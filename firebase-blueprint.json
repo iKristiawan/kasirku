@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KasirkuPOSFirestoreBlueprint",
+  "description": "Firestore blueprint for Kasirku Tablet POS including inventory, customers, transactions, suppliers, attendances, and store settings",
+  "entities": {
+    "products": {
+      "path": "products/{productId}",
+      "description": "Store inventory items with multi-satuan conversion units and stock alerts",
+      "fields": {
+        "id": { "type": "string", "description": "Unique product ID" },
+        "barcode": { "type": "string", "description": "SKU or Barcode" },
+        "name": { "type": "string", "description": "Product title" },
+        "category": { "type": "string", "description": "Category name" },
+        "baseUnit": { "type": "string", "description": "Atomic base unit e.g. PCS, KG" },
+        "stockInBaseUnit": { "type": "number", "description": "Current quantity in base unit" },
+        "minStockAlert": { "type": "number", "description": "Threshold for low stock alert" },
+        "costPrice": { "type": "number", "description": "Purchase cost per base unit" },
+        "units": { "type": "array", "description": "List of multi-unit pricing and conversion factors" },
+        "imageUrl": { "type": "string", "description": "Optional image URL" }
+      }
+    },
+    "customers": {
+      "path": "customers/{customerId}",
+      "description": "Registered retail and wholesale customers with points and debt balances",
+      "fields": {
+        "id": { "type": "string", "description": "Unique customer ID" },
+        "name": { "type": "string", "description": "Full customer name" },
+        "phone": { "type": "string", "description": "Primary phone number" },
+        "whatsapp": { "type": "string", "description": "WhatsApp contact number" },
+        "address": { "type": "string", "description": "Delivery address" },
+        "totalPoints": { "type": "number", "description": "Loyalty points balance" },
+        "creditLimit": { "type": "number", "description": "Maximum allowed debt" },
+        "totalDebt": { "type": "number", "description": "Outstanding unsettled debt" },
+        "notes": { "type": "string", "description": "Optional manager notes" },
+        "createdAt": { "type": "string", "description": "Registration date" }
+      }
+    },
+    "transactions": {
+      "path": "transactions/{transactionId}",
+      "description": "Sales invoices, item breakdowns, payment methods, and points audit trail",
+      "fields": {
+        "id": { "type": "string", "description": "Transaction unique identifier" },
+        "invoiceNumber": { "type": "string", "description": "Generated invoice code" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "cashierId": { "type": "string", "description": "Staff ID who handled the sale" },
+        "cashierName": { "type": "string", "description": "Staff name" },
+        "cashierRole": { "type": "string", "description": "Staff role" },
+        "customerId": { "type": "string", "description": "Optional member customer ID" },
+        "customerName": { "type": "string", "description": "Optional member customer name" },
+        "customerWhatsapp": { "type": "string", "description": "WhatsApp number for e-receipts" },
+        "subtotal": { "type": "number", "description": "Gross total before points discount" },
+        "discount": { "type": "number", "description": "Applied discount" },
+        "pointsUsed": { "type": "number", "description": "Points redeemed" },
+        "pointsDiscountAmount": { "type": "number", "description": "Rupiah value discounted from points" },
+        "pointsEarned": { "type": "number", "description": "Loyalty points accrued from this sale" },
+        "finalAmount": { "type": "number", "description": "Net payable amount" },
+        "paymentMethod": { "type": "string", "description": "CASH | QRIS_BCA | EDC_BCA | TRANSFER_BCA | PIUTANG" },
+        "paymentStatus": { "type": "string", "description": "LUNAS | BELUM_LUNAS" },
+        "cashPaid": { "type": "number", "description": "Cash tendered" },
+        "cashChange": { "type": "number", "description": "Cash return change" },
+        "bankApprovalCode": { "type": "string", "description": "EDC approval code" },
+        "bankRefNumber": { "type": "string", "description": "Transfer or QRIS ref ID" },
+        "dueDate": { "type": "string", "description": "Due date if debt" },
+        "paidAt": { "type": "string", "description": "Debt settlement timestamp" },
+        "items": { "type": "array", "description": "List of sold items with units and prices" }
+      }
+    },
+    "suppliers": {
+      "path": "suppliers/{supplierId}",
+      "description": "Wholesale vendor directory and purchase order contacts",
+      "fields": {
+        "id": { "type": "string", "description": "Unique supplier ID" },
+        "name": { "type": "string", "description": "Supplier business name" },
+        "contactPerson": { "type": "string", "description": "PIC contact name" },
+        "phone": { "type": "string", "description": "Phone number" },
+        "whatsapp": { "type": "string", "description": "WhatsApp number for POs" },
+        "address": { "type": "string", "description": "Warehouse or office address" },
+        "suppliedCategories": { "type": "array", "description": "Categories provided" },
+        "createdAt": { "type": "string", "description": "Creation date" }
+      }
+    },
+    "attendances": {
+      "path": "attendances/{attendanceId}",
+      "description": "Daily employee attendance shift logs",
+      "fields": {
+        "id": { "type": "string", "description": "Unique shift record ID" },
+        "userId": { "type": "string", "description": "Employee user ID" },
+        "userName": { "type": "string", "description": "Employee full name" },
+        "userRole": { "type": "string", "description": "Role: ADMIN | STORE_MANAGER | KARYAWAN" },
+        "date": { "type": "string", "description": "Date YYYY-MM-DD" },
+        "checkInTime": { "type": "string", "description": "Check-in time string" },
+        "checkInTimestamp": { "type": "number", "description": "Timestamp ms" },
+        "checkOutTime": { "type": "string", "description": "Check-out time string" },
+        "checkOutTimestamp": { "type": "number", "description": "Timestamp ms" },
+        "durationMinutes": { "type": "number", "description": "Worked duration" },
+        "notes": { "type": "string", "description": "Shift hand-over notes" },
+        "status": { "type": "string", "description": "PRESENT | COMPLETED" }
+      }
+    },
+    "settings": {
+      "path": "settings/{settingId}",
+      "description": "Store information, thermal printer branding, loyalty configuration",
+      "fields": {
+        "storeName": { "type": "string", "description": "Store title" },
+        "storeAddress": { "type": "string", "description": "Store address" },
+        "storePhone": { "type": "string", "description": "Store hotline" },
+        "storeFooterReceipt": { "type": "string", "description": "Receipt footer greeting" },
+        "storeLogo": { "type": "string", "description": "Logo data URL" },
+        "showLogoOnReceipt": { "type": "boolean", "description": "Toggle receipt logo" },
+        "enablePoints": { "type": "boolean", "description": "Loyalty program toggle" },
+        "spendPerPoint": { "type": "number", "description": "Spend threshold per 1 point" },
+        "pointValueRupiah": { "type": "number", "description": "Rupiah value per 1 point" },
+        "bcaAccountNumber": { "type": "string", "description": "BCA account number" },
+        "bcaAccountName": { "type": "string", "description": "BCA account name" },
+        "bcaMerchantId": { "type": "string", "description": "BCA merchant ID" }
+      }
+    },
+    "categories": {
+      "path": "categories/{categoryId}",
+      "description": "Product categories with customizable color badges for POS visual filtering",
+      "fields": {
+        "id": { "type": "string", "description": "Category unique ID" },
+        "name": { "type": "string", "description": "Category title" },
+        "color": { "type": "string", "description": "Hex color code e.g. #0284c7" },
+        "description": { "type": "string", "description": "Optional category description" },
+        "icon": { "type": "string", "description": "Optional icon identifier" }
+      }
+    },
+    "stock_opnames": {
+      "path": "stock_opnames/{opnameId}",
+      "description": "Historical audit sessions and periodic physical count reconciliation records with unit and Rupiah discrepancies",
+      "fields": {
+        "id": { "type": "string", "description": "Audit session unique ID" },
+        "sessionNumber": { "type": "string", "description": "Document code e.g. SO-20261028-001" },
+        "date": { "type": "string", "description": "Audit execution date (YYYY-MM-DD)" },
+        "timestamp": { "type": "number", "description": "Audit timestamp in ms" },
+        "auditorName": { "type": "string", "description": "Auditor staff name" },
+        "auditorRole": { "type": "string", "description": "Auditor staff role" },
+        "totalItemsAudited": { "type": "number", "description": "Number of SKU items counted" },
+        "totalDiscrepancies": { "type": "number", "description": "Number of items with variance" },
+        "totalDifferenceValue": { "type": "number", "description": "Net financial difference in IDR" },
+        "generalReason": { "type": "string", "description": "General audit objective or period" },
+        "notes": { "type": "string", "description": "Optional session notes" },
+        "items": { "type": "array", "description": "List of audited products with physical vs system count" }
+      }
+    }
+  }
+}

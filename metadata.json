@@ -1,0 +1,10 @@
+{
+  "name": "KasirKu Tablet POS",
+  "description": "Aplikasi Kasir Toko Tablet Android dengan multi-role (Admin, Manager, Karyawan), multi-satuan produk, multi-pembayaran (Cash, QRIS BCA, EDC, Transfer, Piutang), manajemen pelanggan & supplier dengan WhatsApp, dan poin loyalitas.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

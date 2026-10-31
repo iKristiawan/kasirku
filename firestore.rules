@@ -1,0 +1,96 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for data validation
+    function isValidProduct(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.baseUnit is string &&
+             data.stockInBaseUnit is number && data.stockInBaseUnit >= 0;
+    }
+
+    function isValidCustomer(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.phone is string &&
+             data.totalPoints is number && data.totalPoints >= 0 &&
+             data.totalDebt is number && data.totalDebt >= 0;
+    }
+
+    function isValidTransaction(data) {
+      return data.invoiceNumber is string &&
+             data.timestamp is number &&
+             data.finalAmount is number && data.finalAmount >= 0 &&
+             data.items is list && data.items.size() > 0;
+    }
+
+    function isValidSupplier(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.phone is string;
+    }
+
+    function isValidAttendance(data) {
+      return data.userId is string &&
+             data.userName is string &&
+             data.date is string &&
+             data.checkInTime is string &&
+             data.status in ['PRESENT', 'COMPLETED'];
+    }
+
+    function isValidCategory(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.color is string && data.color.size() > 0;
+    }
+
+    function isValidStockOpname(data) {
+      return data.sessionNumber is string &&
+             data.date is string &&
+             data.auditorName is string &&
+             data.items is list;
+    }
+
+    // Users collection (Kasir / Admin / Manager)
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // Categories collection
+    match /categories/{categoryId} {
+      allow read, write: if true;
+    }
+
+    // Products collection
+    match /products/{productId} {
+      allow read, write: if true;
+    }
+
+    // Customers collection
+    match /customers/{customerId} {
+      allow read, write: if true;
+    }
+
+    // Transactions collection
+    match /transactions/{transactionId} {
+      allow read, write: if true;
+    }
+
+    // Suppliers collection
+    match /suppliers/{supplierId} {
+      allow read, write: if true;
+    }
+
+    // Attendances collection
+    match /attendances/{attendanceId} {
+      allow read, write: if true;
+    }
+
+    // Stock Opname collection
+    match /stock_opnames/{opnameId} {
+      allow read, write: if true;
+    }
+
+    // Store settings collection
+    match /settings/{settingId} {
+      allow read, write: if true;
+    }
+  }
+}
