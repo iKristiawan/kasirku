@@ -208,3 +208,67 @@
   animation: beacon-glow 2s ease-in-out infinite;
 }
 
+/* Smooth GPU-compositor animations for Sales Performance Dashboard load & filter transitions */
+@keyframes dashboard-enter {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.992);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes chart-filter-glide {
+  0% {
+    opacity: 0.45;
+    transform: translate3d(0, 5px, 0) scale(0.996);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes chart-filter-sweep {
+  0% {
+    opacity: 0.95;
+    transform: translateX(-100%) scaleX(0.35);
+  }
+  55% {
+    opacity: 1;
+    transform: translateX(15%) scaleX(0.75);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(120%) scaleX(0.4);
+  }
+}
+
+.animate-dashboard-enter {
+  animation: dashboard-enter 340ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-chart-filter {
+  animation: chart-filter-glide 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-chart-sweep {
+  animation: chart-filter-sweep 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-dashboard-enter,
+  .animate-chart-filter,
+  .animate-chart-sweep,
+  .animate-subtle-pulse,
+  .animate-ring-pulse,
+  .animate-beacon-glow {
+    animation: none !important;
+    transition: none !important;
+  }
+}

@@ -31,20 +31,40 @@ import {
   Copy,
   RotateCcw,
   AlertCircle,
-  MessageSquare
+  MessageSquare,
+  Download,
+  FileSpreadsheet,
+  Tag,
+  QrCode,
+  RefreshCw,
+  ChevronDown
 } from 'lucide-react';
-import { Customer, UserRole, Transaction, StoreSettings, MembershipTier } from '../types/pos';
+import QRCode from 'qrcode';
+import { Customer, UserRole, Transaction, StoreSettings, MembershipTier, CustomerCategoryItem } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateTime, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import {
+  getCustomerCategoryBadge,
+  DEFAULT_CUSTOMER_CATEGORIES,
+  isCustomerMember,
+  generateMembershipId,
+  getCustomerMembershipId,
+  buildCustomerQrPayload,
+} from '../utils/customerUtils';
+import { CustomerCategoryModal } from './CustomerCategoryModal';
 
 interface CustomerManagementViewProps {
   customers: Customer[];
   transactions: Transaction[];
   currentUserRole: UserRole;
   storeSettings?: StoreSettings;
+  customerCategories?: CustomerCategoryItem[];
   onAddCustomer: (customerData: Omit<Customer, 'id' | 'createdAt' | 'totalPoints' | 'totalDebt'>) => void;
   onUpdateCustomer: (customer: Customer) => void;
   onDeleteCustomer: (customerId: string) => void;
+  onAddCustomerCategory?: (name: string, color?: string, description?: string) => void;
+  onUpdateCustomerCategory?: (id: string, name: string, color?: string, description?: string) => void;
+  onDeleteCustomerCategory?: (id: string) => void;
 }
 
 export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
@@ -52,15 +72,20 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
   transactions,
   currentUserRole,
   storeSettings,
+  customerCategories = [],
   onAddCustomer,
   onUpdateCustomer,
   onDeleteCustomer,
+  onAddCustomerCategory,
+  onUpdateCustomerCategory,
+  onDeleteCustomerCategory,
 }) => {
   // Navigation tabs: 'directory' vs 'activity_log'
   const [activeSubTab, setActiveSubTab] = useState<'directory' | 'activity_log'>('directory');
 
   // Directory search & modal state
   const [search, setSearch] = useState('');
+  const [filterCategory, setFilterCategory] = useState<string>('ALL');
   const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
   const [isAddingNew, setIsAddingNew] = useState(false);
 
@@ -77,7 +102,49 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
   const [creditLimit, setCreditLimit] = useState('500000');
   const [totalPoints, setTotalPoints] = useState('0');
   const [membershipTier, setMembershipTier] = useState<MembershipTier>('REGULER');
+  const [customerCategory, setCustomerCategory] = useState<string>('REGULER');
+  const [isMember, setIsMember] = useState<boolean>(false);
+  const [customCategoryInput, setCustomCategoryInput] = useState('');
   const [notes, setNotes] = useState('');
+  const [membershipId, setMembershipId] = useState('');
+  const [qrCustomer, setQrCustomer] = useState<Customer | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string>('');
+  const [copiedMemberId, setCopiedMemberId] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [exportScope, setExportScope] = useState<'ALL' | 'FILTERED'>('ALL');
+  const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
+  const [expandedRedemptionCustomerIds, setExpandedRedemptionCustomerIds] = useState<Record<string, boolean>>({});
+
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!qrCustomer) {
+      setQrDataUrl('');
+      return;
+    }
+    const payload = buildCustomerQrPayload(qrCustomer);
+    QRCode.toDataURL(payload, {
+      width: 340,
+      margin: 2,
+      color: { dark: '#0f172a', light: '#ffffff' },
+    })
+      .then((url) => {
+        if (!cancelled) setQrDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setQrDataUrl('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [qrCustomer]);
+
+  // Daftar seluruh kategori pelanggan unik
+  const allCustomerCategories = useMemo(() => {
+    const fromMaster = customerCategories.map((c) => c.name);
+    const customCats = customers.map((c) => c.customerCategory).filter(Boolean) as string[];
+    return Array.from(new Set([...fromMaster, ...DEFAULT_CUSTOMER_CATEGORIES, ...customCats]));
+  }, [customerCategories, customers]);
 
   // =========================================================================
   // WHATSAPP BLAST STATE & PRESETS
@@ -85,9 +152,9 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
   const BLAST_PRESETS = useMemo(() => [
     {
       key: 'PROMO_MEMBER',
-      title: 'Diskon Spesial Tier Member',
-      description: 'Potongan harga khusus tier membership',
-      template: 'Halo Kak {nama}! Dapatkan diskon belanja spesial untuk member tier {tier} di {toko}! Kunjungi toko kami hari ini dan tunjukkan pesan ini di kasir untuk menikmati potongan harga langsung saat checkout. Selamat berbelanja!'
+      title: 'Promo Spesial Kategori Pelanggan',
+      description: 'Informasi harga khusus pelanggan terdaftar',
+      template: 'Halo Kak {nama}! Nikmati harga jual khusus untuk kategori pelanggan Anda di {toko}! Kunjungi toko kami hari ini dan sebutkan nama Anda di kasir saat checkout. Selamat berbelanja!'
     },
     {
       key: 'POINTS_REWARD',
@@ -247,14 +314,24 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
 
   // Filter customers for directory
   const filteredCustomers = useMemo(() => {
-    return customers.filter(
-      (c) =>
-        c.name.toLowerCase().includes(search.toLowerCase()) ||
-        c.phone.includes(search) ||
-        c.whatsapp.includes(search) ||
-        c.address.toLowerCase().includes(search.toLowerCase())
-    );
-  }, [customers, search]);
+    return customers.filter((c) => {
+      const q = search.toLowerCase();
+      const memberCode = getCustomerMembershipId(c).toLowerCase();
+      const matchesSearch =
+        c.name.toLowerCase().includes(q) ||
+        c.phone.includes(q) ||
+        c.whatsapp.includes(q) ||
+        c.address.toLowerCase().includes(q) ||
+        memberCode.includes(q) ||
+        (c.customerCategory && c.customerCategory.toLowerCase().includes(q));
+
+      const matchesCat =
+        filterCategory === 'ALL' ||
+        (c.customerCategory || 'UMUM').toUpperCase() === filterCategory.toUpperCase();
+
+      return matchesSearch && matchesCat;
+    });
+  }, [customers, search, filterCategory]);
 
   // Map transactions by customerId for fast lookups
   const customerTransactionsMap = useMemo(() => {
@@ -276,6 +353,10 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
       const totalPaymentsMade = custTxs.reduce((sum, tx) => sum + tx.finalAmount, 0);
       const totalPointsEarned = custTxs.reduce((sum, tx) => sum + (tx.pointsEarned || 0), 0);
       const totalPointsUsed = custTxs.reduce((sum, tx) => sum + (tx.pointsUsed || 0), 0);
+      const totalPointsDiscountRupiah = custTxs.reduce((sum, tx) => sum + (tx.pointsDiscountAmount || 0), 0);
+      const pointRedemptionHistory = [...custTxs]
+        .filter((tx) => (tx.pointsUsed || 0) > 0)
+        .sort((a, b) => b.timestamp - a.timestamp);
       const totalVisits = custTxs.length;
       const averageBasket = totalVisits > 0 ? totalPaymentsMade / totalVisits : 0;
       const lastTx = custTxs.length > 0 ? [...custTxs].sort((a, b) => b.timestamp - a.timestamp)[0] : null;
@@ -306,6 +387,8 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
         totalPaymentsMade,
         totalPointsEarned,
         totalPointsUsed,
+        totalPointsDiscountRupiah,
+        pointRedemptionHistory,
         totalVisits,
         averageBasket,
         lastTransaction: lastTx,
@@ -401,7 +484,11 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
     setCreditLimit(cust.creditLimit.toString());
     setTotalPoints(cust.totalPoints.toString());
     setMembershipTier(cust.membershipTier || 'REGULER');
+    setCustomerCategory(cust.customerCategory || 'REGULER');
+    setIsMember(isCustomerMember(cust));
+    setCustomCategoryInput('');
     setNotes(cust.notes || '');
+    setMembershipId(getCustomerMembershipId(cust));
   };
 
   const handleSaveEdit = (e: React.FormEvent) => {
@@ -409,6 +496,18 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
     if (!editingCustomer || !name.trim()) return;
 
     sound.playSuccessChime();
+    const finalCategory = customCategoryInput.trim()
+      ? customCategoryInput.trim().toUpperCase()
+      : (customerCategory.trim() || 'REGULER');
+
+    if (
+      customCategoryInput.trim() &&
+      onAddCustomerCategory &&
+      !customerCategories.some((c) => c.name.toUpperCase() === finalCategory)
+    ) {
+      onAddCustomerCategory(finalCategory, 'sky');
+    }
+
     onUpdateCustomer({
       ...editingCustomer,
       name: name.trim(),
@@ -418,6 +517,9 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
       creditLimit: parseFloat(creditLimit) || 0,
       totalPoints: parseInt(totalPoints) || 0,
       membershipTier,
+      customerCategory: finalCategory,
+      isMember,
+      membershipId: membershipId.trim() || getCustomerMembershipId(editingCustomer),
       notes: notes.trim(),
     });
 
@@ -429,6 +531,18 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
     if (!name.trim() || !phone.trim()) return;
 
     sound.playSuccessChime();
+    const finalCategory = customCategoryInput.trim()
+      ? customCategoryInput.trim().toUpperCase()
+      : (customerCategory.trim() || 'REGULER');
+
+    if (
+      customCategoryInput.trim() &&
+      onAddCustomerCategory &&
+      !customerCategories.some((c) => c.name.toUpperCase() === finalCategory)
+    ) {
+      onAddCustomerCategory(finalCategory, 'sky');
+    }
+
     onAddCustomer({
       name: name.trim(),
       phone: phone.trim(),
@@ -436,22 +550,124 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
       address: address.trim(),
       creditLimit: parseFloat(creditLimit) || 0,
       membershipTier,
+      customerCategory: finalCategory,
+      isMember,
+      membershipId: membershipId.trim() || generateMembershipId(),
       notes: notes.trim(),
     });
 
     setIsAddingNew(false);
   };
 
-  const handleSendWA = (cust: Customer) => {
+  const handleDownloadMemberQrCard = async (cust: Customer) => {
     sound.playTap();
-    const msg = `Halo Kak ${cust.name}, terima kasih telah berbelanja di toko kami! Saldo Poin Loyalitas Anda saat ini adalah ${formatNumber(cust.totalPoints)} poin. Kumpulkan terus poin belanja Anda dan dapatkan potongan harga menarik di kunjungan berikutnya!`;
-    window.open(formatWhatsAppUrl(cust.whatsapp, msg), '_blank');
+    const memberCode = getCustomerMembershipId(cust);
+    const payload = buildCustomerQrPayload(cust);
+    const storeName = storeSettings?.storeName || 'KasirKu Store';
+
+    try {
+      const qrPngUrl = await QRCode.toDataURL(payload, {
+        width: 360,
+        margin: 2,
+        color: { dark: '#0f172a', light: '#ffffff' },
+      });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 640;
+      canvas.height = 820;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      // White rounded card background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Top dark navy banner
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(0, 0, canvas.width, 160);
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 20px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('KARTU MEMBER DIGITAL', canvas.width / 2, 54);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 34px sans-serif';
+      ctx.fillText(storeName.toUpperCase(), canvas.width / 2, 102);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '16px sans-serif';
+      ctx.fillText('Tunjukkan QR Code ini ke kasir untuk auto-pilih member', canvas.width / 2, 136);
+
+      // QR Code centered
+      const qrImg = new Image();
+      qrImg.onload = () => {
+        ctx.drawImage(qrImg, (canvas.width - 360) / 2, 200, 360, 360);
+
+        // Customer Name
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 30px sans-serif';
+        ctx.fillText(cust.name, canvas.width / 2, 610);
+
+        // Membership ID Box
+        ctx.fillStyle = '#f1f5f9';
+        ctx.fillRect(110, 636, 420, 56);
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(110, 636, 420, 56);
+
+        ctx.fillStyle = '#0369a1';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText(memberCode, canvas.width / 2, 673);
+
+        // Tier & Category
+        ctx.fillStyle = '#475569';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.fillText(
+          `${cust.customerCategory || 'REGULER'} • Tier ${cust.membershipTier || 'REGULER'} • ${cust.phone}`,
+          canvas.width / 2,
+          738
+        );
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '15px sans-serif';
+        ctx.fillText('Dicetak otomatis oleh Sistem Kasir', canvas.width / 2, 784);
+
+        const link = document.createElement('a');
+        link.href = canvas.toDataURL('image/png');
+        link.download = `QR-Member-${memberCode}-${cust.name.replace(/[^a-z0-9]/gi, '_')}.png`;
+        link.click();
+      };
+      qrImg.src = qrPngUrl;
+    } catch (err) {
+      console.error('Gagal mengunduh kartu QR member:', err);
+    }
+  };
+
+  const handleSendWA = (cust: Customer, forceBill: boolean = false) => {
+    sound.playTap();
+    const storeName = storeSettings?.storeName || 'KasirKu Store';
+    let msg = '';
+    if (forceBill || (cust.totalDebt && cust.totalDebt > 0)) {
+      msg = `Halo Kak ${cust.name}, salam hangat dari *${storeName}*! 🙏✨\n\n` +
+        `Berikut ringkasan akun pelanggan Anda:\n` +
+        `• Status Tier: *${cust.membershipTier || 'REGULER'}*\n` +
+        `• Saldo Poin Loyalitas: *${formatNumber(cust.totalPoints || 0)} Poin*\n` +
+        (cust.totalDebt && cust.totalDebt > 0
+          ? `• Tagihan Tempo / Piutang: *${formatRupiah(cust.totalDebt)}*\n\nMohon konfirmasi atau lakukan pelunasan di kasir pada kunjungan berikutnya. Terima kasih banyak atas kerja sama baiknya! 😊`
+          : `\nTerima kasih telah berbelanja dan terus kumpulkan poin untuk mendapatkan potongan harga langsung!`);
+    } else {
+      msg = `Halo Kak ${cust.name}, salam hangat dari *${storeName}*! 🙏✨\n\n` +
+        `Terima kasih telah menjadi pelanggan setia kami. Saldo Poin Loyalitas Anda saat ini adalah *${formatNumber(cust.totalPoints || 0)} Poin* (Tier: *${cust.membershipTier || 'REGULER'}*).\n` +
+        `Kumpulkan terus poin belanja Anda dan nikmati berbagai penawaran menarik saat checkout di toko kami. Sampai jumpa kembali! 😊🛍️`;
+    }
+    window.open(formatWhatsAppUrl(cust.whatsapp || cust.phone, msg), '_blank');
   };
 
   const handleSendInvoiceWA = (tx: Transaction) => {
     sound.playTap();
     if (!tx.customerWhatsapp) return;
-    const itemsList = tx.items.map((it) => `- ${it.productName} (${it.quantity} ${it.unitName}): ${formatRupiah(it.totalAmount)}`).join('\n');
+    const itemsList = tx.items.map((it) => `- ${it.productName}${it.selectedVariant ? ` (${it.selectedVariant})` : ''} (${it.quantity} ${it.unitName}): ${formatRupiah(it.totalAmount)}`).join('\n');
     const msg = `*STRUK DIGITAL KASIRKU*\nNo: ${tx.invoiceNumber}\nTanggal: ${formatDateTime(tx.timestamp)}\nKasir: ${tx.cashierName}\n\n*Item Belanja:*\n${itemsList}\n\n*Total Bayar:* ${formatRupiah(tx.finalAmount)}\n*Metode:* ${tx.paymentMethod}\n*Poin Didapat:* +${tx.pointsEarned || 0} Poin\n*Saldo Poin Anda:* ${selectedCustomerDetail ? formatNumber(selectedCustomerDetail.customer.totalPoints) : '-'} Poin\n\nTerima kasih atas kunjungan Anda!`;
     window.open(formatWhatsAppUrl(tx.customerWhatsapp, msg), '_blank');
   };
@@ -462,9 +678,293 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
     setActiveSubTab('activity_log');
   };
 
+  const escapeCSV = (val: unknown) => {
+    if (val === null || val === undefined) return '""';
+    const str = String(val).replace(/"/g, '""');
+    return `"${str}"`;
+  };
+
+  const triggerCsvDownload = (csvLines: string[], fileName: string, noticeMessage: string) => {
+    const csvContent = '\uFEFF' + csvLines.join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', fileName);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    sound.playSuccessChime();
+    setIsExportMenuOpen(false);
+    setExportNotice(noticeMessage);
+    setTimeout(() => setExportNotice(null), 4500);
+  };
+
+  const getCustomerCsvMeta = () => {
+    const dateStr = new Date().toISOString().split('T')[0];
+    const storeSlug = (storeSettings?.storeName || 'KasirKu')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '_');
+    return { dateStr, storeSlug };
+  };
+
+  const resolveCustomersForExport = (scopeOverride?: 'ALL' | 'FILTERED') => {
+    const activeScope = scopeOverride || exportScope;
+    if (activeScope === 'FILTERED') {
+      if (activeSubTab === 'activity_log' && selectedCustomerId !== 'ALL') {
+        return customers.filter((c) => c.id === selectedCustomerId);
+      }
+      return filteredCustomers;
+    }
+    return customers;
+  };
+
+  const buildDirectoryCsvData = (targetCustomers: Customer[]) => {
+    const analyticsById = new Map(customerAnalytics.map((a) => [a.customer.id, a]));
+    const headers = [
+      'ID Pelanggan',
+      'Kode Member',
+      'Nama Pelanggan',
+      'Kategori Pelanggan',
+      'Status Member',
+      'Tier Member',
+      'Nomor Telepon',
+      'Nomor WhatsApp',
+      'Alamat',
+      'Saldo Poin Saat Ini',
+      'Total Poin Diperoleh (+)',
+      'Total Poin Ditukar (-)',
+      'Total Potongan Poin (Rp)',
+      'Riwayat Penukaran Poin (Ringkas)',
+      'Total Transaksi',
+      'Total Belanja (Rp)',
+      'Rata-rata Belanja (Rp)',
+      'Transaksi Terakhir',
+      'Limit Kredit (Rp)',
+      'Total Piutang (Rp)',
+      'Catatan',
+      'Tanggal Terdaftar',
+    ];
+
+    const rows = targetCustomers.map((c) => {
+      const a = analyticsById.get(c.id);
+      const redemptionSummary =
+        a && a.pointRedemptionHistory.length > 0
+          ? a.pointRedemptionHistory
+              .slice(0, 5)
+              .map(
+                (tx) =>
+                  `${formatDateTime(tx.timestamp)} [${tx.invoiceNumber}] -${tx.pointsUsed} pts (-${formatRupiah(tx.pointsDiscountAmount)})`
+              )
+              .join(' | ')
+          : '-';
+
+      return [
+        escapeCSV(c.id),
+        escapeCSV(getCustomerMembershipId(c)),
+        escapeCSV(c.name),
+        escapeCSV(c.customerCategory || 'REGULER'),
+        escapeCSV(isCustomerMember(c) ? 'MEMBER' : 'NON-MEMBER'),
+        escapeCSV(c.membershipTier || 'REGULER'),
+        escapeCSV(c.phone),
+        escapeCSV(c.whatsapp || c.phone),
+        escapeCSV(c.address || '-'),
+        escapeCSV(c.totalPoints || 0),
+        escapeCSV(a?.totalPointsEarned || 0),
+        escapeCSV(a?.totalPointsUsed || 0),
+        escapeCSV(a?.totalPointsDiscountRupiah || 0),
+        escapeCSV(redemptionSummary),
+        escapeCSV(a?.totalVisits || 0),
+        escapeCSV(a?.totalPaymentsMade || 0),
+        escapeCSV(Math.round(a?.averageBasket || 0)),
+        escapeCSV(a?.lastTransaction ? formatDateTime(a.lastTransaction.timestamp) : '-'),
+        escapeCSV(c.creditLimit || 0),
+        escapeCSV(c.totalDebt || 0),
+        escapeCSV(c.notes || '-'),
+        escapeCSV(c.createdAt || '-'),
+      ].join(',');
+    });
+
+    return { headersLine: headers.map(escapeCSV).join(','), rows };
+  };
+
+  const buildLoyaltyHistoryCsvData = (
+    targetCustomers: Customer[],
+    sourceTransactions: Transaction[] = transactions
+  ) => {
+    const customerMapById = new Map(targetCustomers.map((c) => [c.id, c]));
+    const headers = [
+      'Tanggal & Waktu',
+      'No. Invoice',
+      'ID Pelanggan',
+      'Kode Member',
+      'Nama Pelanggan',
+      'Nomor Telepon',
+      'Kategori Pelanggan',
+      'Tier Member',
+      'Jenis Aktivitas Poin',
+      'Poin Diperoleh (+)',
+      'Poin Ditukar (-)',
+      'Perubahan Bersih Poin',
+      'Potongan Harga Poin (Rp)',
+      'Total Belanja Invoice (Rp)',
+      'Metode Pembayaran',
+      'Status Pembayaran',
+      'Kasir',
+      'Saldo Poin Saat Ini',
+    ];
+
+    const loyaltyTxs = [...sourceTransactions]
+      .filter((tx) => {
+        if (!tx.customerId || !customerMapById.has(tx.customerId)) return false;
+        return (tx.pointsEarned || 0) > 0 || (tx.pointsUsed || 0) > 0;
+      })
+      .sort((a, b) => b.timestamp - a.timestamp);
+
+    const rows = loyaltyTxs.map((tx) => {
+      const cust = tx.customerId ? customerMapById.get(tx.customerId) : undefined;
+      const earned = tx.pointsEarned || 0;
+      const used = tx.pointsUsed || 0;
+      const net = earned - used;
+      const activityType =
+        earned > 0 && used > 0
+          ? 'PEROLEHAN & PENUKARAN'
+          : used > 0
+          ? 'PENUKARAN POIN'
+          : 'PEROLEHAN POIN';
+
+      return [
+        escapeCSV(formatDateTime(tx.timestamp)),
+        escapeCSV(tx.invoiceNumber),
+        escapeCSV(tx.customerId || '-'),
+        escapeCSV(cust ? getCustomerMembershipId(cust) : '-'),
+        escapeCSV(cust?.name || tx.customerName || 'Pelanggan'),
+        escapeCSV(cust?.phone || tx.customerWhatsapp || '-'),
+        escapeCSV(cust?.customerCategory || 'REGULER'),
+        escapeCSV(cust?.membershipTier || 'REGULER'),
+        escapeCSV(activityType),
+        escapeCSV(earned),
+        escapeCSV(used),
+        escapeCSV(net),
+        escapeCSV(tx.pointsDiscountAmount || 0),
+        escapeCSV(tx.finalAmount || 0),
+        escapeCSV((tx.paymentMethod || '').replace('_', ' ')),
+        escapeCSV(tx.paymentStatus || 'LUNAS'),
+        escapeCSV(tx.cashierName || '-'),
+        escapeCSV(cust ? cust.totalPoints || 0 : '-'),
+      ].join(',');
+    });
+
+    return { headersLine: headers.map(escapeCSV).join(','), rows, count: loyaltyTxs.length };
+  };
+
+  // Export 1: Daftar Pelanggan + Ringkasan Poin
+  const handleExportCustomersDirectoryCSV = (scopeOverride?: 'ALL' | 'FILTERED') => {
+    sound.playTap();
+    const targetCustomers = resolveCustomersForExport(scopeOverride);
+    if (targetCustomers.length === 0) {
+      setExportNotice('Tidak ada data pelanggan yang sesuai untuk diekspor.');
+      setTimeout(() => setExportNotice(null), 3000);
+      return;
+    }
+
+    const { headersLine, rows } = buildDirectoryCsvData(targetCustomers);
+    const { dateStr, storeSlug } = getCustomerCsvMeta();
+    triggerCsvDownload(
+      [headersLine, ...rows],
+      `daftar_pelanggan_${storeSlug}_${dateStr}.csv`,
+      `Berhasil mengekspor ${targetCustomers.length} daftar pelanggan & ringkasan poin ke CSV!`
+    );
+  };
+
+  // Export 2: Riwayat Detail Poin Loyalitas
+  const handleExportLoyaltyHistoryCSV = (
+    customCustomers?: Customer[],
+    customTransactions?: Transaction[],
+    filePrefix: string = 'riwayat_poin_loyalitas'
+  ) => {
+    sound.playTap();
+    const targetCustomers = customCustomers || resolveCustomersForExport();
+    if (targetCustomers.length === 0) {
+      setExportNotice('Tidak ada pelanggan yang dipilih untuk ekspor riwayat poin.');
+      setTimeout(() => setExportNotice(null), 3000);
+      return;
+    }
+
+    const { headersLine, rows, count } = buildLoyaltyHistoryCsvData(
+      targetCustomers,
+      customTransactions || transactions
+    );
+
+    if (count === 0) {
+      setExportNotice('Belum ada transaksi perolehan/penukaran poin loyalitas untuk data terpilih.');
+      setTimeout(() => setExportNotice(null), 3500);
+      return;
+    }
+
+    const { dateStr, storeSlug } = getCustomerCsvMeta();
+    triggerCsvDownload(
+      [headersLine, ...rows],
+      `${filePrefix}_${storeSlug}_${dateStr}.csv`,
+      `Berhasil mengekspor ${count} riwayat poin loyalitas ke file CSV!`
+    );
+  };
+
+  // Export 3: Gabungan Lengkap (Daftar Pelanggan + Riwayat Poin Loyalitas)
+  const handleExportCombinedCSV = (scopeOverride?: 'ALL' | 'FILTERED') => {
+    sound.playTap();
+    const targetCustomers = resolveCustomersForExport(scopeOverride);
+    if (targetCustomers.length === 0) {
+      setExportNotice('Belum ada data pelanggan untuk diekspor.');
+      setTimeout(() => setExportNotice(null), 3000);
+      return;
+    }
+
+    const dir = buildDirectoryCsvData(targetCustomers);
+    const hist = buildLoyaltyHistoryCsvData(targetCustomers, transactions);
+    const { dateStr, storeSlug } = getCustomerCsvMeta();
+
+    const lines: string[] = [
+      escapeCSV(`LAPORAN DATA PELANGGAN & RIWAYAT POIN LOYALITAS - ${storeSettings?.storeName || 'KasirKu Store'}`),
+      escapeCSV(`Tanggal Ekspor: ${formatDateTime(Date.now())} | Jumlah Pelanggan: ${targetCustomers.length} | Total Log Poin: ${hist.count}`),
+      '',
+      escapeCSV('=== BAGIAN 1: DAFTAR PELANGGAN & RINGKASAN POIN LOYALITAS ==='),
+      dir.headersLine,
+      ...dir.rows,
+      '',
+      escapeCSV('=== BAGIAN 2: RIWAYAT TRANSAKSI POIN LOYALITAS PELANGGAN ==='),
+      hist.headersLine,
+      ...(hist.rows.length > 0
+        ? hist.rows
+        : [escapeCSV('Belum ada riwayat perolehan atau penukaran poin loyalitas pada data terpilih.')]),
+    ];
+
+    triggerCsvDownload(
+      lines,
+      `pelanggan_dan_riwayat_poin_${storeSlug}_${dateStr}.csv`,
+      `Berhasil mengekspor ${targetCustomers.length} pelanggan & ${hist.count} riwayat poin loyalitas ke CSV!`
+    );
+  };
+
   return (
     <div className="flex-1 p-3 md:p-6 bg-slate-100 overflow-y-auto">
       <div className="max-w-7xl mx-auto space-y-4 md:space-y-5">
+
+        {/* Floating Export Notification Toast */}
+        {exportNotice && (
+          <div className="fixed top-20 right-6 z-50 p-3.5 bg-slate-900 text-white rounded-2xl shadow-2xl border border-slate-700 flex items-center gap-2.5 animate-in slide-in-from-top-3 duration-200">
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+            <span className="text-xs font-semibold text-slate-100">{exportNotice}</span>
+            <button
+              onClick={() => setExportNotice(null)}
+              className="p-1 text-slate-400 hover:text-white rounded-lg transition-colors ml-1"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
         
         {/* Navigation Bar & Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-2xs">
@@ -518,6 +1018,130 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
               </button>
             </div>
 
+            {/* Export ke CSV Dropdown Menu (Daftar Pelanggan & Riwayat Poin Loyalitas) */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setIsExportMenuOpen((prev) => !prev);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+                title="Ekspor daftar pelanggan dan riwayat poin loyalitas ke format CSV"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                <span>Export ke CSV</span>
+                <ChevronDown className={`w-3.5 h-3.5 text-slate-300 transition-transform ${isExportMenuOpen ? 'rotate-180' : ''}`} />
+              </button>
+
+              {isExportMenuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setIsExportMenuOpen(false)}
+                  />
+                  <div className="absolute right-0 mt-2 w-80 bg-white rounded-2xl border border-slate-200 shadow-2xl z-40 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+                    <div className="p-3 bg-slate-50 border-b border-slate-200 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-700">
+                          Cakupan Data Ekspor CSV
+                        </span>
+                        <span className="text-[10px] font-mono font-bold text-slate-500">
+                          {resolveCustomersForExport().length} pelanggan
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1 bg-slate-200/70 p-0.5 rounded-xl text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setExportScope('ALL');
+                          }}
+                          className={`py-1 px-2 rounded-lg font-bold transition-all cursor-pointer ${
+                            exportScope === 'ALL'
+                              ? 'bg-white text-slate-900 shadow-2xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Semua ({customers.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setExportScope('FILTERED');
+                          }}
+                          className={`py-1 px-2 rounded-lg font-bold transition-all cursor-pointer ${
+                            exportScope === 'FILTERED'
+                              ? 'bg-white text-slate-900 shadow-2xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Sesuai Filter ({resolveCustomersForExport('FILTERED').length})
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="p-1.5 divide-y divide-slate-100">
+                      <button
+                        type="button"
+                        onClick={() => handleExportCombinedCSV()}
+                        className="w-full text-left p-2.5 rounded-xl hover:bg-emerald-50/70 transition-colors flex items-start gap-2.5 cursor-pointer"
+                      >
+                        <div className="p-1.5 rounded-lg bg-emerald-100 text-emerald-700 shrink-0 mt-0.5">
+                          <Download className="w-3.5 h-3.5" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-slate-900">
+                            Pelanggan &amp; Riwayat Poin (Lengkap)
+                          </div>
+                          <div className="text-[10.5px] text-slate-500 leading-snug mt-0.5">
+                            Unduh 1 file CSV berisi daftar pelanggan lengkap beserta seluruh log perolehan &amp; penukaran poin.
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleExportCustomersDirectoryCSV()}
+                        className="w-full text-left p-2.5 rounded-xl hover:bg-sky-50/70 transition-colors flex items-start gap-2.5 cursor-pointer"
+                      >
+                        <div className="p-1.5 rounded-lg bg-sky-100 text-sky-700 shrink-0 mt-0.5">
+                          <Users className="w-3.5 h-3.5" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-slate-900">
+                            Daftar Pelanggan &amp; Saldo Poin
+                          </div>
+                          <div className="text-[10.5px] text-slate-500 leading-snug mt-0.5">
+                            Tabel kontak, kategori, saldo poin, total poin didapat/ditukar, omzet, dan piutang.
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleExportLoyaltyHistoryCSV()}
+                        className="w-full text-left p-2.5 rounded-xl hover:bg-amber-50/70 transition-colors flex items-start gap-2.5 cursor-pointer"
+                      >
+                        <div className="p-1.5 rounded-lg bg-amber-100 text-amber-700 shrink-0 mt-0.5">
+                          <Coins className="w-3.5 h-3.5" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-slate-900">
+                            Riwayat Poin Loyalitas Detail
+                          </div>
+                          <div className="text-[10.5px] text-slate-500 leading-snug mt-0.5">
+                            Log per transaksi: poin masuk (+), poin ditukar (-), potongan Rp, no. invoice, dan kasir.
+                          </div>
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
             {/* WhatsApp Blast Button */}
             <button
               onClick={() => handleOpenBlastModal()}
@@ -531,6 +1155,20 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
               </span>
             </button>
 
+            {/* Kelola Kategori Pelanggan Button */}
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setIsCategoryModalOpen(true);
+              }}
+              className="px-3.5 py-2 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 font-bold text-xs flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+              title="Tambah, Edit, dan Hapus Kategori Pelanggan"
+            >
+              <Tag className="w-4 h-4 text-sky-600" />
+              <span>Kelola Kategori</span>
+            </button>
+
             {/* Quick Add Button */}
             {activeSubTab === 'directory' && (
               <button
@@ -541,10 +1179,15 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                   setWhatsapp('');
                   setAddress('');
                   setCreditLimit('500000');
+                  setMembershipTier('REGULER');
+                  setCustomerCategory('REGULER');
+                  setIsMember(false);
+                  setCustomCategoryInput('');
                   setNotes('');
+                  setMembershipId(generateMembershipId());
                   setIsAddingNew(true);
                 }}
-                className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-colors"
+                className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
               >
                 <UserPlus className="w-4 h-4" />
                 <span>Tambah Pelanggan</span>
@@ -558,22 +1201,87 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
            ========================================================================= */}
         {activeSubTab === 'directory' && (
           <div className="space-y-4">
-            {/* Search Bar */}
-            <div className="relative">
-              <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Cari pelanggan berdasarkan nama, no telepon, WhatsApp, atau alamat..."
-                className="w-full pl-10 pr-4 py-3 bg-white border border-slate-200 rounded-2xl text-xs md:text-sm text-slate-900 focus:outline-none focus:border-sky-500 shadow-2xs"
-              />
+            {/* Search Bar & Category Filter Bar */}
+            <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3">
+              <div className="relative flex-1">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input
+                  type="text"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Cari pelanggan berdasarkan nama, no telepon, WhatsApp, alamat, atau kategori..."
+                  className="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-200 rounded-2xl text-xs md:text-sm text-slate-900 focus:outline-none focus:border-sky-500 shadow-2xs"
+                />
+              </div>
+
+              {/* Kategori Pelanggan Filter Pills */}
+              <div className="flex items-center gap-1.5 p-1 bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-x-auto shrink-0">
+                <span className="text-[11px] font-bold text-slate-500 pl-2 shrink-0">Kategori:</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setFilterCategory('ALL');
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    filterCategory === 'ALL'
+                      ? 'bg-slate-900 text-white shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                  }`}
+                >
+                  Semua ({customers.length})
+                </button>
+                {allCustomerCategories.map((cat) => {
+                  const count = customers.filter(
+                    (c) => (c.customerCategory || 'UMUM').toUpperCase() === cat.toUpperCase()
+                  ).length;
+                  const isSelected = filterCategory.toUpperCase() === cat.toUpperCase();
+                  const catObj = customerCategories.find((c) => c.name.toUpperCase() === cat.toUpperCase());
+                  const badge = getCustomerCategoryBadge(cat, catObj?.color);
+                  return (
+                    <button
+                      key={cat}
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setFilterCategory(cat);
+                      }}
+                      className={`px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
+                        isSelected
+                          ? `${badge.bg} ${badge.text} border ${badge.border} ring-2 ring-sky-400 shadow-xs font-black`
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${badge.dot}`} />
+                      <span>{cat}</span>
+                      <span className="text-[10px] opacity-75 font-mono">({count})</span>
+                    </button>
+                  );
+                })}
+                {/* Tombol Buka Modal Kategori di baris Filter */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setIsCategoryModalOpen(true);
+                  }}
+                  className="px-2.5 py-1.5 rounded-xl text-xs font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 transition-all flex items-center gap-1 cursor-pointer shrink-0 ml-1"
+                  title="Tambah, Edit, atau Hapus Kategori Pelanggan"
+                >
+                  <Tag className="w-3.5 h-3.5" />
+                  <span>+ Kelola Kategori</span>
+                </button>
+              </div>
             </div>
 
             {/* Customer Cards Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {filteredCustomers.map((cust) => {
                 const analytics = customerAnalytics.find((a) => a.customer.id === cust.id);
+                const catObj = customerCategories.find(
+                  (c) => c.name.toUpperCase() === (cust.customerCategory || 'UMUM').toUpperCase()
+                );
+                const categoryBadge = getCustomerCategoryBadge(cust.customerCategory, catObj?.color);
                 return (
                   <div
                     key={cust.id}
@@ -582,20 +1290,61 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     <div>
                       <div className="flex items-start justify-between gap-2 pb-3 border-b border-slate-100">
                         <div className="flex items-center gap-2.5">
-                          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-xs">
+                          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-xs shrink-0">
                             {cust.name.charAt(0)}
                           </div>
                           <div>
-                            <h3 className="text-sm font-bold text-slate-900 line-clamp-1">{cust.name}</h3>
-                            <div className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md mt-0.5">
-                              <Sparkles className="w-3 h-3 text-amber-500 fill-amber-500" />
-                              <span>{formatNumber(cust.totalPoints)} Poin Reward</span>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <h3 className="text-sm font-bold text-slate-900 line-clamp-1">{cust.name}</h3>
+                              <span
+                                className={`inline-flex items-center gap-1 text-[9.5px] font-black px-2 py-0.5 rounded-md border ${categoryBadge.bg} ${categoryBadge.text} ${categoryBadge.border}`}
+                              >
+                                <span className={`w-1.5 h-1.5 rounded-full ${categoryBadge.dot}`} />
+                                <span>{categoryBadge.label}</span>
+                              </span>
+                              {isCustomerMember(cust) ? (
+                                <span className="inline-flex items-center gap-1 text-[9.5px] font-black px-2 py-0.5 rounded-md border bg-emerald-100 text-emerald-800 border-emerald-300">
+                                  ⭐ MEMBER
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 text-[9.5px] font-bold px-2 py-0.5 rounded-md border bg-slate-100 text-slate-500 border-slate-200">
+                                  Non-Member
+                                </span>
+                              )}
+                            </div>
+                            {isCustomerMember(cust) ? (
+                              <div className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md mt-1">
+                                <Sparkles className="w-3 h-3 text-amber-500 fill-amber-500" />
+                                <span>{formatNumber(cust.totalPoints)} Poin Reward</span>
+                              </div>
+                            ) : (
+                              <div className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md mt-1">
+                                <span>Tidak Mendapatkan Poin</span>
+                              </div>
+                            )}
+                            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                              <span className="inline-flex items-center gap-1 text-[10px] font-mono font-bold text-sky-700 bg-sky-50 border border-sky-200 px-1.5 py-0.5 rounded-md">
+                                <QrCode className="w-3 h-3 text-sky-600" />
+                                <span>{getCustomerMembershipId(cust)}</span>
+                              </span>
                             </div>
                           </div>
                         </div>
 
                         {/* Actions */}
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              sound.playTap();
+                              setQrCustomer(cust);
+                            }}
+                            title="Lihat & Unduh QR Code Member"
+                            className="px-2 py-1.5 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-[10.5px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            <QrCode className="w-3.5 h-3.5" />
+                            <span>QR</span>
+                          </button>
                           <button
                             onClick={() => startEdit(cust)}
                             title="Edit Pelanggan"
@@ -657,6 +1406,79 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                             {cust.totalDebt > 0 ? formatRupiah(cust.totalDebt) : 'Lunas (Rp 0)'}
                           </span>
                         </div>
+
+                        {/* Point Redemption History on Customer Card */}
+                        {(() => {
+                          const redemptions = analytics?.pointRedemptionHistory || [];
+                          const isExpanded = !!expandedRedemptionCustomerIds[cust.id];
+                          const visibleRedemptions = isExpanded ? redemptions : redemptions.slice(0, 2);
+                          return (
+                            <div className="mt-2 p-2.5 rounded-xl bg-purple-50/70 border border-purple-200/70 space-y-1.5">
+                              <div className="flex items-center justify-between gap-1">
+                                <span className="text-[10.5px] font-bold text-purple-900 flex items-center gap-1">
+                                  <Coins className="w-3 h-3 text-purple-600 shrink-0" />
+                                  <span>Riwayat Penukaran Poin</span>
+                                </span>
+                                <span className="text-[10px] font-mono font-black text-purple-700">
+                                  -{formatNumber(analytics?.totalPointsUsed || 0)} Pts
+                                  {(analytics?.totalPointsDiscountRupiah || 0) > 0
+                                    ? ` (-${formatRupiah(analytics?.totalPointsDiscountRupiah || 0)})`
+                                    : ''}
+                                </span>
+                              </div>
+
+                              {redemptions.length === 0 ? (
+                                <p className="text-[10px] text-slate-500 italic">
+                                  Belum ada riwayat penukaran poin.
+                                </p>
+                              ) : (
+                                <div className="space-y-1">
+                                  {visibleRedemptions.map((tx) => (
+                                    <div
+                                      key={tx.id}
+                                      className="flex items-center justify-between gap-2 bg-white/90 px-2 py-1 rounded-lg border border-purple-100 text-[10px]"
+                                    >
+                                      <div className="min-w-0">
+                                        <div className="font-mono font-bold text-slate-800 truncate">
+                                          {tx.invoiceNumber}
+                                        </div>
+                                        <div className="text-[9.5px] text-slate-400">
+                                          {formatDateTime(tx.timestamp)}
+                                        </div>
+                                      </div>
+                                      <div className="text-right shrink-0">
+                                        <div className="font-mono font-bold text-purple-700">
+                                          -{formatNumber(tx.pointsUsed)} Poin
+                                        </div>
+                                        <div className="text-[9.5px] font-mono text-emerald-700">
+                                          -{formatRupiah(tx.pointsDiscountAmount)}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ))}
+
+                                  {redemptions.length > 2 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        sound.playTap();
+                                        setExpandedRedemptionCustomerIds((prev) => ({
+                                          ...prev,
+                                          [cust.id]: !prev[cust.id],
+                                        }));
+                                      }}
+                                      className="w-full text-center text-[10px] font-bold text-purple-700 hover:text-purple-900 py-0.5 cursor-pointer"
+                                    >
+                                      {isExpanded
+                                        ? 'Tampilkan Lebih Sedikit'
+                                        : `Lihat semua (${redemptions.length} penukaran)`}
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -674,10 +1496,10 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                         <button
                           onClick={() => handleSendWA(cust)}
                           className="py-2 px-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold flex items-center justify-center gap-1 transition-colors border border-emerald-200/60"
-                          title="Kirim Saldo Poin ke WhatsApp"
+                          title="Hubungi via WhatsApp (Sapaan Ramah / Tagihan)"
                         >
                           <MessageCircle className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Kirim Poin</span>
+                          <span>Hubungi via WhatsApp</span>
                         </button>
 
                         <button
@@ -873,7 +1695,22 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleExportLoyaltyHistoryCSV(
+                          [selectedCustomerDetail.customer],
+                          transactions,
+                          `riwayat_poin_${selectedCustomerDetail.customer.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`
+                        )
+                      }
+                      className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow-md transition-colors cursor-pointer"
+                      title="Unduh riwayat poin loyalitas pelanggan ini dalam format CSV"
+                    >
+                      <Download className="w-4 h-4" />
+                      <span>Export Poin CSV</span>
+                    </button>
                     <button
                       onClick={() => handleSendWA(selectedCustomerDetail.customer)}
                       className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md transition-colors"
@@ -891,7 +1728,7 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                 </div>
 
                 {/* Behavioral Metrics Grid */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 pt-5 relative z-10">
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3 pt-5 relative z-10">
                   <div className="bg-white/5 border border-white/10 rounded-2xl p-3">
                     <span className="text-[11px] text-slate-400 block mb-0.5">Total Belanja (Spend)</span>
                     <span className="text-sm md:text-base font-black text-emerald-400 font-mono">
@@ -903,6 +1740,16 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     <span className="text-[11px] text-slate-400 block mb-0.5">Total Poin Diperoleh</span>
                     <span className="text-sm md:text-base font-black text-amber-300 font-mono">
                       +{formatNumber(selectedCustomerDetail.totalPointsEarned)}
+                    </span>
+                  </div>
+
+                  <div className="bg-white/5 border border-white/10 rounded-2xl p-3">
+                    <span className="text-[11px] text-slate-400 block mb-0.5">Total Poin Ditukar</span>
+                    <span className="text-sm md:text-base font-black text-purple-300 font-mono">
+                      -{formatNumber(selectedCustomerDetail.totalPointsUsed)}
+                    </span>
+                    <span className="text-[10px] text-purple-200/80 block font-mono">
+                      Hemat {formatRupiah(selectedCustomerDetail.totalPointsDiscountRupiah)}
                     </span>
                   </div>
 
@@ -952,6 +1799,58 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     ))}
                   </div>
                 )}
+
+                {/* Dedicated Point Redemption History Section on Detail Card */}
+                <div className="mt-4 pt-4 border-t border-white/10 relative z-10 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-bold text-purple-200">
+                      <Coins className="w-4 h-4 text-purple-300" />
+                      <span>Riwayat Penukaran Poin Pelanggan</span>
+                      <span className="px-2 py-0.5 rounded-md bg-purple-500/30 border border-purple-400/40 text-[10px] font-mono text-purple-100">
+                        {selectedCustomerDetail.pointRedemptionHistory.length}x Penukaran
+                      </span>
+                    </div>
+                    <div className="text-[11px] font-mono text-purple-200">
+                      Total Terpakai: <strong className="text-white">-{formatNumber(selectedCustomerDetail.totalPointsUsed)} Poin</strong> ({formatRupiah(selectedCustomerDetail.totalPointsDiscountRupiah)})
+                    </div>
+                  </div>
+
+                  {selectedCustomerDetail.pointRedemptionHistory.length === 0 ? (
+                    <div className="p-3 rounded-2xl bg-white/5 border border-white/10 text-xs text-slate-300">
+                      Pelanggan ini belum memiliki riwayat penukaran poin.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-56 overflow-y-auto pr-1">
+                      {selectedCustomerDetail.pointRedemptionHistory.map((tx) => (
+                        <div
+                          key={tx.id}
+                          className="p-2.5 rounded-2xl bg-white/10 border border-white/15 flex items-center justify-between gap-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-mono font-bold text-white truncate">
+                              {tx.invoiceNumber}
+                            </div>
+                            <div className="text-[10px] text-slate-300 flex items-center gap-1 mt-0.5">
+                              <Clock className="w-3 h-3 shrink-0" />
+                              <span className="truncate">{formatDateTime(tx.timestamp)}</span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 truncate">
+                              Kasir: {tx.cashierName} • Tagihan: {formatRupiah(tx.finalAmount)}
+                            </div>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <div className="text-xs font-mono font-black text-purple-300">
+                              -{formatNumber(tx.pointsUsed)} Poin
+                            </div>
+                            <div className="text-[10.5px] font-mono font-bold text-emerald-300">
+                              -{formatRupiah(tx.pointsDiscountAmount)}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -1054,14 +1953,33 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     {filteredActivityTransactions.length} Transaksi Ditemukan
                   </span>
                 </div>
-                {selectedCustomerId !== 'ALL' && (
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
-                    onClick={() => setSelectedCustomerId('ALL')}
-                    className="text-xs text-sky-600 hover:text-sky-700 font-bold"
+                    type="button"
+                    onClick={() =>
+                      handleExportLoyaltyHistoryCSV(
+                        selectedCustomerId === 'ALL'
+                          ? customers
+                          : customers.filter((c) => c.id === selectedCustomerId),
+                        filteredActivityTransactions,
+                        'log_poin_loyalitas'
+                      )
+                    }
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                    title="Ekspor log riwayat poin loyalitas sesuai filter aktif ke file CSV"
                   >
-                    Reset ke Semua Pelanggan
+                    <Download className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Export Riwayat Poin CSV</span>
                   </button>
-                )}
+                  {selectedCustomerId !== 'ALL' && (
+                    <button
+                      onClick={() => setSelectedCustomerId('ALL')}
+                      className="text-xs text-sky-600 hover:text-sky-700 font-bold"
+                    >
+                      Reset ke Semua Pelanggan
+                    </button>
+                  )}
+                </div>
               </div>
 
               {filteredActivityTransactions.length === 0 ? (
@@ -1259,11 +2177,147 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                 />
               </div>
 
-              <div>
-                <label className="text-xs font-bold text-slate-700 block mb-1.5 flex items-center gap-1.5">
-                  <Award className="w-3.5 h-3.5 text-indigo-600" />
-                  <span>Kategori Tier Membership</span>
+              {/* Unique Membership ID for QR Auto-Select */}
+              <div className="p-3 bg-sky-50/70 rounded-2xl border border-sky-200 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-sky-900 flex items-center gap-1.5">
+                    <QrCode className="w-3.5 h-3.5 text-sky-600" />
+                    <span>ID Membership Unik (QR Kasir)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setMembershipId(generateMembershipId());
+                    }}
+                    className="text-[11px] font-bold text-sky-700 hover:text-sky-900 flex items-center gap-1 bg-white px-2 py-0.5 rounded-lg border border-sky-200 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Buat ID Baru</span>
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  value={membershipId}
+                  onChange={(e) => setMembershipId(e.target.value.toUpperCase())}
+                  placeholder="MBR-..."
+                  className="w-full p-2 rounded-xl border border-sky-300 text-xs font-mono font-bold text-sky-900 bg-white focus:border-sky-500 focus:outline-none"
+                />
+                <p className="text-[10px] text-sky-700/80">
+                  Digunakan untuk generate QR Code pelanggan agar kasir dapat scan dan memilih pelanggan secara otomatis saat checkout.
+                </p>
+              </div>
+
+              {/* Kategori Pelanggan (Untuk Penentuan Harga Khusus) */}
+              <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Users className="w-3.5 h-3.5 text-sky-600" />
+                    <span>Kategori Pelanggan (Harga Khusus) *</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setIsCategoryModalOpen(true);
+                    }}
+                    className="text-[11px] font-bold text-sky-700 hover:text-sky-800 flex items-center gap-1 bg-white hover:bg-sky-50 px-2 py-0.5 rounded-lg border border-sky-200 transition-colors shadow-2xs cursor-pointer"
+                  >
+                    <Tag className="w-3 h-3 text-sky-600" />
+                    <span>Kelola Kategori</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {allCustomerCategories.map((cat) => {
+                    const isSelected =
+                      customerCategory.toUpperCase() === cat.toUpperCase() && !customCategoryInput;
+                    const catObj = customerCategories.find((c) => c.name.toUpperCase() === cat.toUpperCase());
+                    const badge = getCustomerCategoryBadge(cat, catObj?.color);
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setCustomerCategory(cat);
+                          setCustomCategoryInput('');
+                          const upper = cat.toUpperCase();
+                          if (upper === 'MEMBER' || upper === 'VIP') {
+                            setIsMember(true);
+                          } else if (upper === 'UMUM') {
+                            setIsMember(false);
+                          }
+                        }}
+                        className={`px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 cursor-pointer ${
+                          isSelected
+                            ? `${badge.bg} ${badge.text} ${badge.border} ring-2 ring-sky-500 shadow-2xs font-black`
+                            : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${badge.dot}`} />
+                        <span>{cat}</span>
+                        {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="pt-1">
+                  <input
+                    type="text"
+                    value={customCategoryInput}
+                    onChange={(e) => {
+                      setCustomCategoryInput(e.target.value);
+                      if (e.target.value.trim()) {
+                        setCustomerCategory(e.target.value.trim().toUpperCase());
+                      }
+                    }}
+                    placeholder="Atau ketik kategori kustom baru (misal: MITRA, KARYAWAN, INSTANSI)..."
+                    className="w-full p-2 rounded-xl border border-slate-300 text-xs focus:border-sky-500 focus:outline-none uppercase font-semibold bg-white"
+                  />
+                </div>
+              </div>
+
+              {/* Status Member (Poin Loyalitas) */}
+              <div className={`p-3 rounded-2xl border flex items-center justify-between gap-3 transition-colors ${
+                isMember ? 'bg-emerald-50/80 border-emerald-300' : 'bg-slate-50 border-slate-200'
+              }`}>
+                <div>
+                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Sparkles className={`w-3.5 h-3.5 ${isMember ? 'text-amber-500 fill-amber-500' : 'text-slate-400'}`} />
+                    <span>Status Member Aktif (Berhak Dapat &amp; Tukar Poin)</span>
+                  </div>
+                  <p className="text-[10.5px] text-slate-500 mt-0.5">
+                    {isMember
+                      ? 'Aktif: Pelanggan ini mendapatkan poin setiap berbelanja sesuai aturan Admin.'
+                      : 'Non-Member: Pelanggan ini tidak akan menerima poin belanja.'}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={isMember}
+                    onChange={(e) => {
+                      sound.playTap();
+                      setIsMember(e.target.checked);
+                    }}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
                 </label>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                    <Award className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Status Loyalitas (Tier Membership)</span>
+                  </label>
+                  <span className="text-[10px] text-emerald-600 font-semibold">
+                    Harga khusus mengikuti Kategori Pelanggan
+                  </span>
+                </div>
                 <div className="grid grid-cols-4 gap-2">
                   {[
                     { tier: 'REGULER' as const, label: 'Reguler', color: 'border-slate-300 text-slate-700 bg-white' },
@@ -1283,13 +2337,7 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     >
                       <span className="uppercase text-[10px] tracking-wider">{t.tier}</span>
                       <span className="text-[9px] font-normal opacity-70">
-                        {t.tier === 'SILVER'
-                          ? `Diskon ${storeSettings?.membershipDiscounts?.silver ?? 3}%`
-                          : t.tier === 'GOLD'
-                          ? `Diskon ${storeSettings?.membershipDiscounts?.gold ?? 5}%`
-                          : t.tier === 'PLATINUM'
-                          ? `Diskon ${storeSettings?.membershipDiscounts?.platinum ?? 10}%`
-                          : 'Non-diskon'}
+                        {t.tier === 'REGULER' ? 'Standard' : 'Loyalitas Poin'}
                       </span>
                     </button>
                   ))}
@@ -1783,6 +2831,126 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
           </div>
         </div>
       )}
+      {/* Customer Member QR Code Card Modal */}
+      {qrCustomer && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 select-none">
+          <div className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            {/* Dark Header */}
+            <div className="bg-slate-900 text-white p-5 relative">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setQrCustomer(null);
+                }}
+                className="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <div className="flex items-center gap-2 text-sky-400 text-[11px] font-bold uppercase tracking-wider">
+                <QrCode className="w-4 h-4" />
+                <span>Kartu QR Member Digital</span>
+              </div>
+              <h3 className="text-lg font-black mt-1 pr-8">{qrCustomer.name}</h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {qrCustomer.customerCategory || 'REGULER'} • Tier {qrCustomer.membershipTier || 'REGULER'} • {qrCustomer.phone}
+              </p>
+            </div>
+
+            {/* QR Body */}
+            <div className="p-6 flex flex-col items-center text-center space-y-4">
+              <div className="p-3 bg-white rounded-2xl border-2 border-slate-200 shadow-sm">
+                {qrDataUrl ? (
+                  <img
+                    src={qrDataUrl}
+                    alt={`QR Member ${qrCustomer.name}`}
+                    className="w-56 h-56 object-contain"
+                  />
+                ) : (
+                  <div className="w-56 h-56 flex items-center justify-center text-xs text-slate-400">
+                    Membuat QR Code...
+                  </div>
+                )}
+              </div>
+
+              {/* Membership ID Copy Pill */}
+              <div className="w-full p-3 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-2">
+                <div className="text-left min-w-0">
+                  <div className="text-[10px] font-bold text-slate-400 uppercase">ID Membership</div>
+                  <div className="text-sm font-black font-mono text-sky-800 truncate">
+                    {getCustomerMembershipId(qrCustomer)}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const code = getCustomerMembershipId(qrCustomer);
+                    navigator.clipboard?.writeText(code).catch(() => {});
+                    sound.playTap();
+                    setCopiedMemberId(code);
+                    setTimeout(() => setCopiedMemberId(null), 2000);
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-white hover:bg-sky-50 border border-slate-200 text-xs font-bold text-slate-700 flex items-center gap-1.5 shrink-0 cursor-pointer"
+                >
+                  {copiedMemberId === getCustomerMembershipId(qrCustomer) ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span className="text-emerald-700">Disalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-sky-600" />
+                      <span>Salin ID</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Kasir dapat memindai QR Code ini pada layar POS atau jendela Pilih Pelanggan untuk langsung memilih{' '}
+                <strong className="text-slate-700">{qrCustomer.name}</strong> saat checkout.
+              </p>
+
+              {/* Actions */}
+              <div className="w-full grid grid-cols-2 gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleDownloadMemberQrCard(qrCustomer)}
+                  className="py-2.5 px-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Unduh Kartu PNG</span>
+                </button>
+
+                <a
+                  href={formatWhatsAppUrl(
+                    qrCustomer.whatsapp || qrCustomer.phone,
+                    `Halo ${qrCustomer.name}, berikut ID Member Anda di ${storeSettings?.storeName || 'KasirKu Store'}: *${getCustomerMembershipId(qrCustomer)}*. Tunjukkan ID atau Kartu QR Member ini saat berbelanja untuk mendapatkan poin & harga khusus.`
+                  )}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => sound.playTap()}
+                  className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm"
+                >
+                  <MessageCircle className="w-4 h-4" />
+                  <span>Kirim ID via WA</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Customer Category Management Modal (CRUD) */}
+      <CustomerCategoryModal
+        isOpen={isCategoryModalOpen}
+        onClose={() => setIsCategoryModalOpen(false)}
+        categories={customerCategories}
+        customers={customers}
+        onAddCategory={onAddCustomerCategory || (() => {})}
+        onUpdateCategory={onUpdateCustomerCategory || (() => {})}
+        onDeleteCategory={onDeleteCustomerCategory || (() => {})}
+      />
     </div>
   );
 };

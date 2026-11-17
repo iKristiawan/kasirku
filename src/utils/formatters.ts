@@ -47,8 +47,8 @@ export function formatWhatsAppUrl(rawPhone: string, message: string): string {
   return `https://api.whatsapp.com/send?phone=${cleaned}&text=${encodeURIComponent(message)}`;
 }
 
-export function generateInvoiceNumber(): string {
-  const now = new Date();
+export function generateInvoiceNumber(timestamp?: number): string {
+  const now = timestamp ? new Date(timestamp) : new Date();
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
@@ -62,4 +62,13 @@ export function generatePONumber(): string {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const rand = Math.floor(100 + Math.random() * 900);
   return `PO/${year}${month}/${rand}`;
+}
+
+export function generateOnlineOrderCode(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const rand = Math.floor(1000 + Math.random() * 9000);
+  return `ONL-${year}${month}${day}-${rand}`;
 }

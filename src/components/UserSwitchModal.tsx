@@ -160,12 +160,14 @@ export const UserSwitchModal: React.FC<UserSwitchModalProps> = ({
             <div className="mt-4 p-3 bg-slate-50 rounded-2xl border border-slate-200 text-xs text-slate-500 space-y-1">
               <div className="font-semibold text-slate-700 flex items-center gap-1">
                 <HelpCircle className="w-3.5 h-3.5 text-sky-500" />
-                <span>PIN Bawaan (Default):</span>
+                <span>PIN Masuk Kasir &amp; Admin:</span>
               </div>
-              <div className="grid grid-cols-3 gap-1 text-[11px] font-mono text-slate-600 pt-1">
-                <div>Admin: <b>1234</b></div>
-                <div>Manager: <b>2345</b></div>
-                <div>Kasir: <b>3456</b></div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono text-slate-600 pt-1">
+                {users.map((u) => (
+                  <div key={u.id}>
+                    {u.name}: <b>{u.pin}</b> ({u.role})
+                  </div>
+                ))}
               </div>
             </div>
           </div>

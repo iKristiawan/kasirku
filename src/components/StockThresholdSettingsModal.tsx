@@ -78,6 +78,7 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
   const [filterSupplierCategories, setFilterSupplierCategories] = useState<boolean>(false);
   const [customReorderQtys, setCustomReorderQtys] = useState<Record<string, number>>({});
   const [customSelectedUnits, setCustomSelectedUnits] = useState<Record<string, string>>({});
+  const [customUnitCosts, setCustomUnitCosts] = useState<Record<string, number>>({});
   const [excludedFromPO, setExcludedFromPO] = useState<Record<string, boolean>>({});
   const [poNote, setPoNote] = useState<string>('Mohon konfirmasi ketersediaan barang & estimasi jam pengiriman. Terima kasih!');
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
@@ -148,9 +149,24 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
       const defaultOrderInUnit = Math.max(1, Math.ceil(defaultBaseOrderQty / convFactor));
       const orderQty = customReorderQtys[p.id] !== undefined ? customReorderQtys[p.id] : defaultOrderInUnit;
 
-      const unitCost = (unitObj?.costPrice && unitObj.costPrice > 0)
-        ? unitObj.costPrice
-        : (p.costPrice * convFactor);
+      // Unit cost: Prioritize latest p.costPrice from product form
+      const baseCost = p.costPrice > 0 ? p.costPrice : (p.units[0]?.costPrice || 0);
+
+      // Determine default purchase cost for this packaging unit
+      let defaultUnitCost = baseCost;
+      if (convFactor > 1) {
+        // If unitObj has an explicit valid costPrice that is NOT the corrupted 120000 (when factor != 12)
+        if (unitObj?.costPrice && unitObj.costPrice > 0 && !(unitObj.costPrice === 120000 && convFactor !== 12)) {
+          defaultUnitCost = unitObj.costPrice;
+        } else {
+          defaultUnitCost = Math.round(baseCost * convFactor);
+        }
+      }
+
+      // Check per-unit custom cost override: keyed by `${p.id}_${selectedUnitName}` or `${p.id}`
+      const unitKey = `${p.id}_${selectedUnitName}`;
+      const customCost = customUnitCosts[unitKey] !== undefined ? customUnitCosts[unitKey] : customUnitCosts[p.id];
+      const unitCost = customCost !== undefined ? customCost : defaultUnitCost;
       const totalEstimatedCost = orderQty * unitCost;
 
       const isExcluded = !!excludedFromPO[p.id];
@@ -168,7 +184,7 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
         isExcluded,
       };
     });
-  }, [lowStockProducts, thresholds, activeSupplier, filterSupplierCategories, customSelectedUnits, customReorderQtys, excludedFromPO]);
+  }, [lowStockProducts, thresholds, activeSupplier, filterSupplierCategories, customSelectedUnits, customReorderQtys, customUnitCosts, excludedFromPO]);
 
   // Active items included in PO (not unchecked)
   const activePOItems = useMemo(() => {
@@ -227,13 +243,30 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
     }));
   };
 
-  // Change order unit for a product (e.g. PCS -> DUS)
+  // Change order unit for a product (e.g. PCS -> ZAK)
   const handleUnitChange = (productId: string, unitName: string) => {
     sound.playTap();
     setCustomSelectedUnits((prev) => ({
       ...prev,
       [productId]: unitName,
     }));
+    // Clear legacy cost override so the new unit's cost recalculates freshly
+    setCustomUnitCosts((prev) => {
+      const next = { ...prev };
+      delete next[productId];
+      return next;
+    });
+  };
+
+  // Adjust purchase unit cost for a product in PO
+  const handleUnitCostChange = (productId: string, newCost: number, unitName?: string) => {
+    setCustomUnitCosts((prev) => {
+      const next = { ...prev, [productId]: Math.max(0, newCost) };
+      if (unitName) {
+        next[`${productId}_${unitName}`] = Math.max(0, newCost);
+      }
+      return next;
+    });
   };
 
   // Toggle exclusion of an item from PO
@@ -936,10 +969,22 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
                         </div>
 
                         {/* Estimated Cost */}
-                        <div className="text-right min-w-[100px]">
-                          <div className="text-[10px] text-slate-400">Subtotal Estimasi</div>
-                          <div className="text-xs font-bold text-slate-900 font-mono">
-                            {formatRupiah(item.totalEstimatedCost)}
+                        <div className="text-right min-w-[120px]">
+                          <div className="text-[10px] text-slate-400">Harga Beli / Satuan</div>
+                          <div className="flex items-center justify-end gap-1 my-0.5">
+                            <span className="text-[10px] text-slate-400 font-mono">@</span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.unitCost}
+                              disabled={!isChecked}
+                              onChange={(e) => handleUnitCostChange(p.id, parseFloat(e.target.value) || 0, item.selectedUnitName)}
+                              className="w-20 text-right p-1 bg-white border border-slate-200 rounded-lg text-xs font-mono font-bold text-slate-900 focus:outline-none focus:border-emerald-500 disabled:opacity-40"
+                              title="Harga beli / modal satuan untuk pemesanan PO ini"
+                            />
+                          </div>
+                          <div className="text-[11px] font-bold text-emerald-700 font-mono">
+                            Subtotal: {formatRupiah(item.totalEstimatedCost)}
                           </div>
                         </div>
                       </div>

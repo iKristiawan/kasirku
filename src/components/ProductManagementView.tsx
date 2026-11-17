@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useDeferredValue, useEffect } from 'react';
 import { 
   Package, 
   Search, 
@@ -29,8 +29,22 @@ import {
   Truck,
   RotateCcw,
   BarChart3,
-  SwitchCamera
+  SwitchCamera,
+  Wrench,
+  Clock,
+  UserCheck,
+  Briefcase,
+  FileSpreadsheet,
+  Download,
+  CalendarDays,
+  Users,
+  Calculator,
+  Coins,
+  ArrowUpDown,
+  QrCode,
+  Printer
 } from 'lucide-react';
+import QRCode from 'qrcode';
 import { 
   ResponsiveContainer, 
   BarChart, 
@@ -40,44 +54,217 @@ import {
   Tooltip, 
   Cell 
 } from 'recharts';
-import { Product, ProductUnit, ProductCategory, UserRole, Transaction } from '../types/pos';
+import { Product, ProductUnit, ProductVariant, ProductCategory, UserRole, Transaction, CustomerSpecialPrice, CustomerCategoryItem } from '../types/pos';
 import { formatRupiah, formatNumber } from '../utils/formatters';
+import { getItemFifoCogs } from '../utils/fifoUtils';
 import { sound } from '../utils/audio';
 import { CATEGORY_COLOR_PRESETS, getCategoryColor, isDarkColor } from '../utils/categoryColors';
+import { deleteDocumentFromFirestore } from '../utils/firebaseSync';
+import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { getCustomerCategoryBadge, DEFAULT_CUSTOMER_CATEGORIES } from '../utils/customerUtils';
+import * as XLSX from 'xlsx';
+
+/**
+ * Automatically forwards and increments the highest sequential SKU in store
+ */
+export const getNextSequentialSku = (existingProducts: Product[], isService: boolean = false): string => {
+  const prefix = isService ? 'JSA-' : 'SKU-';
+  const targetProducts = existingProducts.filter((p) => isService ? p.productType === 'JASA' : p.productType !== 'JASA');
+  let maxNum = 0;
+  let detectedPrefix = prefix;
+
+  targetProducts.forEach((p) => {
+    const code = (p.sku || p.barcode || '').trim();
+    if (!code) return;
+    const match = code.match(/^(.*?)(\d+)$/);
+    if (match) {
+      const pfx = match[1];
+      const num = parseInt(match[2], 10);
+      if (!isNaN(num) && num > maxNum) {
+        maxNum = num;
+        if (pfx) detectedPrefix = pfx;
+      }
+    }
+  });
+
+  const nextNum = maxNum + 1;
+  return `${detectedPrefix}${String(nextNum).padStart(4, '0')}`;
+};
 
 interface ProductManagementViewProps {
   products: Product[];
   categories: ProductCategory[];
+  customerCategories?: CustomerCategoryItem[];
   currentUserRole: UserRole;
   transactions?: Transaction[];
   onAddProduct: (product: Omit<Product, 'id'>) => void;
+  onBatchAddProducts?: (products: Omit<Product, 'id'>[]) => void;
   onUpdateProduct: (product: Product) => void;
   onDeleteProduct: (productId: string) => void;
   onAddCategory?: (category: Omit<ProductCategory, 'id'>) => ProductCategory;
+  onBatchAddCategories?: (categories: Omit<ProductCategory, 'id'>[]) => void;
   onUpdateCategory?: (category: ProductCategory) => void;
   onDeleteCategory?: (categoryId: string) => void;
   onOpenThresholdSettings?: () => void;
   onNavigateToSuppliers?: () => void;
+  onNavigateToServices?: () => void;
 }
 
 export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   products,
   categories,
+  customerCategories = [],
   currentUserRole,
   transactions = [],
   onAddProduct,
+  onBatchAddProducts,
   onUpdateProduct,
   onDeleteProduct,
   onAddCategory,
+  onBatchAddCategories,
   onUpdateCategory,
   onDeleteCategory,
   onOpenThresholdSettings,
   onNavigateToSuppliers,
+  onNavigateToServices,
 }) => {
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [selectedCategory, setSelectedCategory] = useState('SEMUA');
+  const [sortField, setSortField] = useState<'DEFAULT' | 'SKU' | 'NAME' | 'CATEGORY' | 'STOCK'>('DEFAULT');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState<25 | 50 | 100>(50);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [isAddingNew, setIsAddingNew] = useState(false);
+  const [skuQrProduct, setSkuQrProduct] = useState<Product | null>(null);
+  const [skuQrDataUrl, setSkuQrDataUrl] = useState<string>('');
+
+  const productMap = useMemo(() => {
+    const map = new Map<string, Product>();
+    for (let i = 0; i < products.length; i++) {
+      map.set(products[i].id, products[i]);
+    }
+    return map;
+  }, [products]);
+
+  const categoryCountMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < products.length; i++) {
+      const k = (products[i].category || '').toLowerCase();
+      map.set(k, (map.get(k) || 0) + 1);
+    }
+    return map;
+  }, [products]);
+
+  const customerCategoryColorMap = useMemo(() => {
+    const map = new Map<string, string | undefined>();
+    customerCategories.forEach((c) => {
+      map.set(c.name.toUpperCase(), c.color);
+    });
+    return map;
+  }, [customerCategories]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!skuQrProduct) {
+      setSkuQrDataUrl('');
+      return;
+    }
+    const skuCode = (skuQrProduct.sku || skuQrProduct.barcode || skuQrProduct.id).trim();
+    QRCode.toDataURL(skuCode, {
+      width: 340,
+      margin: 2,
+      color: { dark: '#0f172a', light: '#ffffff' },
+    })
+      .then((url) => {
+        if (!cancelled) setSkuQrDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setSkuQrDataUrl('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skuQrProduct]);
+
+  const handleDownloadSkuQrLabel = async (prod: Product) => {
+    sound.playTap();
+    const skuCode = (prod.sku || prod.barcode || prod.id).trim();
+    const basePrice = prod.units?.[0]?.sellingPrice || 0;
+    const baseUnitName = prod.units?.[0]?.unitName || prod.baseUnit;
+
+    try {
+      const qrPng = await QRCode.toDataURL(skuCode, {
+        width: 340,
+        margin: 2,
+        color: { dark: '#0f172a', light: '#ffffff' },
+      });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 540;
+      canvas.height = 660;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      // White label card with crisp dark border
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
+
+      // Header bar
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(12, 12, canvas.width - 24, 66);
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(prod.category.toUpperCase(), canvas.width / 2, 52);
+
+      // Product Name
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 26px sans-serif';
+      const displayTitle = prod.name.length > 30 ? prod.name.slice(0, 29) + '…' : prod.name;
+      ctx.fillText(displayTitle, canvas.width / 2, 120);
+
+      // QR Code
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, (canvas.width - 320) / 2, 146, 320, 320);
+
+        // SKU Pill
+        ctx.fillStyle = '#f1f5f9';
+        ctx.fillRect(70, 484, canvas.width - 140, 48);
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(70, 484, canvas.width - 140, 48);
+
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(skuCode, canvas.width / 2, 517);
+
+        // Selling Price
+        ctx.fillStyle = '#0369a1';
+        ctx.font = 'bold 34px sans-serif';
+        ctx.fillText(`${formatRupiah(basePrice)} / ${baseUnitName}`, canvas.width / 2, 588);
+
+        ctx.fillStyle = '#64748b';
+        ctx.font = '14px sans-serif';
+        ctx.fillText('Scan QR Code ini di kasir untuk input cepat & cek stok', canvas.width / 2, 624);
+
+        const link = document.createElement('a');
+        link.href = canvas.toDataURL('image/png');
+        link.download = `QR-SKU-${skuCode.replace(/[^a-z0-9-_]/gi, '_')}.png`;
+        link.click();
+      };
+      img.src = qrPng;
+    } catch (err) {
+      console.error('Gagal membuat gambar label QR SKU:', err);
+    }
+  };
 
   // Category Manager Modal state
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
@@ -85,29 +272,94 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const [categoryNameInput, setCategoryNameInput] = useState('');
   const [categoryColorInput, setCategoryColorInput] = useState(CATEGORY_COLOR_PRESETS[0].hex);
   const [categoryDescInput, setCategoryDescInput] = useState('');
-
   // Quick inline category create inside product form
   const [showInlineCatCreator, setShowInlineCatCreator] = useState(false);
   const [inlineCatName, setInlineCatName] = useState('');
   const [inlineCatColor, setInlineCatColor] = useState(CATEGORY_COLOR_PRESETS[2].hex);
 
-  // Form states for Product
+  // Item type filter: 'ALL' | 'BARANG' | 'JASA'
+  const [productTypeFilter, setProductTypeFilter] = useState<'ALL' | 'BARANG' | 'JASA'>('ALL');
+  const [showLowStockOnly, setShowLowStockOnly] = useState<boolean>(false);
+
+  // Customer Category names list
+  const availableCategoryNames = useMemo(() => {
+    if (customerCategories && customerCategories.length > 0) {
+      return customerCategories.map((c) => c.name);
+    }
+    return DEFAULT_CUSTOMER_CATEGORIES;
+  }, [customerCategories]);
+
+  // Form states for Product & Service
+  const [productType, setProductType] = useState<'BARANG' | 'JASA'>('BARANG');
   const [name, setName] = useState('');
   const [barcode, setBarcode] = useState('');
   const [category, setCategory] = useState('Sembako');
   const [baseUnit, setBaseUnit] = useState('PCS');
   const [stockInBaseUnit, setStockInBaseUnit] = useState('100');
   const [minStockAlert, setMinStockAlert] = useState('15');
-  const [costPrice, setCostPrice] = useState('10000');
+  const [costPrice, setCostPrice] = useState('0');
   const [imageUrl, setImageUrl] = useState('');
+  const [expiryDate, setExpiryDate] = useState<string>('');
+  const [serviceDurationMinutes, setServiceDurationMinutes] = useState('30');
+  const [technicianName, setTechnicianName] = useState('');
+  const [serviceNotes, setServiceNotes] = useState('');
   const [units, setUnits] = useState<ProductUnit[]>([
-    { id: 'u_1', unitName: 'PCS', conversionFactor: 1, sellingPrice: 12000, costPrice: 10000 },
+    { id: 'u_1', unitName: 'PCS', conversionFactor: 1, sellingPrice: 0, costPrice: 0 },
   ]);
+  const [variants, setVariants] = useState<ProductVariant[]>([]);
+  const [variantLabel, setVariantLabel] = useState<string>('Rasa');
+  const [variantInput, setVariantInput] = useState<string>('');
+  const [customerPrices, setCustomerPrices] = useState<CustomerSpecialPrice[]>([]);
+
+  // CSV Import States
+  const [isCsvModalOpen, setIsCsvModalOpen] = useState(false);
+  const [csvFileName, setCsvFileName] = useState('');
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [csvRawRows, setCsvRawRows] = useState<string[][]>([]);
+  const [csvMapping, setCsvMapping] = useState<{
+    sku: string;
+    name: string;
+    category: string;
+    baseUnit: string;
+    sellingPrice: string;
+    costPrice: string;
+    stock: string;
+    minStock: string;
+    expiryDate: string;
+    variants: string;
+    imageUrl: string;
+  }>({
+    sku: '',
+    name: '',
+    category: '',
+    baseUnit: '',
+    sellingPrice: '',
+    costPrice: '',
+    stock: '',
+    minStock: '',
+    expiryDate: '',
+    variants: '',
+    imageUrl: '',
+  });
+  const [csvImportSuccessMessage, setCsvImportSuccessMessage] = useState<string | null>(null);
+  const [productToDelete, setProductToDelete] = useState<Product | null>(null);
+  const [scanningUnitIndex, setScanningUnitIndex] = useState<number | null>(null);
+
+  // Automatically compute next sequential SKU from database products
+  const nextSuggestedSku = useMemo(() => {
+    return getNextSequentialSku(products, productType === 'JASA');
+  }, [products, productType]);
 
   // Top 5 Best Sellers Chart states
   const [salesTimeframe, setSalesTimeframe] = useState<'30_DAYS' | '7_DAYS' | 'ALL'>('30_DAYS');
   const [salesMetric, setSalesMetric] = useState<'QTY' | 'REVENUE'>('QTY');
   const [isChartExpanded, setIsChartExpanded] = useState<boolean>(true);
+
+  // FIFO Gross Profit Summary Card states
+  const [profitTimeframe, setProfitTimeframe] = useState<'TODAY' | '7_DAYS' | '30_DAYS' | 'ALL'>('ALL');
+  const [profitSortBy, setProfitSortBy] = useState<'PROFIT' | 'REVENUE' | 'MARGIN' | 'QTY'>('PROFIT');
+  const [profitSearch, setProfitSearch] = useState<string>('');
+  const [isProfitCardExpanded, setIsProfitCardExpanded] = useState<boolean>(true);
 
   // Camera capture states
   const [isCameraModalOpen, setIsCameraModalOpen] = useState(false);
@@ -147,7 +399,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
     filteredTx.forEach((tx) => {
       tx.items.forEach((item) => {
-        const prod = products.find((p) => p.id === item.productId);
+        const prod = productMap.get(item.productId);
         const baseUnit = prod?.baseUnit || 'PCS';
         const category = prod?.category || 'Umum';
         const unitsSold = item.quantity * (item.conversionFactor || 1);
@@ -170,7 +422,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     });
 
     const list = Array.from(statsMap.values()).map((stat) => {
-      const prod = products.find((p) => p.id === stat.productId);
+      const prod = productMap.get(stat.productId);
       const currentStock = prod ? prod.stockInBaseUnit : 0;
       const minAlert = prod ? prod.minStockAlert : 10;
       const costPrice = prod ? prod.costPrice : 0;
@@ -201,7 +453,124 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     );
 
     return list.slice(0, 5);
-  }, [transactions, products, salesTimeframe, salesMetric]);
+  }, [transactions, productMap, salesTimeframe, salesMetric]);
+
+  // FIFO Gross Profit Summary per product based on processed transactions
+  const fifoGrossProfitSummary = useMemo(() => {
+    const productMap = new Map<string, Product>();
+    products.forEach((p) => productMap.set(p.id, p));
+
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayStartMs = startOfToday.getTime();
+
+    const filteredTx = transactions.filter((tx) => {
+      if (profitTimeframe === 'TODAY') return tx.timestamp >= todayStartMs;
+      if (profitTimeframe === '7_DAYS') return now - tx.timestamp <= 7 * 86400000;
+      if (profitTimeframe === '30_DAYS') return now - tx.timestamp <= 30 * 86400000;
+      return true;
+    });
+
+    interface FifoProductProfitAccumulator {
+      productId: string;
+      productName: string;
+      category: string;
+      baseUnit: string;
+      isService: boolean;
+      unitsSold: number;
+      totalRevenue: number;
+      totalFifoCogs: number;
+      txCount: number;
+      fifoBatchItemCount: number;
+      totalLineItems: number;
+    }
+
+    const profitMap = new Map<string, FifoProductProfitAccumulator>();
+    let grandRevenue = 0;
+    let grandFifoCogs = 0;
+    let fifoVerifiedItemsCount = 0;
+    let totalItemsCount = 0;
+
+    filteredTx.forEach((tx) => {
+      (tx.items || []).forEach((item) => {
+        const prod = productMap.get(item.productId);
+        const isService = Boolean(item.isService || prod?.productType === 'JASA');
+        const baseUnit = prod?.baseUnit || item.unitName || 'PCS';
+        const category = prod?.category || 'Umum';
+        const unitsSold = (item.quantity || 0) * (item.conversionFactor || 1);
+        const revenue = item.totalAmount || 0;
+        const fifoCogs = getItemFifoCogs(item, prod);
+        const hasBatchAudit = Boolean(item.batchDeductions && item.batchDeductions.length > 0);
+
+        totalItemsCount += 1;
+        if (hasBatchAudit) fifoVerifiedItemsCount += 1;
+        grandRevenue += revenue;
+        grandFifoCogs += fifoCogs;
+
+        const existing = profitMap.get(item.productId) || {
+          productId: item.productId,
+          productName: item.productName || prod?.name || 'Produk',
+          category,
+          baseUnit,
+          isService,
+          unitsSold: 0,
+          totalRevenue: 0,
+          totalFifoCogs: 0,
+          txCount: 0,
+          fifoBatchItemCount: 0,
+          totalLineItems: 0,
+        };
+
+        existing.unitsSold += unitsSold;
+        existing.totalRevenue += revenue;
+        existing.totalFifoCogs += fifoCogs;
+        existing.txCount += 1;
+        existing.totalLineItems += 1;
+        if (hasBatchAudit) existing.fifoBatchItemCount += 1;
+
+        profitMap.set(item.productId, existing);
+      });
+    });
+
+    const allRows = Array.from(profitMap.values()).map((row) => {
+      const grossProfit = row.totalRevenue - row.totalFifoCogs;
+      const marginPercent = row.totalRevenue > 0 ? (grossProfit / row.totalRevenue) * 100 : 0;
+      const avgFifoCostPerUnit = row.unitsSold > 0 ? Math.round(row.totalFifoCogs / row.unitsSold) : 0;
+      return {
+        ...row,
+        grossProfit,
+        marginPercent,
+        avgFifoCostPerUnit,
+        product: productMap.get(row.productId),
+      };
+    });
+
+    const q = profitSearch.trim().toLowerCase();
+    const visibleRows = allRows
+      .filter((r) => !q || r.productName.toLowerCase().includes(q) || r.category.toLowerCase().includes(q))
+      .sort((a, b) => {
+        if (profitSortBy === 'REVENUE') return b.totalRevenue - a.totalRevenue;
+        if (profitSortBy === 'MARGIN') return b.marginPercent - a.marginPercent;
+        if (profitSortBy === 'QTY') return b.unitsSold - a.unitsSold;
+        return b.grossProfit - a.grossProfit;
+      });
+
+    const grandGrossProfit = grandRevenue - grandFifoCogs;
+    const overallMarginPercent = grandRevenue > 0 ? (grandGrossProfit / grandRevenue) * 100 : 0;
+
+    return {
+      rows: visibleRows,
+      totalProductsSold: allRows.length,
+      transactionCount: filteredTx.length,
+      grandRevenue,
+      grandFifoCogs,
+      grandGrossProfit,
+      overallMarginPercent,
+      fifoVerifiedItemsCount,
+      totalItemsCount,
+    };
+  }, [transactions, products, profitTimeframe, profitSearch, profitSortBy]);
 
   // Camera Helper Functions
   const startCamera = async (facingModeOverride?: 'environment' | 'user') => {
@@ -210,22 +579,45 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setCapturedPhotoPreview(null);
     setIsCameraModalOpen(true);
 
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraError('Browser atau halaman saat ini tidak mendukung akses kamera. Pastikan halaman berjalan di HTTPS.');
+      return;
+    }
+
     const targetFacing = facingModeOverride || cameraFacingMode;
     if (cameraStream) {
       cameraStream.getTracks().forEach((track) => track.stop());
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: targetFacing, width: { ideal: 640 }, height: { ideal: 640 } },
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: targetFacing }, width: { ideal: 640 }, height: { ideal: 640 } },
+          audio: false,
+        });
+      } catch (constraintErr) {
+        const errName = (constraintErr as { name?: string })?.name || '';
+        if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errName === 'SecurityError') {
+          throw constraintErr;
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
       setCameraStream(stream);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.play().catch(() => {});
       }
     } catch (err: any) {
-      setCameraError('Izin kamera tidak aktif atau kamera tidak tersedia pada perangkat.');
+      const errName = err?.name || '';
+      if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errName === 'SecurityError') {
+        setCameraError('Izin akses kamera ditolak browser. Aktifkan izin kamera pada ikon gembok/address bar browser.');
+      } else {
+        setCameraError('Izin kamera tidak aktif atau kamera tidak tersedia pada perangkat.');
+      }
     }
   };
 
@@ -297,8 +689,42 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     sound.playTap();
     const reader = new FileReader();
     reader.onload = (event) => {
-      const res = event.target?.result as string;
-      setImageUrl(res);
+      const rawDataUrl = event.target?.result as string;
+      if (!rawDataUrl) return;
+
+      // Compress and resize uploaded image on an offscreen canvas (max 400px JPEG 0.78)
+      // to keep localStorage & Firestore documents lightweight and snappy
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 400;
+        let targetW = img.width || maxDim;
+        let targetH = img.height || maxDim;
+        if (targetW > maxDim || targetH > maxDim) {
+          if (targetW >= targetH) {
+            targetH = Math.max(1, Math.round((targetH * maxDim) / targetW));
+            targetW = maxDim;
+          } else {
+            targetW = Math.max(1, Math.round((targetW * maxDim) / targetH));
+            targetH = maxDim;
+          }
+        }
+        const offscreen = document.createElement('canvas');
+        offscreen.width = targetW;
+        offscreen.height = targetH;
+        const ctx = offscreen.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, targetW, targetH);
+          ctx.drawImage(img, 0, 0, targetW, targetH);
+          setImageUrl(offscreen.toDataURL('image/jpeg', 0.78));
+        } else {
+          setImageUrl(rawDataUrl);
+        }
+      };
+      img.onerror = () => {
+        setImageUrl(rawDataUrl);
+      };
+      img.src = rawDataUrl;
     };
     reader.readAsDataURL(file);
     e.target.value = '';
@@ -321,42 +747,240 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     };
   }, [cameraStream]);
 
-  // Unique list of category names (from configured categories + any existing in products)
-  const categoryNamesList = React.useMemo(() => {
-    const names = new Set<string>();
-    categories.forEach((c) => names.add(c.name));
-    products.forEach((p) => {
-      if (p.category) names.add(p.category);
+  const [dismissedAutoCategories, setDismissedAutoCategories] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('kasir_dismissed_auto_categories');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const updateDismissedAutoCategories = (updater: (prev: string[]) => string[]) => {
+    setDismissedAutoCategories((prev) => {
+      const next = updater(prev);
+      try {
+        localStorage.setItem('kasir_dismissed_auto_categories', JSON.stringify(next));
+      } catch {}
+      return next;
     });
-    return Array.from(names);
+  };
+
+  // Detect any categories present in products (e.g. from imported Excel/CSV) that are not yet registered in categories list
+  const autoDetectedCategories = useMemo<ProductCategory[]>(() => {
+    const existingLower = new Set(
+      categories.map((c) => (c.name || '').trim().toLowerCase()).filter(Boolean)
+    );
+    const dismissedSet = new Set(
+      dismissedAutoCategories.map((n) => n.trim().toLowerCase()).filter(Boolean)
+    );
+    const seenLower = new Set<string>();
+    const detected: ProductCategory[] = [];
+
+    products.forEach((p) => {
+      const cleanName = (p.category || '').trim();
+      if (!cleanName) return;
+      const lower = cleanName.toLowerCase();
+      if (existingLower.has(lower) || dismissedSet.has(lower) || seenLower.has(lower)) return;
+      seenLower.add(lower);
+
+      detected.push({
+        id: `auto_cat_${encodeURIComponent(lower)}`,
+        name: cleanName,
+        color: getCategoryColor(cleanName, categories, p),
+        description: 'Terdeteksi dari produk / file impor',
+      });
+    });
+
+    return detected;
+  }, [categories, products, dismissedAutoCategories]);
+
+  // Combined list of saved categories + newly detected categories from products
+  const mergedCategories = useMemo<ProductCategory[]>(
+    () => [...categories, ...autoDetectedCategories],
+    [categories, autoDetectedCategories]
+  );
+
+  // Unique list of category names (from configured categories + any existing in products, case-insensitive deduped)
+  const categoryNamesList = React.useMemo(() => {
+    const names: string[] = [];
+    const seenLower = new Set<string>();
+    const addName = (raw?: string) => {
+      const clean = (raw || '').trim();
+      if (!clean) return;
+      const lower = clean.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        names.push(clean);
+      }
+    };
+    categories.forEach((c) => addName(c.name));
+    products.forEach((p) => addName(p.category));
+    return names;
   }, [categories, products]);
 
-  const filterTabs = ['SEMUA', ...categoryNamesList];
+  const filterTabs = useMemo(() => ['SEMUA', ...categoryNamesList], [categoryNamesList]);
 
-  const filteredProducts = products.filter((p) => {
-    const matchCat = selectedCategory === 'SEMUA' || p.category === selectedCategory;
-    const matchSearch =
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.barcode.toLowerCase().includes(search.toLowerCase()) ||
-      p.category.toLowerCase().includes(search.toLowerCase()) ||
-      p.units.some((u) => u.unitName.toLowerCase().includes(search.toLowerCase()));
-    return matchCat && matchSearch;
-  });
+  const { physicalProductsCount, serviceProductsCount, lowStockProductsCount } = useMemo(() => {
+    let physical = 0;
+    let service = 0;
+    let low = 0;
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      if (p.productType === 'JASA') {
+        service += 1;
+      } else {
+        physical += 1;
+        if (p.stockInBaseUnit <= p.minStockAlert) {
+          low += 1;
+        }
+      }
+    }
+    return { physicalProductsCount: physical, serviceProductsCount: service, lowStockProductsCount: low };
+  }, [products]);
+
+  const filteredProducts = useMemo(() => {
+    const q = deferredSearch.trim().toLowerCase();
+    const list = products.filter((p) => {
+      const pType = p.productType || 'BARANG';
+      if (productTypeFilter !== 'ALL' && pType !== productTypeFilter) return false;
+      if (showLowStockOnly && (pType === 'JASA' || p.stockInBaseUnit > p.minStockAlert)) return false;
+      if (selectedCategory !== 'SEMUA' && p.category !== selectedCategory) return false;
+      if (!q) return true;
+
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.barcode.toLowerCase().includes(q) ||
+        (p.sku && p.sku.toLowerCase().includes(q)) ||
+        p.category.toLowerCase().includes(q) ||
+        (p.technicianName && p.technicianName.toLowerCase().includes(q)) ||
+        p.units.some((u) => u.unitName.toLowerCase().includes(q) || (u.barcode && u.barcode.toLowerCase().includes(q))) ||
+        (p.variants && p.variants.some((v) => v.name.toLowerCase().includes(q) || (v.barcode && v.barcode.toLowerCase().includes(q))))
+      );
+    });
+
+    if (sortField === 'DEFAULT') return list;
+
+    const dir = sortDirection === 'asc' ? 1 : -1;
+    const compareText = (aVal: string, bVal: string) =>
+      aVal.localeCompare(bVal, 'id', { numeric: true, sensitivity: 'base' });
+
+    return [...list].sort((a, b) => {
+      if (sortField === 'SKU') {
+        const skuA = (a.sku || a.barcode || '').trim();
+        const skuB = (b.sku || b.barcode || '').trim();
+        if (!skuA && skuB) return 1;
+        if (skuA && !skuB) return -1;
+        const cmp = compareText(skuA, skuB) * dir;
+        if (cmp !== 0) return cmp;
+        return compareText((a.name || '').trim(), (b.name || '').trim());
+      }
+
+      if (sortField === 'NAME') {
+        const cmp = compareText((a.name || '').trim(), (b.name || '').trim()) * dir;
+        if (cmp !== 0) return cmp;
+        return compareText((a.sku || a.barcode || '').trim(), (b.sku || b.barcode || '').trim());
+      }
+
+      if (sortField === 'CATEGORY') {
+        const catA = (a.category || '').trim();
+        const catB = (b.category || '').trim();
+        if (!catA && catB) return 1;
+        if (catA && !catB) return -1;
+        const cmp = compareText(catA, catB) * dir;
+        if (cmp !== 0) return cmp;
+        return compareText((a.name || '').trim(), (b.name || '').trim());
+      }
+
+      if (sortField === 'STOCK') {
+        const isServiceA = a.productType === 'JASA';
+        const isServiceB = b.productType === 'JASA';
+        if (isServiceA && !isServiceB) return 1;
+        if (!isServiceA && isServiceB) return -1;
+        const stockDiff = ((Number(a.stockInBaseUnit) || 0) - (Number(b.stockInBaseUnit) || 0)) * dir;
+        if (stockDiff !== 0) return stockDiff;
+        return compareText((a.name || '').trim(), (b.name || '').trim());
+      }
+
+      return 0;
+    });
+  }, [products, productTypeFilter, showLowStockOnly, selectedCategory, deferredSearch, sortField, sortDirection]);
+
+  const handleToggleSortField = (field: 'SKU' | 'NAME' | 'CATEGORY' | 'STOCK') => {
+    sound.playTap();
+    if (sortField === field) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+  };
+
+  const totalPages = Math.max(1, Math.ceil(filteredProducts.length / pageSize));
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [deferredSearch, selectedCategory, productTypeFilter, showLowStockOnly, pageSize, sortField, sortDirection]);
+
+  const paginatedProducts = useMemo(() => {
+    const start = (safeCurrentPage - 1) * pageSize;
+    return filteredProducts.slice(start, start + pageSize);
+  }, [filteredProducts, safeCurrentPage, pageSize]);
 
   const openAddModal = () => {
     sound.playTap();
+    setProductType('BARANG');
     setName('');
-    setBarcode(Math.floor(899000000000 + Math.random() * 999999999).toString());
-    const defaultCat = categories[0]?.name || 'Sembako';
+    // Leave barcode empty without hardcoding so it cleanly continues sequential SKU
+    setBarcode('');
+    const defaultCat = categories.find((c) => !c.name.toLowerCase().includes('jasa') && !c.name.toLowerCase().includes('layanan'))?.name || categories[0]?.name || 'Sembako';
     setCategory(defaultCat);
     setBaseUnit('PCS');
     setStockInBaseUnit('100');
     setMinStockAlert('15');
-    setCostPrice('10000');
+    setCostPrice('0');
     setImageUrl('');
+    setExpiryDate('');
+    setServiceDurationMinutes('30');
+    setTechnicianName('');
+    setServiceNotes('');
     setUnits([
-      { id: 'u_base', unitName: 'PCS', conversionFactor: 1, sellingPrice: 13000, costPrice: 10000 },
+      { id: 'u_base', unitName: 'PCS', conversionFactor: 1, sellingPrice: 0, costPrice: 0 },
     ]);
+    setVariants([]);
+    setVariantLabel('Rasa');
+    setVariantInput('');
+    setCustomerPrices([]);
+    setShowInlineCatCreator(false);
+    setIsAddingNew(true);
+    setEditingProduct(null);
+  };
+
+  const openAddServiceModal = () => {
+    sound.playTap();
+    setProductType('JASA');
+    setName('');
+    setBarcode('');
+    const serviceCat = categories.find((c) => c.name.toLowerCase().includes('jasa') || c.name.toLowerCase().includes('layanan') || c.name.toLowerCase().includes('service'))?.name || 'Jasa & Layanan';
+    setCategory(serviceCat);
+    setBaseUnit('SESI');
+    setStockInBaseUnit('99999'); // Non-inventoried unlimited
+    setMinStockAlert('0');
+    setCostPrice('0'); // Biaya modal / komisi teknisi
+    setImageUrl('');
+    setExpiryDate('');
+    setServiceDurationMinutes('45');
+    setTechnicianName('');
+    setServiceNotes('');
+    setUnits([
+      { id: 'u_jasa_base', unitName: 'SESI', conversionFactor: 1, sellingPrice: 50000, costPrice: 0 },
+    ]);
+    setVariants([]);
+    setVariantLabel('Tipe');
+    setVariantInput('');
+    setCustomerPrices([]);
     setShowInlineCatCreator(false);
     setIsAddingNew(true);
     setEditingProduct(null);
@@ -365,31 +989,112 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const openEditModal = (prod: Product) => {
     sound.playTap();
     setEditingProduct(prod);
+    setProductType(prod.productType || 'BARANG');
     setName(prod.name);
-    setBarcode(prod.barcode);
+    setBarcode(prod.sku || prod.barcode);
     setCategory(prod.category);
     setBaseUnit(prod.baseUnit);
     setStockInBaseUnit(prod.stockInBaseUnit.toString());
     setMinStockAlert(prod.minStockAlert.toString());
-    setCostPrice(prod.costPrice.toString());
+    const effectiveCost = prod.costPrice !== undefined ? prod.costPrice : (prod.units[0]?.costPrice || 0);
+    setCostPrice(effectiveCost.toString());
     setImageUrl(prod.imageUrl || '');
-    setUnits([...prod.units]);
+    setExpiryDate(prod.expiryDate || '');
+    setServiceDurationMinutes((prod.serviceDurationMinutes || 30).toString());
+    setTechnicianName(prod.technicianName || '');
+    setServiceNotes(prod.serviceNotes || '');
+    setUnits(
+      prod.units.map((u, i) => {
+        const factor = u.conversionFactor || 1;
+        let uCost = u.costPrice;
+        if (i === 0) {
+          uCost = effectiveCost;
+        } else if (uCost === undefined || uCost === null || uCost <= 0 || (uCost === 120000 && factor !== 12)) {
+          uCost = Math.round(effectiveCost * factor);
+        }
+        return {
+          ...u,
+          costPrice: uCost,
+        };
+      })
+    );
+    setVariants(prod.variants ? [...prod.variants] : []);
+    setVariantLabel(prod.variantLabel || 'Rasa');
+    setVariantInput('');
+    setCustomerPrices(prod.customerPrices ? [...prod.customerPrices] : []);
     setShowInlineCatCreator(false);
     setIsAddingNew(false);
+  };
+
+  // Reaktif update state costPrice dan satuan dasar (units[0]) serta satuan turunan
+  const handleCostPriceChange = (val: string) => {
+    setCostPrice(val);
+    const parsedCost = Math.max(0, parseFloat(val) || 0);
+    setUnits((prevUnits) =>
+      prevUnits.map((u, i) => {
+        if (i === 0) {
+          return { ...u, costPrice: parsedCost };
+        }
+        return {
+          ...u,
+          costPrice: Math.round(parsedCost * (u.conversionFactor || 1)),
+        };
+      })
+    );
+  };
+
+  const isDuplicateSku = useMemo(() => {
+    const trimmed = barcode.trim().toUpperCase();
+    if (!trimmed) return false;
+    return products.some((p) => {
+      if (editingProduct && p.id === editingProduct.id) return false;
+      return (p.sku && p.sku.toUpperCase() === trimmed) || (p.barcode && p.barcode.toUpperCase() === trimmed);
+    });
+  }, [barcode, products, editingProduct]);
+
+  const handleAddVariant = (customName?: string) => {
+    const val = (customName || variantInput).trim();
+    if (!val) return;
+    if (variants.some((v) => v.name.toLowerCase() === val.toLowerCase())) {
+      setVariantInput('');
+      return;
+    }
+    sound.playTap();
+    const defaultPrice = units[0]?.sellingPrice || 0;
+    setVariants([
+      ...variants,
+      {
+        id: 'var_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        name: val,
+        price: defaultPrice,
+        barcode: '',
+      },
+    ]);
+    setVariantInput('');
+  };
+
+  const handleVariantChange = (index: number, field: keyof ProductVariant, value: any) => {
+    const updated = [...variants];
+    updated[index] = { ...updated[index], [field]: value };
+    setVariants(updated);
   };
 
   // Add unit row to form
   const handleAddUnitRow = () => {
     sound.playTap();
     const newId = 'u_' + Date.now();
+    const defaultUnitName = productType === 'JASA' ? 'PAKET' : 'DUS';
+    const defaultFactor = productType === 'JASA' ? 1 : 12;
+    const baseCost = Math.max(0, parseFloat(units[0]?.costPrice?.toString() || costPrice || '0') || 0);
+    const baseSelling = units[0]?.sellingPrice || 0;
     setUnits([
       ...units,
       {
         id: newId,
-        unitName: 'DUS',
-        conversionFactor: 12,
-        sellingPrice: (units[0]?.sellingPrice || 10000) * 11, // discount bulk
-        costPrice: (units[0]?.costPrice || 8000) * 12,
+        unitName: defaultUnitName,
+        conversionFactor: defaultFactor,
+        sellingPrice: baseSelling > 0 ? baseSelling * (productType === 'JASA' ? 2 : defaultFactor) : 0,
+        costPrice: Math.round(baseCost * defaultFactor),
       },
     ]);
   };
@@ -397,7 +1102,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const handleRemoveUnitRow = (index: number) => {
     sound.playTap();
     if (units.length <= 1) {
-      alert('Produk harus memiliki minimal 1 satuan dasar!');
+      alert(productType === 'JASA' ? 'Jasa harus memiliki minimal 1 satuan tarif dasar!' : 'Produk harus memiliki minimal 1 satuan dasar!');
       return;
     }
     const updated = [...units];
@@ -406,36 +1111,143 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   };
 
   const handleUnitChange = (index: number, field: keyof ProductUnit, value: any) => {
-    const updated = [...units];
-    updated[index] = { ...updated[index], [field]: value };
-    setUnits(updated);
+    setUnits((prevUnits) => {
+      const updated = [...prevUnits];
+      let val = value;
+      if (field === 'conversionFactor') {
+        const factor = Math.max(1, parseFloat(value) || 1);
+        val = factor;
+        const baseCost = Math.max(0, parseFloat(prevUnits[0]?.costPrice?.toString() || costPrice || '0') || 0);
+        const baseSelling = Math.max(0, parseFloat(prevUnits[0]?.sellingPrice?.toString() || '0') || 0);
+        updated[index] = {
+          ...updated[index],
+          conversionFactor: factor,
+          costPrice: Math.round(baseCost * factor),
+          sellingPrice: Math.round(baseSelling * factor),
+        };
+        return updated;
+      }
+      if (field === 'sellingPrice') {
+        const parsedSelling = Math.max(0, parseFloat(value) || 0);
+        val = parsedSelling;
+        if (index === 0) {
+          // Base selling price updated -> auto-adjust all higher units proportionally
+          return updated.map((u, i) => {
+            if (i === 0) return { ...u, sellingPrice: parsedSelling };
+            return {
+              ...u,
+              sellingPrice: Math.round(parsedSelling * (u.conversionFactor || 1)),
+            };
+          });
+        }
+      }
+      if (field === 'costPrice') {
+        const parsedCost = Math.max(0, parseFloat(value) || 0);
+        val = parsedCost;
+        if (index === 0) {
+          setCostPrice(parsedCost.toString());
+          return updated.map((u, i) => {
+            if (i === 0) return { ...u, costPrice: parsedCost };
+            return { ...u, costPrice: Math.round(parsedCost * (u.conversionFactor || 1)) };
+          });
+        }
+      }
+      updated[index] = { ...updated[index], [field]: val };
+      return updated;
+    });
+  };
+
+  // Helper fungsi untuk kelola Harga Khusus Pelanggan
+  const handleAddCustomerPrice = (presetCategory: string = 'VIP') => {
+    sound.playTap();
+    const baseSelling = units[0]?.sellingPrice || 0;
+    const newPrice: CustomerSpecialPrice = {
+      id: 'cp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      customerCategory: presetCategory,
+      price: Math.max(0, Math.round(baseSelling * 0.9)), // default perkiraan hemat 10%
+      unitName: baseUnit,
+      minQuantity: 1, // default syarat minimal pembelian
+      notes: '',
+    };
+    setCustomerPrices((prev) => [...prev, newPrice]);
+  };
+
+  const handleUpdateCustomerPrice = (index: number, field: keyof CustomerSpecialPrice, value: any) => {
+    setCustomerPrices((prev) => {
+      const copy = [...prev];
+      copy[index] = { ...copy[index], [field]: value };
+      return copy;
+    });
+  };
+
+  const handleRemoveCustomerPrice = (index: number) => {
+    sound.playTap();
+    setCustomerPrices((prev) => prev.filter((_, i) => i !== index));
   };
 
   const handleSubmitForm = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !barcode.trim() || units.length === 0) return;
+    const effectiveSku = (barcode.trim() || nextSuggestedSku || `SKU-${Date.now().toString().slice(-4)}`).toUpperCase();
+    if (!name.trim() || units.length === 0) return;
+
+    if (barcode.trim() && isDuplicateSku) {
+      sound.playWarningChime();
+      alert(`SKU "${barcode.trim()}" sudah digunakan oleh produk lain! Setiap produk wajib memiliki SKU unik.`);
+      return;
+    }
 
     sound.playSuccessChime();
 
     const catColor = getCategoryColor(category, categories);
+    const isService = productType === 'JASA';
+    const parsedBaseCost = Math.max(0, parseFloat(units[0]?.costPrice?.toString() || costPrice || '0') || 0);
 
-    const productPayload = {
-      barcode: barcode.trim(),
+    const productPayload: Omit<Product, 'id'> = {
+      productType,
+      barcode: effectiveSku,
+      sku: effectiveSku,
       name: name.trim(),
       category: category.trim(),
       categoryColor: catColor,
       baseUnit: baseUnit.trim().toUpperCase(),
-      stockInBaseUnit: parseFloat(stockInBaseUnit) || 0,
-      minStockAlert: parseFloat(minStockAlert) || 0,
-      costPrice: parseFloat(costPrice) || 0,
+      stockInBaseUnit: isService ? 99999 : (parseFloat(stockInBaseUnit) || 0),
+      minStockAlert: isService ? 0 : (parseFloat(minStockAlert) || 0),
+      costPrice: parsedBaseCost,
       imageUrl: imageUrl.trim(),
-      units: units.map((u, i) => ({
-        ...u,
-        unitName: u.unitName.trim().toUpperCase(),
-        conversionFactor: i === 0 ? 1 : Math.max(1, parseFloat(u.conversionFactor.toString()) || 1),
-        sellingPrice: Math.max(0, parseFloat(u.sellingPrice.toString()) || 0),
-        costPrice: parseFloat(u.costPrice?.toString() || '0') || 0,
-      })),
+      serviceDurationMinutes: isService ? (parseInt(serviceDurationMinutes) || 0) : undefined,
+      technicianName: isService ? technicianName.trim() : undefined,
+      serviceNotes: isService ? serviceNotes.trim() : undefined,
+      expiryDate: (!isService && expiryDate.trim()) ? expiryDate.trim() : undefined,
+      customerPrices: customerPrices.length > 0 ? customerPrices.map((cp) => ({
+        id: cp.id || ('cp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6)),
+        customerCategory: cp.customerCategory.trim().toUpperCase(),
+        price: Math.max(0, parseFloat(cp.price.toString()) || 0),
+        unitName: cp.unitName ? cp.unitName.trim().toUpperCase() : undefined,
+        minQuantity: Math.max(1, parseInt(cp.minQuantity?.toString() || '1') || 1),
+        notes: cp.notes?.trim() || undefined,
+      })) : undefined,
+      variants: variants.length > 0 ? variants.map((v) => ({
+        ...v,
+        name: v.name.trim(),
+        price: v.price !== undefined ? Math.max(0, parseFloat(v.price.toString()) || 0) : undefined,
+        barcode: v.barcode?.trim() || undefined,
+      })) : undefined,
+      variantLabel: variants.length > 0 ? variantLabel.trim() : undefined,
+      units: units.map((u, i) => {
+        const factor = i === 0 ? 1 : Math.max(1, parseFloat(u.conversionFactor.toString()) || 1);
+        const parsedUnitCost = parseFloat(u.costPrice?.toString() || '0');
+        const unitCost = i === 0 
+          ? parsedBaseCost 
+          : (parsedUnitCost > 0 ? parsedUnitCost : Math.round(parsedBaseCost * factor));
+        return {
+          ...u,
+          unitName: u.unitName.trim().toUpperCase(),
+          conversionFactor: factor,
+          sellingPrice: Math.max(0, parseFloat(u.sellingPrice.toString()) || 0),
+          costPrice: unitCost,
+          barcode: u.barcode?.trim() || undefined,
+        };
+      }),
     };
 
     if (editingProduct) {
@@ -451,10 +1263,493 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   };
 
   // =========================================================================
+  // CSV IMPORT PRODUK MASSAL HANDLERS
+  // =========================================================================
+  // EXCEL & CSV IMPORT / EXPORT PRODUK MASSAL HANDLERS
+  // =========================================================================
+
+  // 1. Ekspor Seluruh Data Produk ke File EXCEL (.XLSX)
+  const handleExportExcel = () => {
+    sound.playTap();
+    if (products.length === 0) {
+      alert('Belum ada produk untuk diekspor.');
+      return;
+    }
+
+    const exportData = products.map((p, idx) => {
+      const baseUnit = p.baseUnit || p.units[0]?.unitName || 'PCS';
+      const baseSellPrice = p.units[0]?.sellingPrice || 0;
+      const baseCostPrice = p.costPrice || p.units[0]?.costPrice || 0;
+
+      // Format multi-satuan additional units
+      const multiUnitsStr = p.units
+        .filter((u, uIdx) => uIdx > 0 || u.conversionFactor > 1)
+        .map((u) => `${u.unitName}:${u.conversionFactor}:${u.sellingPrice}:${u.costPrice || 0}:${u.barcode || ''}`)
+        .join('; ');
+
+      // Format variants
+      const variantsStr = (p.variants || [])
+        .map((v) => `${v.name}:${v.price}:${v.barcode || ''}`)
+        .join('; ');
+
+      // Guard Excel cell 32,767 char limit (e.g. if product uses huge legacy inline base64 photo)
+      const rawImageUrl = (p.imageUrl || '').trim();
+      const safeImageUrl = rawImageUrl.length <= 32767 ? rawImageUrl : '';
+
+      return {
+        "No": idx + 1,
+        "SKU": p.sku || p.barcode || `SKU-${idx + 1}`,
+        "Barcode": p.barcode || '',
+        "Nama Produk": p.name,
+        "Kategori": p.category || 'Umum',
+        "Tipe": p.productType || 'BARANG',
+        "Satuan Dasar": baseUnit,
+        "Stok Dasar": p.stockInBaseUnit || 0,
+        "Batas Peringatan": p.minStockAlert || 10,
+        "Harga Modal / Beli (Rp)": baseCostPrice,
+        "Harga Jual Dasar (Rp)": baseSellPrice,
+        "Tanggal Kadaluarsa": p.expiryDate || '-',
+        "Konfigurasi Multi Satuan": multiUnitsStr,
+        "Varian": variantsStr,
+        "URL Gambar": safeImageUrl,
+        "Jumlah Batch FIFO": p.batches?.length || 0
+      };
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(exportData);
+    XLSX.utils.book_append_sheet(wb, ws, 'Data Produk Kasirku');
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    XLSX.writeFile(wb, `Data_Produk_Kasirku_${todayStr}.xlsx`);
+  };
+
+  // 2. Unduh Template Excel (.XLSX) dengan Contoh Pengisian Realistis & Petunjuk
+  const handleDownloadExcelTemplate = () => {
+    sound.playTap();
+    
+    // Sheet 1: Contoh Pengisian Realistis (Berbagai Kategori & Multi-Satuan)
+    const sampleRows = [
+      {
+        "SKU": "BRG-0001",
+        "Barcode": "899238810011",
+        "Nama Produk": "Beras Rojolele Super 5kg",
+        "Kategori": "Sembako",
+        "Tipe (BARANG/JASA)": "BARANG",
+        "Satuan Dasar": "KARUNG",
+        "Stok Dasar": 50,
+        "Batas Peringatan": 10,
+        "Harga Modal / Beli (Rp)": 66000,
+        "Harga Jual Dasar (Rp)": 76000,
+        "Tanggal Kadaluarsa": "2027-06-30",
+        "Satuan Tambahan": "BAL (Isi 5):5:370000:325000:899238810012",
+        "Varian": "",
+        "URL Gambar": "https://images.unsplash.com/photo-1586201375761-83865001e31c?w=300&auto=format&fit=crop&q=80"
+      },
+      {
+        "SKU": "BRG-0002",
+        "Barcode": "899886620022",
+        "Nama Produk": "Indomie Goreng Spesial",
+        "Kategori": "Makanan Instan",
+        "Tipe (BARANG/JASA)": "BARANG",
+        "Satuan Dasar": "BUNGKUS",
+        "Stok Dasar": 240,
+        "Batas Peringatan": 40,
+        "Harga Modal / Beli (Rp)": 2900,
+        "Harga Jual Dasar (Rp)": 3500,
+        "Tanggal Kadaluarsa": "2026-12-15",
+        "Satuan Tambahan": "DUS (Isi 40):40:128000:112000:899886620024; RENCENG (Isi 10):10:33000:28500:899886620023",
+        "Varian": "Pedas:3500:899886620025; Rendang:3500:899886620026",
+        "URL Gambar": "https://images.unsplash.com/photo-1612927601601-6638404737ce?w=300&auto=format&fit=crop&q=80"
+      },
+      {
+        "SKU": "BRG-0003",
+        "Barcode": "899300550055",
+        "Nama Produk": "Teh Pucuk Harum 350ml",
+        "Kategori": "Minuman",
+        "Tipe (BARANG/JASA)": "BARANG",
+        "Satuan Dasar": "BOTOL",
+        "Stok Dasar": 120,
+        "Batas Peringatan": 24,
+        "Harga Modal / Beli (Rp)": 4800,
+        "Harga Jual Dasar (Rp)": 6500,
+        "Tanggal Kadaluarsa": "2026-11-30",
+        "Satuan Tambahan": "DUS (Isi 24):24:148000:112000:899300550056",
+        "Varian": "Jasmine:6500:899300550057; Less Sugar:6500:899300550058",
+        "URL Gambar": "https://images.unsplash.com/photo-1556881286-fc6915169721?w=300&auto=format&fit=crop&q=80"
+      },
+      {
+        "SKU": "BRG-0004",
+        "Barcode": "899455660066",
+        "Nama Produk": "Whiskas Pouch Tuna 85g",
+        "Kategori": "Perawatan Diri",
+        "Tipe (BARANG/JASA)": "BARANG",
+        "Satuan Dasar": "PCS",
+        "Stok Dasar": 80,
+        "Batas Peringatan": 15,
+        "Harga Modal / Beli (Rp)": 15500,
+        "Harga Jual Dasar (Rp)": 18500,
+        "Tanggal Kadaluarsa": "2027-02-28",
+        "Satuan Tambahan": "DUS (Isi 24):24:430000:365000:899455660067",
+        "Varian": "Tuna:18500:899455660068; Salmon:18500:899455660069",
+        "URL Gambar": ""
+      },
+      {
+        "SKU": "JSA-0001",
+        "Barcode": "",
+        "Nama Produk": "Grooming Kucing Lengkap",
+        "Kategori": "Layanan Jasa",
+        "Tipe (BARANG/JASA)": "JASA",
+        "Satuan Dasar": "SESI",
+        "Stok Dasar": 0,
+        "Batas Peringatan": 0,
+        "Harga Modal / Beli (Rp)": 25000,
+        "Harga Jual Dasar (Rp)": 75000,
+        "Tanggal Kadaluarsa": "",
+        "Satuan Tambahan": "",
+        "Varian": "Kutu & Jamur:85000:; Mandi Biasa:65000:",
+        "URL Gambar": ""
+      }
+    ];
+
+    // Sheet 2: Petunjuk Format Pengisian
+    const instructions = [
+      { "Kolom": "SKU", "Keterangan": "Kode unik produk (wajib). Kosongkan jika ingin sistem membuatkan otomatis (SKU-XXXX)." },
+      { "Kolom": "Barcode", "Keterangan": "Nomor barcode fisik untuk scan menggunakan kamera atau alat barcode scanner." },
+      { "Kolom": "Nama Produk", "Keterangan": "Nama lengkap barang atau jasa (wajib)." },
+      { "Kolom": "Kategori", "Keterangan": "Kategori barang (cth: Sembako, Minuman, Makanan). Kategori baru akan otomatis ditambahkan ke sistem." },
+      { "Kolom": "Tipe (BARANG/JASA)", "Keterangan": "Isi BARANG untuk stok fisik, atau JASA untuk layanan jasa yang tidak membutuhkan stok." },
+      { "Kolom": "Satuan Dasar", "Keterangan": "Satuan terkecil produk (cth: PCS, BOTOL, BUNGKUS, KARUNG)." },
+      { "Kolom": "Stok Dasar", "Keterangan": "Jumlah stok awal dalam satuan dasar (cth: 100)." },
+      { "Kolom": "Batas Peringatan", "Keterangan": "Batas minimum stok untuk memunculkan notifikasi habis (cth: 15)." },
+      { "Kolom": "Harga Modal / Beli (Rp)", "Keterangan": "Harga modal/pembelian awal per satuan dasar (HPP FIFO)." },
+      { "Kolom": "Harga Jual Dasar (Rp)", "Keterangan": "Harga jual kepada konsumen untuk 1 satuan dasar (wajib)." },
+      { "Kolom": "Tanggal Kadaluarsa", "Keterangan": "Format tanggal YYYY-MM-DD (cth: 2026-12-31) untuk pelacakan batch expired." },
+      { "Kolom": "Satuan Tambahan", "Keterangan": "Format: NamaSatuan:FaktorKonversi:HargaJual:HargaBeli:Barcode. Pisahkan dengan tanda titik koma (;) jika lebih dari 1 satuan." },
+      { "Kolom": "Varian", "Keterangan": "Format: NamaVarian:HargaJual:Barcode. Pisahkan dengan titik koma (;) jika lebih dari 1 varian." },
+      { "Kolom": "URL Gambar", "Keterangan": "Link URL gambar produk (opsional, cth: https://domain.com/gambar-produk.jpg). Kosongkan jika tidak ada gambar." }
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws1 = XLSX.utils.json_to_sheet(sampleRows);
+    const ws2 = XLSX.utils.json_to_sheet(instructions);
+
+    XLSX.utils.book_append_sheet(wb, ws1, 'Contoh Pengisian Produk');
+    XLSX.utils.book_append_sheet(wb, ws2, 'Petunjuk Format Pengisian');
+
+    XLSX.writeFile(wb, 'template_import_produk_kasirku.xlsx');
+  };
+
+  // Helper parser for line CSV fallback
+  const parseCsvLine = (line: string, delimiter: string): string[] => {
+    const result: string[] = [];
+    let current = '';
+    let insideQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        insideQuotes = !insideQuotes;
+      } else if (char === delimiter && !insideQuotes) {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    result.push(current.trim());
+    return result.map((col) => col.replace(/^"(.*)"$/, '$1').trim());
+  };
+
+  // 3. Upload File Handler (Mendukung Excel .xlsx, .xls dan .csv)
+  const handleCsvFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    sound.playTap();
+    setCsvFileName(file.name);
+    setCsvImportSuccessMessage(null);
+
+    const isExcel = /\.(xlsx|xls)$/i.test(file.name);
+
+    if (isExcel) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const buffer = event.target?.result as ArrayBuffer;
+          const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+          const firstSheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheetName];
+          const rawSheetData = XLSX.utils.sheet_to_json<string[]>(worksheet, { header: 1, defval: '' });
+
+          if (!rawSheetData || rawSheetData.length < 2) {
+            alert('File Excel harus memiliki minimal 1 baris judul kolom dan 1 baris data produk.');
+            return;
+          }
+
+          const headers = (rawSheetData[0] || []).map((h) => String(h).trim()).filter(Boolean);
+          const rows: string[][] = [];
+
+          for (let i = 1; i < rawSheetData.length; i++) {
+            const rowCols = (rawSheetData[i] || []).map((c) => String(c).trim());
+            if (rowCols.some((c) => c.length > 0)) {
+              rows.push(rowCols);
+            }
+          }
+
+          setCsvHeaders(headers);
+          setCsvRawRows(rows);
+
+          // Auto mapping
+          const autoMap = {
+            sku: headers.find((h) => /sku|kode|barcode/i.test(h)) || headers[0] || '',
+            name: headers.find((h) => /nama|name|produk|barang/i.test(h)) || headers[1] || '',
+            category: headers.find((h) => /kategori|category/i.test(h)) || '',
+            baseUnit: headers.find((h) => /satuan dasar|satuan|unit/i.test(h)) || '',
+            sellingPrice: headers.find((h) => /harga jual|selling|harga|price|jual/i.test(h)) || '',
+            costPrice: headers.find((h) => /modal|beli|cost|hpp/i.test(h)) || '',
+            stock: headers.find((h) => /stok|stock|qty|jumlah/i.test(h)) || '',
+            minStock: headers.find((h) => /min|peringatan|alert|batas/i.test(h)) || '',
+            expiryDate: headers.find((h) => /kadaluarsa|expired|exp/i.test(h)) || '',
+            variants: headers.find((h) => /varian|variant|variasi/i.test(h)) || '',
+            imageUrl: headers.find((h) => /url\s*gambar|gambar|image\s*url|imageurl|image|foto|photo|link\s*gambar|thumbnail/i.test(h)) || '',
+          };
+
+          setCsvMapping(autoMap);
+        } catch (err) {
+          console.error('Gagal membaca file Excel:', err);
+          alert('Format file Excel tidak dapat dibaca. Pastikan format file .xlsx atau .xls valid.');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      // CSV Fallback
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = event.target?.result as string;
+        if (!text) return;
+
+        const lines = text
+          .split(/\r\n|\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+
+        if (lines.length < 2) {
+          alert('File harus memiliki minimal 1 baris judul kolom dan 1 baris data produk.');
+          return;
+        }
+
+        const firstLine = lines[0];
+        const delimiter = firstLine.includes(';') ? ';' : ',';
+        const headers = parseCsvLine(firstLine, delimiter);
+        const rows: string[][] = [];
+
+        for (let i = 1; i < lines.length; i++) {
+          const rowCols = parseCsvLine(lines[i], delimiter);
+          if (rowCols.some((col) => col.length > 0)) {
+            rows.push(rowCols);
+          }
+        }
+
+        setCsvHeaders(headers);
+        setCsvRawRows(rows);
+
+        const autoMap = {
+          sku: headers.find((h) => /sku|kode|barcode/i.test(h)) || headers[0] || '',
+          name: headers.find((h) => /nama|name|produk|barang/i.test(h)) || headers[1] || '',
+          category: headers.find((h) => /kategori|category/i.test(h)) || '',
+          baseUnit: headers.find((h) => /satuan|unit/i.test(h)) || '',
+          sellingPrice: headers.find((h) => /harga jual|selling|harga|price|jual/i.test(h)) || '',
+          costPrice: headers.find((h) => /modal|beli|cost|hpp/i.test(h)) || '',
+          stock: headers.find((h) => /stok|stock|qty|jumlah/i.test(h)) || '',
+          minStock: headers.find((h) => /min|peringatan|alert|batas/i.test(h)) || '',
+          expiryDate: headers.find((h) => /kadaluarsa|expired|exp/i.test(h)) || '',
+          variants: headers.find((h) => /varian|variant|variasi/i.test(h)) || '',
+          imageUrl: headers.find((h) => /url\s*gambar|gambar|image\s*url|imageurl|image|foto|photo|link\s*gambar|thumbnail/i.test(h)) || '',
+        };
+
+        setCsvMapping(autoMap);
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const handleExecuteCsvImport = () => {
+    sound.playTap();
+    if (!csvMapping.sku || !csvMapping.name || !csvMapping.sellingPrice) {
+      alert('Mohon pilih pemetaan kolom wajib: SKU, Nama Produk, dan Harga Jual.');
+      return;
+    }
+
+    const skuIdx = csvHeaders.indexOf(csvMapping.sku);
+    const nameIdx = csvHeaders.indexOf(csvMapping.name);
+    const catIdx = csvHeaders.indexOf(csvMapping.category);
+    const unitIdx = csvHeaders.indexOf(csvMapping.baseUnit);
+    const sellPriceIdx = csvHeaders.indexOf(csvMapping.sellingPrice);
+    const costPriceIdx = csvHeaders.indexOf(csvMapping.costPrice);
+    const stockIdx = csvHeaders.indexOf(csvMapping.stock);
+    const minStockIdx = csvHeaders.indexOf(csvMapping.minStock);
+    const expIdx = csvHeaders.indexOf(csvMapping.expiryDate);
+    const varIdx = csvHeaders.indexOf(csvMapping.variants);
+    const imageUrlIdx = csvHeaders.indexOf(csvMapping.imageUrl);
+
+    const existingSkus = new Set(
+      products.map((p) => (p.sku || p.barcode || '').toUpperCase().trim()).filter(Boolean)
+    );
+
+    const newProductsToCreate: Omit<Product, 'id'>[] = [];
+    const skippedSkus: string[] = [];
+    const seenImportSkus = new Set<string>();
+
+    csvRawRows.forEach((row, rowIdx) => {
+      const rawSku = (skuIdx >= 0 ? row[skuIdx] : '') || `SKU-${Date.now()}-${rowIdx + 1}`;
+      const cleanSku = rawSku.trim().toUpperCase();
+      const rawName = (nameIdx >= 0 ? row[nameIdx] : '').trim();
+
+      if (!rawName) return;
+
+      if (existingSkus.has(cleanSku) || seenImportSkus.has(cleanSku)) {
+        skippedSkus.push(cleanSku);
+        return;
+      }
+
+      seenImportSkus.add(cleanSku);
+
+      const rawCat = (catIdx >= 0 ? row[catIdx] : '').trim() || 'Umum';
+      const rawUnit = (unitIdx >= 0 ? row[unitIdx] : '').trim().toUpperCase() || 'PCS';
+      const rawSellPrice = parseFloat((sellPriceIdx >= 0 ? row[sellPriceIdx] : '').replace(/[^\d.]/g, '')) || 0;
+      const rawCostPrice = parseFloat((costPriceIdx >= 0 ? row[costPriceIdx] : '').replace(/[^\d.]/g, '')) || 0;
+      const rawStock = parseFloat((stockIdx >= 0 ? row[stockIdx] : '').replace(/[^\d.]/g, '')) || 0;
+      const rawMinStock = parseFloat((minStockIdx >= 0 ? row[minStockIdx] : '').replace(/[^\d.]/g, '')) || 10;
+      const rawExpDate = (expIdx >= 0 ? row[expIdx] : '').trim();
+      const rawImageUrl = (imageUrlIdx >= 0 ? row[imageUrlIdx] : '').trim();
+
+      // Parse variants column if provided: format "Nama:Harga:Barcode;Nama2:Harga2:Barcode2" or "Rasa A, Rasa B"
+      let parsedVariants: ProductVariant[] | undefined = undefined;
+      const rawVariantsStr = (varIdx >= 0 ? row[varIdx] : '').trim();
+      if (rawVariantsStr) {
+        const parts = rawVariantsStr.split(/[;,]/).map((p) => p.trim()).filter(Boolean);
+        if (parts.length > 0) {
+          parsedVariants = parts.map((part, vIdx) => {
+            const tokens = part.split(':').map((t) => t.trim());
+            const vName = tokens[0] || `Varian ${vIdx + 1}`;
+            const vPrice = tokens[1] ? (parseFloat(tokens[1]) || rawSellPrice) : rawSellPrice;
+            const vBarcode = tokens[2] || '';
+            return {
+              id: `var_${Date.now()}_${vIdx}_${Math.random().toString(36).substring(2, 6)}`,
+              name: vName,
+              price: vPrice,
+              barcode: vBarcode,
+            };
+          });
+        }
+      }
+
+      const catColor = getCategoryColor(rawCat, categories);
+
+      newProductsToCreate.push({
+        productType: 'BARANG',
+        sku: cleanSku,
+        barcode: cleanSku,
+        name: rawName,
+        category: rawCat,
+        categoryColor: catColor,
+        baseUnit: rawUnit,
+        stockInBaseUnit: rawStock,
+        minStockAlert: rawMinStock,
+        costPrice: rawCostPrice,
+        imageUrl: rawImageUrl || undefined,
+        expiryDate: rawExpDate || undefined,
+        units: [
+          {
+            id: `u_${Date.now()}_${rowIdx}`,
+            unitName: rawUnit,
+            conversionFactor: 1,
+            sellingPrice: rawSellPrice,
+            costPrice: rawCostPrice,
+            barcode: cleanSku,
+          },
+        ],
+        variants: parsedVariants,
+        variantLabel: parsedVariants && parsedVariants.length > 0 ? 'Varian' : undefined,
+      });
+    });
+
+    if (newProductsToCreate.length === 0) {
+      alert('Tidak ada produk valid yang dapat diimpor. Periksa apakah SKU sudah terdaftar atau nama produk kosong.');
+      return;
+    }
+
+    // Ensure imported category names are not suppressed if previously dismissed
+    const importedCategoryLowers = new Set(
+      newProductsToCreate.map((p) => (p.category || '').trim().toLowerCase()).filter(Boolean)
+    );
+    if (importedCategoryLowers.size > 0) {
+      updateDismissedAutoCategories((prev) =>
+        prev.filter((name) => !importedCategoryLowers.has(name.trim().toLowerCase()))
+      );
+    }
+
+    // Batch insert
+    if (onBatchAddProducts) {
+      onBatchAddProducts(newProductsToCreate);
+    } else {
+      newProductsToCreate.forEach((p) => onAddProduct(p));
+      // Fallback category registration when parent didn't pass onBatchAddProducts
+      if (onAddCategory) {
+        const existingLower = new Set(categories.map((c) => (c.name || '').trim().toLowerCase()));
+        newProductsToCreate.forEach((p) => {
+          const cleanCat = (p.category || '').trim();
+          if (cleanCat && !existingLower.has(cleanCat.toLowerCase())) {
+            existingLower.add(cleanCat.toLowerCase());
+            onAddCategory({
+              name: cleanCat,
+              color: p.categoryColor || getCategoryColor(cleanCat, categories),
+              description: 'Otomatis ditambahkan dari impor Excel/CSV',
+            });
+          }
+        });
+      }
+    }
+
+    sound.playSuccessChime();
+    setCsvImportSuccessMessage(
+      `Berhasil mengimpor ${newProductsToCreate.length} produk baru!` +
+      (skippedSkus.length > 0 ? ` (${skippedSkus.length} SKU dilewati karena duplikat)` : '')
+    );
+
+    setTimeout(() => {
+      setIsCsvModalOpen(false);
+      setCsvRawRows([]);
+      setCsvHeaders([]);
+      setCsvFileName('');
+      setCsvImportSuccessMessage(null);
+    }, 2000);
+  };
+
+  // =========================================================================
   // CATEGORY MANAGEMENT HANDLERS
   // =========================================================================
+  const handleSyncDetectedCategories = (catsToSync = autoDetectedCategories) => {
+    if (catsToSync.length === 0) return;
+    const payload = catsToSync.map((c) => ({
+      name: c.name,
+      color: c.color,
+      description: 'Terdeteksi dari impor produk',
+    }));
+    if (onBatchAddCategories) {
+      onBatchAddCategories(payload);
+    } else if (onAddCategory) {
+      payload.forEach((c) => onAddCategory(c));
+    }
+  };
+
   const openCategoryManager = () => {
     sound.playTap();
+    // Auto-register any categories from previously imported files so they appear as permanent categories
+    if (autoDetectedCategories.length > 0) {
+      handleSyncDetectedCategories(autoDetectedCategories);
+    }
     setEditingCategory(null);
     setCategoryNameInput('');
     setCategoryColorInput(CATEGORY_COLOR_PRESETS[0].hex);
@@ -472,15 +1767,38 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
   const handleSaveCategory = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!categoryNameInput.trim()) return;
+    const cleanName = categoryNameInput.trim();
+    if (!cleanName) return;
 
     sound.playSuccessChime();
+    updateDismissedAutoCategories((prev) =>
+      prev.filter((n) => n.trim().toLowerCase() !== cleanName.toLowerCase())
+    );
 
     if (editingCategory) {
-      if (onUpdateCategory) {
+      if (editingCategory.id.startsWith('auto_cat_')) {
+        // Persist newly promoted auto-detected category & sync matching products
+        if (onAddCategory) {
+          onAddCategory({
+            name: cleanName,
+            color: categoryColorInput,
+            description: categoryDescInput.trim() || 'Kategori dari produk impor',
+          });
+        }
+        const oldLower = editingCategory.name.trim().toLowerCase();
+        products.forEach((p) => {
+          if ((p.category || '').trim().toLowerCase() === oldLower) {
+            onUpdateProduct({
+              ...p,
+              category: cleanName,
+              categoryColor: categoryColorInput,
+            });
+          }
+        });
+      } else if (onUpdateCategory) {
         onUpdateCategory({
           ...editingCategory,
-          name: categoryNameInput.trim(),
+          name: cleanName,
           color: categoryColorInput,
           description: categoryDescInput.trim(),
         });
@@ -489,7 +1807,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     } else {
       if (onAddCategory) {
         onAddCategory({
-          name: categoryNameInput.trim(),
+          name: cleanName,
           color: categoryColorInput,
           description: categoryDescInput.trim(),
         });
@@ -502,18 +1820,22 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   };
 
   const handleDeleteCategory = (cat: ProductCategory) => {
-    const productsInCat = products.filter((p) => p.category.toLowerCase() === cat.name.toLowerCase());
+    const catLower = cat.name.trim().toLowerCase();
+    const productsInCat = products.filter((p) => (p.category || '').trim().toLowerCase() === catLower);
     if (productsInCat.length > 0) {
       const confirmDelete = confirm(
         `Kategori "${cat.name}" sedang digunakan oleh ${productsInCat.length} produk. Apakah Anda yakin ingin menghapusnya? Produk akan tetap tersimpan.`
       );
       if (!confirmDelete) return;
+      updateDismissedAutoCategories((prev) =>
+        prev.includes(catLower) ? prev : [...prev, catLower]
+      );
     } else {
       if (!confirm(`Hapus kategori "${cat.name}"?`)) return;
     }
 
     sound.playTap();
-    if (onDeleteCategory) {
+    if (!cat.id.startsWith('auto_cat_') && onDeleteCategory) {
       onDeleteCategory(cat.id);
     }
     if (editingCategory?.id === cat.id) {
@@ -525,15 +1847,19 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const handleCreateInlineCategory = () => {
     if (!inlineCatName.trim()) return;
     sound.playSuccessChime();
+    const clean = inlineCatName.trim();
+    updateDismissedAutoCategories((prev) =>
+      prev.filter((n) => n.trim().toLowerCase() !== clean.toLowerCase())
+    );
     let newCat: ProductCategory | null = null;
     if (onAddCategory) {
       newCat = onAddCategory({
-        name: inlineCatName.trim(),
+        name: clean,
         color: inlineCatColor,
         description: 'Dibuat saat tambah produk',
       });
     }
-    setCategory(newCat ? newCat.name : inlineCatName.trim());
+    setCategory(newCat ? newCat.name : clean);
     setInlineCatName('');
     setShowInlineCatCreator(false);
   };
@@ -544,12 +1870,33 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-2xs">
           <div>
-            <h2 className="text-lg md:text-xl font-bold text-slate-900 flex items-center gap-2">
-              <Package className="w-5 h-5 text-sky-600" />
-              <span>Manajemen Barang & Multi Satuan</span>
-            </h2>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-lg md:text-xl font-bold text-slate-900 flex items-center gap-2">
+                <Package className="w-5 h-5 text-sky-600" />
+                <span>Katalog Barang &amp; Input Jasa Layanan</span>
+              </h2>
+              {lowStockProductsCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setShowLowStockOnly((prev) => !prev);
+                    setProductTypeFilter('BARANG');
+                  }}
+                  title="Klik untuk menyaring produk dengan stok di bawah/pada ambang batas minimum"
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-black border transition-all cursor-pointer ${
+                    showLowStockOnly
+                      ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
+                      : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
+                  }`}
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{lowStockProductsCount} Stok Menipis</span>
+                </button>
+              )}
+            </div>
             <p className="text-xs text-slate-500 mt-0.5">
-              Atur harga jual bertingkat, kelola kategori berwarna untuk POS, dan pantau stok toko.
+              Atur produk fisik, tarif jasa/layanan non-stok, harga jual bertingkat, dan pantau stok toko.
             </p>
           </div>
 
@@ -558,13 +1905,13 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
             <button
               type="button"
               onClick={openCategoryManager}
-              className="px-3.5 py-2.5 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-200 font-bold text-xs md:text-sm flex items-center gap-1.5 transition-colors shadow-2xs"
+              className="px-3.5 py-2.5 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-200 font-bold text-xs md:text-sm flex items-center gap-1.5 transition-colors shadow-2xs cursor-pointer"
               title="Kelola warna dan daftar kategori produk"
             >
               <Palette className="w-4 h-4 text-sky-600" />
               <span>Kelola Kategori</span>
               <span className="ml-1 px-1.5 py-0.2 bg-sky-600 text-white text-[10px] rounded-full">
-                {categories.length}
+                {mergedCategories.length}
               </span>
             </button>
 
@@ -575,7 +1922,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                   sound.playTap();
                   onOpenThresholdSettings();
                 }}
-                className="px-3.5 py-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 font-bold text-xs md:text-sm flex items-center gap-1.5 transition-colors shadow-2xs"
+                className="px-3.5 py-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 font-bold text-xs md:text-sm flex items-center gap-1.5 transition-colors shadow-2xs cursor-pointer"
                 title="Kelola Ambang Batas Minimum Stok untuk seluruh produk"
               >
                 <Sliders className="w-4 h-4 text-amber-700" />
@@ -583,12 +1930,57 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               </button>
             )}
 
+            {/* Dedicated Input Jasa Button */}
             <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                if (onNavigateToServices) {
+                  onNavigateToServices();
+                } else {
+                  openAddServiceModal();
+                }
+              }}
+              className="px-3.5 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all cursor-pointer hover:shadow-md"
+              title="Buka Menu Khusus Jasa & Layanan (Servis, Bengkel, Salon, Cuci, Laundry, dll.)"
+            >
+              <Wrench className="w-4 h-4" />
+              <span>Menu Jasa ({serviceProductsCount})</span>
+            </button>
+
+            {/* Button Ekspor Excel (.XLSX) */}
+            <button
+              type="button"
+              onClick={handleExportExcel}
+              className="px-3.5 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+              title="Ekspor seluruh database produk ke format file Excel (.xlsx)"
+            >
+              <Download className="w-4 h-4" />
+              <span>Ekspor Excel (.XLSX)</span>
+            </button>
+
+            {/* Button Import Excel (.XLSX) */}
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setIsCsvModalOpen(true);
+              }}
+              className="px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+              title="Impor data produk secara massal dengan file Excel (.xlsx) atau CSV"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              <span>Import Excel (.XLSX)</span>
+            </button>
+
+            {/* Button Tambah Barang Fisik */}
+            <button
+              type="button"
               onClick={openAddModal}
-              className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-colors"
+              className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-colors cursor-pointer"
             >
               <Plus className="w-4 h-4 stroke-[2.5]" />
-              <span>Tambah Produk Baru</span>
+              <span>+ Tambah Barang</span>
             </button>
           </div>
         </div>
@@ -918,23 +2310,463 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
           )}
         </div>
 
-        {/* Filter & Search Bar with Color-coded category tags */}
+        {/* =================================================================== */}
+        {/* KARTU RINGKASAN LABA KOTOR PER PRODUK (METODE FIFO)                 */}
+        {/* =================================================================== */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
+          <div className="p-4 md:p-5 border-b border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-3 bg-gradient-to-r from-emerald-50/60 via-white to-teal-50/40">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shadow-md shadow-emerald-600/20 shrink-0">
+                <Coins className="w-5 h-5 text-emerald-50" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="text-base font-bold text-slate-900">
+                    Ringkasan Laba Kotor per Produk (FIFO)
+                  </h3>
+                  <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-md border border-emerald-200">
+                    HPP Batch FIFO
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Total akumulasi laba kotor (Omzet &minus; HPP FIFO) yang dihasilkan tiap produk dari transaksi yang telah diproses.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap self-end md:self-auto">
+              <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 text-xs">
+                {[
+                  { id: 'TODAY', label: 'Hari Ini' },
+                  { id: '7_DAYS', label: '7 Hari' },
+                  { id: '30_DAYS', label: '30 Hari' },
+                  { id: 'ALL', label: 'Semua' },
+                ].map((tf) => (
+                  <button
+                    key={tf.id}
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setProfitTimeframe(tf.id as 'TODAY' | '7_DAYS' | '30_DAYS' | 'ALL');
+                    }}
+                    className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer ${
+                      profitTimeframe === tf.id
+                        ? 'bg-white text-emerald-800 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {tf.label}
+                  </button>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setIsProfitCardExpanded(!isProfitCardExpanded);
+                }}
+                className="p-1.5 rounded-xl border border-slate-200 hover:bg-slate-100 text-slate-600 transition-colors cursor-pointer"
+                title={isProfitCardExpanded ? 'Ciutkan Ringkasan Laba Kotor' : 'Perluas Ringkasan Laba Kotor'}
+              >
+                {isProfitCardExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+
+          {isProfitCardExpanded && (
+            <div className="p-4 md:p-5 space-y-4">
+              {/* KPI Strip */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="p-3.5 rounded-xl bg-emerald-50/90 border border-emerald-200">
+                  <div className="text-[11px] font-bold text-emerald-800 flex items-center justify-between">
+                    <span>Total Laba Kotor FIFO</span>
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-600 text-white text-[10px] font-black font-mono">
+                      {fifoGrossProfitSummary.overallMarginPercent.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className={`text-lg md:text-xl font-black font-mono mt-1 ${
+                    fifoGrossProfitSummary.grandGrossProfit >= 0 ? 'text-emerald-700' : 'text-rose-600'
+                  }`}>
+                    {formatRupiah(fifoGrossProfitSummary.grandGrossProfit)}
+                  </div>
+                  <div className="text-[10px] text-emerald-700/80 mt-0.5">
+                    Margin rata-rata dari omzet
+                  </div>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[11px] font-bold text-slate-600">Total Omzet Produk</div>
+                  <div className="text-base md:text-lg font-black font-mono text-slate-900 mt-1">
+                    {formatRupiah(fifoGrossProfitSummary.grandRevenue)}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    Dari {formatNumber(fifoGrossProfitSummary.transactionCount)} transaksi
+                  </div>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[11px] font-bold text-slate-600">Total HPP (Modal FIFO)</div>
+                  <div className="text-base md:text-lg font-black font-mono text-slate-800 mt-1">
+                    {formatRupiah(fifoGrossProfitSummary.grandFifoCogs)}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    {formatNumber(fifoGrossProfitSummary.fifoVerifiedItemsCount)}/{formatNumber(fifoGrossProfitSummary.totalItemsCount)} baris teraudit batch FIFO
+                  </div>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-sky-50/70 border border-sky-200">
+                  <div className="text-[11px] font-bold text-sky-900">Produk Terjual</div>
+                  <div className="text-base md:text-lg font-black font-mono text-sky-700 mt-1">
+                    {formatNumber(fifoGrossProfitSummary.totalProductsSold)} Produk
+                  </div>
+                  <div className="text-[10px] text-sky-700/80 mt-0.5">
+                    {fifoGrossProfitSummary.totalProductsSold > 0
+                      ? `Rata-rata ${formatRupiah(Math.round(fifoGrossProfitSummary.grandGrossProfit / fifoGrossProfitSummary.totalProductsSold))}/produk`
+                      : 'Belum ada penjualan'}
+                  </div>
+                </div>
+              </div>
+
+              {fifoGrossProfitSummary.totalProductsSold === 0 ? (
+                <div className="p-8 text-center text-slate-400 bg-slate-50/70 rounded-2xl border border-dashed border-slate-200 space-y-1">
+                  <Calculator className="w-8 h-8 text-slate-300 mx-auto" />
+                  <p className="font-bold text-slate-700 text-xs">Belum ada transaksi FIFO pada periode ini</p>
+                  <p className="text-[11px] text-slate-400">
+                    Proses transaksi penjualan di menu Kasir POS untuk menghitung laba kotor FIFO per produk secara otomatis.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {/* Search & Sort Controls */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                    <div className="relative flex-1 max-w-sm">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={profitSearch}
+                        onChange={(e) => setProfitSearch(e.target.value)}
+                        placeholder="Cari nama produk atau kategori..."
+                        className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+                      <span className="text-slate-500 font-semibold flex items-center gap-1 mr-0.5">
+                        <ArrowUpDown className="w-3 h-3" />
+                        <span>Urutkan:</span>
+                      </span>
+                      {[
+                        { id: 'PROFIT', label: 'Laba Tertinggi' },
+                        { id: 'MARGIN', label: 'Margin %' },
+                        { id: 'REVENUE', label: 'Omzet' },
+                        { id: 'QTY', label: 'Unit Terjual' },
+                      ].map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setProfitSortBy(opt.id as 'PROFIT' | 'REVENUE' | 'MARGIN' | 'QTY');
+                          }}
+                          className={`px-2.5 py-1 rounded-lg font-bold border transition-all cursor-pointer ${
+                            profitSortBy === opt.id
+                              ? 'bg-emerald-600 text-white border-emerald-600 shadow-2xs'
+                              : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Per-Product FIFO Gross Profit Table */}
+                  <div className="border border-slate-200 rounded-xl overflow-hidden">
+                    <div className="overflow-x-auto max-h-[360px] overflow-y-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-slate-50 text-slate-600 uppercase text-[10.5px] font-bold border-b border-slate-200 sticky top-0 z-10">
+                          <tr>
+                            <th className="py-2.5 px-3">Produk</th>
+                            <th className="py-2.5 px-3 text-right">Terjual</th>
+                            <th className="py-2.5 px-3 text-right">Omzet</th>
+                            <th className="py-2.5 px-3 text-right">HPP FIFO</th>
+                            <th className="py-2.5 px-3 text-right">Laba Kotor</th>
+                            <th className="py-2.5 px-3 text-right">Margin</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {fifoGrossProfitSummary.rows.length === 0 ? (
+                            <tr>
+                              <td colSpan={6} className="py-6 text-center text-slate-400 text-xs">
+                                Tidak ada produk yang cocok dengan pencarian &ldquo;{profitSearch}&rdquo;.
+                              </td>
+                            </tr>
+                          ) : (
+                            fifoGrossProfitSummary.rows.map((row, idx) => {
+                              const catColor = getCategoryColor(row.category, categories, row.product);
+                              const isPositive = row.grossProfit >= 0;
+                              return (
+                                <tr key={row.productId} className="hover:bg-emerald-50/30 transition-colors">
+                                  <td className="py-2.5 px-3">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span className="w-5 h-5 rounded-md bg-slate-100 text-slate-600 font-bold text-[10px] flex items-center justify-center shrink-0">
+                                        {idx + 1}
+                                      </span>
+                                      <div className="min-w-0">
+                                        <div className="font-bold text-slate-900 truncate flex items-center gap-1.5">
+                                          <span>{row.productName}</span>
+                                          {row.isService && (
+                                            <span className="px-1 py-0.2 rounded bg-purple-100 text-purple-700 text-[9px] font-bold">
+                                              JASA
+                                            </span>
+                                          )}
+                                          {row.fifoBatchItemCount > 0 && (
+                                            <span
+                                              className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 text-[9px] font-bold inline-flex items-center gap-0.5"
+                                              title={`${row.fifoBatchItemCount} dari ${row.totalLineItems} item transaksi menggunakan catatan batch FIFO`}
+                                            >
+                                              <Layers className="w-2.5 h-2.5" />
+                                              <span>FIFO</span>
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-1.5 mt-0.5">
+                                          <span
+                                            className="inline-flex items-center gap-1 text-[10px] font-semibold"
+                                            style={{ color: catColor }}
+                                          >
+                                            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: catColor }} />
+                                            <span>{row.category}</span>
+                                          </span>
+                                          <span className="text-[10px] text-slate-400">&middot; {row.txCount} trx</span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-700 whitespace-nowrap">
+                                    {formatNumber(row.unitsSold)} {row.baseUnit}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono text-slate-700 whitespace-nowrap">
+                                    {formatRupiah(row.totalRevenue)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono text-slate-600 whitespace-nowrap">
+                                    <div>{formatRupiah(row.totalFifoCogs)}</div>
+                                    {row.unitsSold > 0 && (
+                                      <div className="text-[9.5px] text-slate-400">
+                                        @{formatRupiah(row.avgFifoCostPerUnit)}/{row.baseUnit}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className={`py-2.5 px-3 text-right font-mono font-black whitespace-nowrap ${
+                                    isPositive ? 'text-emerald-700' : 'text-rose-600'
+                                  }`}>
+                                    {formatRupiah(row.grossProfit)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                    <span className={`inline-block px-2 py-0.5 rounded-md font-mono font-bold text-[10.5px] ${
+                                      row.marginPercent >= 25
+                                        ? 'bg-emerald-100 text-emerald-800'
+                                        : row.marginPercent >= 10
+                                        ? 'bg-sky-100 text-sky-800'
+                                        : row.marginPercent >= 0
+                                        ? 'bg-amber-100 text-amber-800'
+                                        : 'bg-rose-100 text-rose-800'
+                                    }`}>
+                                      {row.marginPercent.toFixed(1)}%
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1">
+                <span>Dihitung dari selisih omzet penjualan terhadap HPP batch FIFO aktual per transaksi.</span>
+                <span className="font-semibold text-slate-700">Metode Akuntansi: FIFO</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Filter & Search Bar with Color-coded category tags & Type Switcher */}
         <div className="bg-white p-3 md:p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
-          <div className="flex flex-col md:flex-row gap-3 items-center">
+          {/* Top Row: Type Tabs (Semua, Barang Fisik, Jasa/Layanan) */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="inline-flex p-1 bg-slate-100 rounded-xl border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setProductTypeFilter('ALL');
+                    setShowLowStockOnly(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    productTypeFilter === 'ALL' && !showLowStockOnly
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Semua Item ({products.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setProductTypeFilter('BARANG');
+                    setShowLowStockOnly(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                    productTypeFilter === 'BARANG' && !showLowStockOnly
+                      ? 'bg-white text-sky-800 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Package className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Barang Fisik ({physicalProductsCount})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setProductTypeFilter('JASA');
+                    setShowLowStockOnly(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                    productTypeFilter === 'JASA' && !showLowStockOnly
+                      ? 'bg-purple-600 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-purple-700'
+                  }`}
+                >
+                  <Wrench className="w-3.5 h-3.5" />
+                  <span>Jasa &amp; Layanan ({serviceProductsCount})</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setShowLowStockOnly((prev) => !prev);
+                  if (!showLowStockOnly) setProductTypeFilter('BARANG');
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 cursor-pointer ${
+                  showLowStockOnly
+                    ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
+                    : lowStockProductsCount > 0
+                    ? 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
+                    : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Stok Menipis</span>
+                <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-black ${
+                  showLowStockOnly
+                    ? 'bg-white text-rose-600'
+                    : lowStockProductsCount > 0
+                    ? 'bg-rose-600 text-white'
+                    : 'bg-slate-200 text-slate-600'
+                }`}>
+                  {lowStockProductsCount}
+                </span>
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-500 font-semibold self-end sm:self-auto">
+              Total: <span className="font-bold text-slate-800">{filteredProducts.length}</span> item
+            </div>
+          </div>
+
+          <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center">
             <div className="relative flex-1 w-full">
               <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
               <input
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Cari nama produk, barcode, kategori, atau satuan..."
+                placeholder="Cari nama produk / jasa, barcode, kategori, teknisi, atau satuan..."
                 className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs md:text-sm text-slate-900 focus:outline-none focus:border-sky-500"
               />
             </div>
 
-            <div className="text-xs text-slate-500 font-semibold self-end md:self-auto shrink-0">
-              Total: <span className="font-bold text-slate-800">{filteredProducts.length}</span> dari{' '}
-              {products.length} produk
+            {/* Sort By Dropdown & Direction Toggle */}
+            <div className="flex items-center gap-2 shrink-0 flex-wrap">
+              <div
+                className={`flex items-center gap-1.5 border px-3 py-2 rounded-xl text-xs transition-colors ${
+                  sortField !== 'DEFAULT'
+                    ? 'bg-sky-50 border-sky-300 text-sky-900'
+                    : 'bg-slate-50 border-slate-200 text-slate-700'
+                }`}
+              >
+                <ArrowUpDown
+                  className={`w-3.5 h-3.5 shrink-0 ${
+                    sortField !== 'DEFAULT' ? 'text-sky-600' : 'text-slate-400'
+                  }`}
+                />
+                <span className="text-slate-500 font-bold">Urutkan:</span>
+                <select
+                  aria-label="Urutkan Daftar Barang"
+                  value={sortField}
+                  onChange={(e) => {
+                    sound.playTap();
+                    const next = e.target.value as 'DEFAULT' | 'SKU' | 'NAME' | 'CATEGORY' | 'STOCK';
+                    setSortField(next);
+                    if (next === 'DEFAULT') setSortDirection('asc');
+                  }}
+                  className="bg-transparent font-bold text-slate-800 focus:outline-none cursor-pointer"
+                >
+                  <option value="DEFAULT">Default</option>
+                  <option value="SKU">SKU</option>
+                  <option value="NAME">Produk</option>
+                  <option value="CATEGORY">Kategori</option>
+                  <option value="STOCK">Stok Dasar</option>
+                </select>
+              </div>
+
+              {sortField !== 'DEFAULT' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+                    }}
+                    title="Ubah arah urutan"
+                    className="px-3 py-2 rounded-xl text-xs font-bold bg-white border border-slate-200 hover:border-sky-300 hover:bg-sky-50 text-slate-700 transition-colors flex items-center gap-1 cursor-pointer shadow-2xs"
+                  >
+                    {sortDirection === 'asc' ? (
+                      <>
+                        <ChevronUp className="w-3.5 h-3.5 text-sky-600" />
+                        <span>{sortField === 'STOCK' ? 'Terkecil' : 'A → Z'}</span>
+                      </>
+                    ) : (
+                      <>
+                        <ChevronDown className="w-3.5 h-3.5 text-sky-600" />
+                        <span>{sortField === 'STOCK' ? 'Terbesar' : 'Z → A'}</span>
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setSortField('DEFAULT');
+                      setSortDirection('asc');
+                    }}
+                    title="Reset urutan"
+                    className="p-2 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -951,7 +2783,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               const count =
                 cat === 'SEMUA'
                   ? products.length
-                  : products.filter((p) => p.category.toLowerCase() === cat.toLowerCase()).length;
+                  : categoryCountMap.get(cat.toLowerCase()) || 0;
 
               return (
                 <button
@@ -1003,9 +2835,89 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
             <table className="w-full text-left text-xs md:text-sm">
               <thead className="bg-slate-50 text-slate-600 uppercase text-[11px] font-bold border-b border-slate-200 tracking-wider">
                 <tr>
-                  <th className="py-3 px-4">Produk</th>
-                  <th className="py-3 px-4">Kategori Berwarna</th>
-                  <th className="py-3 px-4">Stok Dasar</th>
+                  <th className="py-3 px-4">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleSortField('NAME')}
+                        className={`inline-flex items-center gap-1 uppercase transition-colors cursor-pointer ${
+                          sortField === 'NAME' ? 'text-sky-700 font-black' : 'hover:text-slate-900'
+                        }`}
+                      >
+                        <span>Produk</span>
+                        {sortField === 'NAME' ? (
+                          sortDirection === 'asc' ? (
+                            <ChevronUp className="w-3.5 h-3.5 text-sky-600" />
+                          ) : (
+                            <ChevronDown className="w-3.5 h-3.5 text-sky-600" />
+                          )
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                        )}
+                      </button>
+                      <span className="text-slate-300">/</span>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleSortField('SKU')}
+                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] uppercase transition-colors cursor-pointer ${
+                          sortField === 'SKU'
+                            ? 'bg-sky-100 border-sky-300 text-sky-800 font-black'
+                            : 'bg-white border-slate-200 text-slate-500 hover:text-slate-800 hover:border-slate-300'
+                        }`}
+                      >
+                        <span>SKU</span>
+                        {sortField === 'SKU' ? (
+                          sortDirection === 'asc' ? (
+                            <ChevronUp className="w-3 h-3 text-sky-600" />
+                          ) : (
+                            <ChevronDown className="w-3 h-3 text-sky-600" />
+                          )
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 text-slate-400" />
+                        )}
+                      </button>
+                    </div>
+                  </th>
+                  <th className="py-3 px-4">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleSortField('CATEGORY')}
+                      className={`inline-flex items-center gap-1 uppercase transition-colors cursor-pointer ${
+                        sortField === 'CATEGORY' ? 'text-sky-700 font-black' : 'hover:text-slate-900'
+                      }`}
+                    >
+                      <span>Kategori Berwarna</span>
+                      {sortField === 'CATEGORY' ? (
+                        sortDirection === 'asc' ? (
+                          <ChevronUp className="w-3.5 h-3.5 text-sky-600" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5 text-sky-600" />
+                        )
+                      ) : (
+                        <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                      )}
+                    </button>
+                  </th>
+                  <th className="py-3 px-4">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleSortField('STOCK')}
+                      className={`inline-flex items-center gap-1 uppercase transition-colors cursor-pointer ${
+                        sortField === 'STOCK' ? 'text-sky-700 font-black' : 'hover:text-slate-900'
+                      }`}
+                    >
+                      <span>Stok Dasar</span>
+                      {sortField === 'STOCK' ? (
+                        sortDirection === 'asc' ? (
+                          <ChevronUp className="w-3.5 h-3.5 text-sky-600" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5 text-sky-600" />
+                        )
+                      ) : (
+                        <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                      )}
+                    </button>
+                  </th>
                   <th className="py-3 px-4">Multi Satuan & Harga Jual</th>
                   <th className="py-3 px-4 text-right">Aksi</th>
                 </tr>
@@ -1022,7 +2934,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                     </td>
                   </tr>
                 ) : (
-                  filteredProducts.map((prod) => {
+                  paginatedProducts.map((prod) => {
                     const isLow = prod.stockInBaseUnit <= prod.minStockAlert;
                     const catColor = getCategoryColor(prod.category, categories, prod);
 
@@ -1040,8 +2952,10 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                                 <img
                                   src={prod.imageUrl}
                                   alt={prod.name}
+                                  loading="lazy"
+                                  decoding="async"
                                   referrerPolicy="no-referrer"
-                                  className="w-full h-full object-cover group-hover/thumb:scale-105 transition-transform"
+                                  className="w-full h-full object-cover"
                                 />
                               ) : (
                                 <div
@@ -1059,10 +2973,32 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                               </div>
                             </div>
                             <div>
-                              <div className="font-bold text-slate-900">{prod.name}</div>
-                              <div className="text-[11px] text-slate-400 font-mono flex items-center gap-1 mt-0.5">
-                                <Barcode className="w-3.5 h-3.5" />
-                                <span>{prod.barcode}</span>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-bold text-slate-900">{prod.name}</span>
+                                {prod.productType === 'JASA' && (
+                                  <span className="px-1.5 py-0.5 rounded text-[9.5px] font-black bg-purple-100 text-purple-800 border border-purple-200 inline-flex items-center gap-1 shadow-2xs">
+                                    <Wrench className="w-2.5 h-2.5 text-purple-600" />
+                                    <span>JASA</span>
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-slate-400 font-mono flex items-center gap-2 mt-0.5 flex-wrap">
+                                <div className="flex items-center gap-1">
+                                  <Barcode className="w-3.5 h-3.5 text-slate-500" />
+                                  <span>SKU: {prod.sku || prod.barcode}</span>
+                                </div>
+                                {prod.variants && prod.variants.length > 0 && (
+                                  <span className="px-1.5 py-0.2 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-sans font-bold flex items-center gap-1">
+                                    <Sliders className="w-2.5 h-2.5" />
+                                    <span>{prod.variants.length} {prod.variantLabel || 'Varian'} ({prod.variants.map((v) => v.name).slice(0, 3).join(', ')}{prod.variants.length > 3 ? '...' : ''})</span>
+                                  </span>
+                                )}
+                                {prod.technicianName && (
+                                  <span className="text-slate-600 font-sans flex items-center gap-1 font-medium">
+                                    <UserCheck className="w-3 h-3 text-slate-500" />
+                                    <span>{prod.technicianName}</span>
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -1086,43 +3022,146 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                           </span>
                         </td>
 
-                        {/* Stock in Base Unit */}
+                        {/* Stock in Base Unit / Service Non-Stock Indicator */}
                         <td className="py-3 px-4">
-                          <div className="font-mono font-bold text-slate-800">
-                            {formatNumber(prod.stockInBaseUnit)} {prod.baseUnit}
-                          </div>
-                          {isLow && (
-                            <span className="inline-flex items-center gap-0.5 text-[10px] font-bold text-amber-600">
-                              <AlertTriangle className="w-3 h-3" />
-                              Min. {prod.minStockAlert}
-                            </span>
+                          {prod.productType === 'JASA' ? (
+                            <div className="space-y-0.5">
+                              <span className="inline-flex items-center gap-1 font-bold text-xs text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full border border-purple-200">
+                                <span>Non-Stok (∞)</span>
+                              </span>
+                              <div className="text-[10px] text-slate-500 flex items-center gap-1 mt-0.5">
+                                {prod.serviceDurationMinutes ? (
+                                  <span className="flex items-center gap-0.5 font-medium">
+                                    <Clock className="w-3 h-3 text-slate-400" />
+                                    <span>{prod.serviceDurationMinutes} Mnt</span>
+                                  </span>
+                                ) : (
+                                  <span>Layanan Bebas Stok</span>
+                                )}
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <div className="font-mono font-bold text-slate-800">
+                                {formatNumber(prod.stockInBaseUnit)} {prod.baseUnit}
+                              </div>
+                              {isLow && (
+                                <span className="inline-flex items-center gap-0.5 text-[10px] font-bold text-amber-600">
+                                  <AlertTriangle className="w-3 h-3" />
+                                  Min. {prod.minStockAlert}
+                                </span>
+                              )}
+                              {prod.expiryDate && (
+                                <div className="mt-1">
+                                  {(() => {
+                                    const expDate = new Date(prod.expiryDate);
+                                    const today = new Date();
+                                    today.setHours(0, 0, 0, 0);
+                                    const isExpired = expDate < today;
+                                    const diffDays = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+                                    const isNearExpiry = diffDays <= 30;
+
+                                    return (
+                                      <span
+                                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                          isExpired
+                                            ? 'bg-rose-100 text-rose-700 font-black border border-rose-200'
+                                            : isNearExpiry
+                                            ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                            : 'bg-slate-100 text-slate-600'
+                                        }`}
+                                        title={`Tanggal Kadaluarsa: ${prod.expiryDate}`}
+                                      >
+                                        <CalendarDays className="w-2.5 h-2.5" />
+                                        <span>
+                                          {isExpired ? 'EXPIRED' : isNearExpiry ? `Exp: ${diffDays}hr` : prod.expiryDate}
+                                        </span>
+                                      </span>
+                                    );
+                                  })()}
+                                </div>
+                              )}
+                            </>
                           )}
                         </td>
 
-                        {/* Multi Units Breakdown */}
+                        {/* Multi Units & Service Tariffs Breakdown */}
                         <td className="py-3 px-4">
                           <div className="space-y-1">
                             {prod.units.map((u) => (
-                              <div key={u.id} className="flex items-center gap-2 text-xs">
-                                <span className="px-1.5 py-0.5 rounded bg-slate-100 font-mono font-bold text-slate-700">
+                              <div key={u.id} className="flex items-center gap-2 text-xs flex-wrap">
+                                <span className={`px-1.5 py-0.5 rounded font-mono font-bold ${
+                                  prod.productType === 'JASA'
+                                    ? 'bg-purple-50 text-purple-800 border border-purple-200'
+                                    : 'bg-slate-100 text-slate-700'
+                                }`}>
                                   {u.unitName}
                                 </span>
-                                {u.conversionFactor > 1 && (
+                                {prod.productType !== 'JASA' && u.conversionFactor > 1 && (
                                   <span className="text-[11px] text-slate-400">
                                     ({u.conversionFactor} {prod.baseUnit})
                                   </span>
                                 )}
-                                <span className="font-mono font-bold text-sky-700">
+                                <span className={`font-mono font-bold ${
+                                  prod.productType === 'JASA' ? 'text-purple-700' : 'text-sky-700'
+                                }`}>
                                   {formatRupiah(u.sellingPrice)}
                                 </span>
+                                {u.barcode && (
+                                  <span className="text-[10px] text-slate-400 font-mono flex items-center gap-0.5 bg-slate-50 px-1 py-0.2 rounded border border-slate-200" title={`Barcode Satuan: ${u.barcode}`}>
+                                    <Barcode className="w-2.5 h-2.5" />
+                                    <span>{u.barcode}</span>
+                                  </span>
+                                )}
+                                {prod.productType === 'JASA' && u.costPrice ? (
+                                  <span className="text-[10px] text-slate-400 font-mono">
+                                    (Komisi: {formatRupiah(u.costPrice)})
+                                  </span>
+                                ) : null}
                               </div>
                             ))}
+
+                            {/* Badges Harga Khusus Pelanggan */}
+                            {prod.customerPrices && prod.customerPrices.length > 0 && (
+                              <div className="pt-1 flex flex-wrap gap-1">
+                                {prod.customerPrices.map((cp, idx) => {
+                                  const catColorVal = customerCategoryColorMap.get(cp.customerCategory.toUpperCase());
+                                  const badge = getCustomerCategoryBadge(cp.customerCategory, catColorVal);
+                                  const minQty = cp.minQuantity && cp.minQuantity > 1 ? cp.minQuantity : 1;
+                                  return (
+                                    <span
+                                      key={cp.id || idx}
+                                      className={`inline-flex items-center gap-1 text-[9.5px] font-bold px-1.5 py-0.2 rounded border ${badge.bg} ${badge.text} ${badge.border}`}
+                                      title={`Harga Khusus ${cp.customerCategory}: ${formatRupiah(cp.price)} (${cp.unitName || prod.baseUnit})${minQty > 1 ? ` — Berlaku mulai beli ${minQty} ${cp.unitName || prod.baseUnit}` : ''}`}
+                                    >
+                                      <span className={`w-1 h-1 rounded-full ${badge.dot}`} />
+                                      <span>
+                                        {cp.customerCategory}: {formatRupiah(cp.price)}
+                                        {minQty > 1 ? ` (≥${minQty} ${cp.unitName || prod.baseUnit})` : ''}
+                                      </span>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         </td>
 
                         {/* Actions */}
                         <td className="py-3 px-4 text-right">
                           <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setSkuQrProduct(prod);
+                              }}
+                              title="Generate & Unduh QR Code Label SKU"
+                              className="px-2 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-[10.5px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                            >
+                              <QrCode className="w-3.5 h-3.5" />
+                              <span className="hidden xl:inline">QR SKU</span>
+                            </button>
                             <button
                               onClick={() => handleQuickCamera(prod)}
                               title="Ambil / Ganti Foto Profil Produk via Kamera"
@@ -1137,20 +3176,17 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                             >
                               <Edit3 className="w-4 h-4" />
                             </button>
-                            {currentUserRole === 'ADMIN' && (
-                              <button
-                                onClick={() => {
-                                  if (confirm(`Hapus produk "${prod.name}"?`)) {
-                                    sound.playTap();
-                                    onDeleteProduct(prod.id);
-                                  }
-                                }}
-                                title="Hapus Produk"
-                                className="p-1.5 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 transition-colors"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setProductToDelete(prod);
+                              }}
+                              title="Hapus Produk"
+                              className="p-1.5 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -1160,6 +3196,59 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               </tbody>
             </table>
           </div>
+
+          {filteredProducts.length > 0 && (
+            <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600">
+              <div className="flex items-center gap-2">
+                <span>
+                  Menampilkan{' '}
+                  <strong className="text-slate-900">
+                    {(safeCurrentPage - 1) * pageSize + 1}–{Math.min(safeCurrentPage * pageSize, filteredProducts.length)}
+                  </strong>{' '}
+                  dari <strong className="text-slate-900">{filteredProducts.length}</strong> produk
+                </span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value) as 25 | 50 | 100)}
+                  className="px-2 py-1 rounded-lg border border-slate-300 bg-white font-bold text-slate-700"
+                >
+                  <option value={25}>25 / hal</option>
+                  <option value={50}>50 / hal</option>
+                  <option value={100}>100 / hal</option>
+                </select>
+              </div>
+
+              {totalPages > 1 && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage <= 1}
+                    onClick={() => {
+                      sound.playTap();
+                      setCurrentPage((p) => Math.max(1, p - 1));
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                  >
+                    Sebelumnya
+                  </button>
+                  <span className="px-2.5 font-mono font-bold text-slate-800">
+                    Hal {safeCurrentPage} / {totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage >= totalPages}
+                    onClick={() => {
+                      sound.playTap();
+                      setCurrentPage((p) => Math.min(totalPages, p + 1));
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                  >
+                    Berikutnya
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1171,11 +3260,23 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
           <div className="bg-white rounded-3xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 my-auto animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div>
-                <h3 className="text-base font-bold text-slate-900">
-                  {isAddingNew ? 'Tambah Master Produk Baru' : `Edit Produk: ${editingProduct?.name}`}
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  {productType === 'JASA' ? (
+                    <>
+                      <Wrench className="w-5 h-5 text-purple-600" />
+                      <span>{isAddingNew ? 'Input Jasa & Layanan Baru' : `Edit Jasa: ${editingProduct?.name}`}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Package className="w-5 h-5 text-sky-600" />
+                      <span>{isAddingNew ? 'Tambah Master Produk Baru' : `Edit Produk: ${editingProduct?.name}`}</span>
+                    </>
+                  )}
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Lengkapi data produk, kategori berwarna, dan konversi multi-satuan.
+                  {productType === 'JASA'
+                    ? 'Input data layanan, tarif jasa per sesi/jam/paket, dan komisi atau biaya operasional.'
+                    : 'Lengkapi data produk, kategori berwarna, stok gudang, dan konversi multi-satuan.'}
                 </p>
               </div>
 
@@ -1190,35 +3291,138 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               </button>
             </div>
 
+            {/* Type Switcher: Barang Fisik vs Jasa & Layanan */}
+            <div className="grid grid-cols-2 gap-2 p-1.5 bg-slate-100 rounded-2xl border border-slate-200 mt-3">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setProductType('BARANG');
+                  if (baseUnit === 'SESI' || baseUnit === 'JAM' || baseUnit === 'KALI') setBaseUnit('PCS');
+                }}
+                className={`py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                  productType === 'BARANG'
+                    ? 'bg-white text-slate-900 shadow-xs border border-slate-200/80 font-extrabold'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Package className="w-4 h-4 text-sky-600" />
+                <span>Barang Fisik (Stok Gudang)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setProductType('JASA');
+                  if (baseUnit === 'PCS') setBaseUnit('SESI');
+                  setStockInBaseUnit('99999');
+                  setMinStockAlert('0');
+                }}
+                className={`py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                  productType === 'JASA'
+                    ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-xs font-extrabold'
+                    : 'text-slate-600 hover:text-purple-700'
+                }`}
+              >
+                <Wrench className="w-4 h-4" />
+                <span>Jasa &amp; Layanan (Non-Stok)</span>
+              </button>
+            </div>
+
+            {productType === 'JASA' && (
+              <div className="p-3 bg-purple-50/90 border border-purple-200 rounded-2xl flex items-start gap-2.5 text-xs text-purple-900 mt-2.5">
+                <Wrench className="w-4 h-4 text-purple-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Layanan Non-Stok:</span> Jasa tidak memerlukan penghitungan stok gudang. Sistem otomatis menetapkan stok tidak terbatas (unlimited) tanpa peringatan stok habis.
+                </div>
+              </div>
+            )}
+
             <form onSubmit={handleSubmitForm} className="py-4 space-y-4">
               {/* Row 1: Name & Barcode */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Nama Produk *
+                    {productType === 'JASA' ? 'Nama Jasa / Layanan *' : 'Nama Produk *'}
                   </label>
                   <input
                     type="text"
                     required
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="Contoh: Kopi Kapal Api Mix 24g"
+                    placeholder={productType === 'JASA' ? 'Contoh: Jasa Servis Ringan, Ongkir, Cuci AC' : 'Contoh: Kopi Kapal Api Mix 24g'}
                     className="w-full p-2.5 rounded-xl border border-slate-300 text-xs md:text-sm focus:border-sky-500 focus:outline-none"
                   />
                 </div>
 
                 <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Barcode / SKU *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={barcode}
-                    onChange={(e) => setBarcode(e.target.value)}
-                    placeholder="Contoh: 899277540044"
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs md:text-sm font-mono font-bold focus:border-sky-500 focus:outline-none"
-                  />
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                      <span>{productType === 'JASA' ? 'Kode Jasa' : 'SKU (Stock Keeping Unit)'}</span>
+                      <span className="text-[10px] text-slate-400 font-normal">Wajib Unik</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      {nextSuggestedSku && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setBarcode(nextSuggestedSku);
+                          }}
+                          className="text-[10px] font-bold text-sky-600 hover:text-sky-700 hover:underline cursor-pointer flex items-center gap-1 bg-sky-50 px-2 py-0.5 rounded border border-sky-200"
+                          title="Klik untuk mengisi otomatis kode SKU urutan berikutnya"
+                        >
+                          <Sparkles className="w-2.5 h-2.5 text-amber-500" />
+                          <span>Gunakan SKU Urut: <strong>{nextSuggestedSku}</strong></span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setScanningUnitIndex(-1);
+                        }}
+                        className="text-[10px] px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center gap-1 cursor-pointer border border-slate-200"
+                        title="Scan Barcode / SKU dengan Kamera atau Scanner Fisik"
+                      >
+                        <Camera className="w-3 h-3 text-slate-600" />
+                        <span>Scan</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={barcode}
+                      onChange={(e) => setBarcode(e.target.value)}
+                      placeholder={nextSuggestedSku ? `Otomatis: ${nextSuggestedSku} (atau ketik SKU manual)` : 'Contoh: SKU-0001'}
+                      className={`w-full p-2.5 pr-10 rounded-xl border text-xs md:text-sm font-mono font-bold focus:outline-none transition-colors ${
+                        isDuplicateSku
+                          ? 'border-rose-500 bg-rose-50/40 text-rose-800 focus:border-rose-600'
+                          : 'border-slate-300 focus:border-sky-500 bg-white'
+                      }`}
+                    />
+                    {barcode && (
+                      <button
+                        type="button"
+                        onClick={() => setBarcode('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 rounded"
+                        title="Kosongkan kolom SKU"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-400 mt-1 flex items-center justify-between">
+                    <span>Biarkan kosong untuk otomatis menggunakan nomor urut SKU selanjutnya ({nextSuggestedSku})</span>
+                  </div>
+                  {isDuplicateSku && (
+                    <div className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>SKU sudah digunakan oleh produk lain! Harap gunakan SKU yang unik.</span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1359,7 +3563,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
                 {/* Existing categories list radio/badges */}
                 <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto p-1">
-                  {categories.map((cat) => {
+                  {mergedCategories.map((cat) => {
                     const isChosen = category.toLowerCase() === cat.name.toLowerCase();
                     const color = cat.color || '#0284c7';
                     return (
@@ -1393,178 +3597,842 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                 </div>
               </div>
 
-              {/* Row 3: Base Unit, Stock, Minimum Alert */}
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">Satuan Dasar *</label>
-                  <input
-                    type="text"
-                    required
-                    value={baseUnit}
-                    onChange={(e) => {
-                      setBaseUnit(e.target.value);
-                      if (units.length > 0) {
-                        const copy = [...units];
-                        copy[0].unitName = e.target.value;
-                        setUnits(copy);
-                      }
-                    }}
-                    placeholder="PCS / KG / BUNGKUS"
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-bold font-mono focus:border-sky-500 focus:outline-none uppercase"
-                  />
-                </div>
+              {/* Conditional Fields based on productType: BARANG vs JASA */}
+              {productType === 'JASA' ? (
+                <div className="space-y-3 bg-purple-50/70 p-4 rounded-2xl border border-purple-100">
+                  <div className="flex items-center gap-2 text-purple-800 text-xs font-bold uppercase tracking-wider">
+                    <Wrench className="w-4 h-4 text-purple-600" />
+                    <span>Parameter & Spesifikasi Jasa / Layanan</span>
+                  </div>
 
-                <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">Stok Dasar *</label>
-                  <input
-                    type="number"
-                    required
-                    value={stockInBaseUnit}
-                    onChange={(e) => setStockInBaseUnit(e.target.value)}
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono font-bold focus:border-sky-500 focus:outline-none"
-                  />
-                </div>
+                  {/* Service Row 1: Satuan Layanan & Preset */}
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 block mb-1">
+                      Satuan Tarif Layanan *
+                    </label>
+                    <div className="flex flex-wrap items-center gap-2 mb-2">
+                      {['SESI', 'JAM', 'PAKET', 'KALI', 'ORDER', 'TINDAKAN', 'ORANG'].map((preset) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          onClick={() => {
+                            setBaseUnit(preset);
+                            if (units.length > 0) {
+                              const copy = [...units];
+                              copy[0].unitName = preset;
+                              setUnits(copy);
+                            }
+                          }}
+                          className={`px-2.5 py-1 text-[11px] font-bold rounded-lg border transition-all ${
+                            baseUnit.toUpperCase() === preset
+                              ? 'bg-purple-600 text-white border-purple-600 shadow-xs'
+                              : 'bg-white text-slate-600 border-slate-200 hover:border-purple-300'
+                          }`}
+                        >
+                          {preset}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      type="text"
+                      required
+                      value={baseUnit}
+                      onChange={(e) => {
+                        const val = e.target.value.toUpperCase();
+                        setBaseUnit(val);
+                        if (units.length > 0) {
+                          const copy = [...units];
+                          copy[0].unitName = val;
+                          setUnits(copy);
+                        }
+                      }}
+                      placeholder="Misal: SESI, JAM, PAKET"
+                      className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs font-bold font-mono focus:border-purple-500 focus:outline-none uppercase"
+                    />
+                  </div>
 
-                <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Batas Peringatan
-                  </label>
-                  <input
-                    type="number"
-                    value={minStockAlert}
-                    onChange={(e) => setMinStockAlert(e.target.value)}
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono focus:border-sky-500 focus:outline-none"
-                  />
-                </div>
-              </div>
+                  {/* Service Row 2: Estimasi Durasi & Petugas Default */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5 mb-1">
+                        <Clock className="w-3.5 h-3.5 text-purple-600" />
+                        <span>Estimasi Durasi Pengerjaan (Menit)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="5"
+                        value={serviceDurationMinutes || ''}
+                        onChange={(e) => setServiceDurationMinutes(e.target.value)}
+                        placeholder="Contoh: 30, 45, 60 menit"
+                        className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs font-mono font-bold focus:border-purple-500 focus:outline-none"
+                      />
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Digunakan untuk estimasi antrian dan jadwal pelanggan.
+                      </p>
+                    </div>
 
-              {/* Row 4: Cost Price & Image URL */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Harga Modal / Beli Satuan Dasar (Rp)
-                  </label>
-                  <input
-                    type="number"
-                    value={costPrice}
-                    onChange={(e) => setCostPrice(e.target.value)}
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono focus:border-sky-500 focus:outline-none"
-                  />
-                </div>
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5 mb-1">
+                        <UserCheck className="w-3.5 h-3.5 text-purple-600" />
+                        <span>Teknisi / Petugas Default (Opsional)</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={technicianName}
+                        onChange={(e) => setTechnicianName(e.target.value)}
+                        placeholder="Misal: Budi Santoso / Tim A"
+                        className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs focus:border-purple-500 focus:outline-none"
+                      />
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Bisa disesuaikan atau diganti saat kasir melayani transaksi.
+                      </p>
+                    </div>
+                  </div>
 
-                <div>
-                  <label className="text-xs font-bold text-slate-700 block mb-1">
-                    URL Gambar Produk (Opsional)
-                  </label>
-                  <input
-                    type="url"
-                    value={imageUrl}
-                    onChange={(e) => setImageUrl(e.target.value)}
-                    placeholder="https://..."
-                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs focus:border-sky-500 focus:outline-none"
-                  />
-                </div>
-              </div>
+                  {/* Service Row 3: Biaya Operasional / Komisi Petugas (HPP) */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">
+                        Biaya Operasional / Komisi Petugas (HPP Rp)
+                      </label>
+                      <input
+                        type="number"
+                        value={costPrice}
+                        onChange={(e) => handleCostPriceChange(e.target.value)}
+                        placeholder="0 jika murni jasa tanpa komisi"
+                        className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs font-mono focus:border-purple-500 focus:outline-none"
+                      />
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Biaya material yang terpakai atau komisi per pengerjaan jasa.
+                      </p>
+                    </div>
 
-              {/* MULTI SATUAN CONFIGURATOR SECTION */}
-              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">
+                        URL Foto / Icon Layanan (Opsional)
+                      </label>
+                      <input
+                        type="url"
+                        value={imageUrl}
+                        onChange={(e) => setImageUrl(e.target.value)}
+                        placeholder="https://..."
+                        className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs focus:border-purple-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Service Row 4: Catatan SOP Layanan */}
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 block mb-1">
+                      Catatan SOP / Instruksi Layanan (Opsional)
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={serviceNotes}
+                      onChange={(e) => setServiceNotes(e.target.value)}
+                      placeholder="Contoh: Periksa keluhan fisik pelanggan dulu, gunakan alat steril, konfirmasi kepuasan sebelum selesai..."
+                      className="w-full p-2.5 rounded-xl border border-purple-200 bg-white text-xs focus:border-purple-500 focus:outline-none resize-none"
+                    />
+                  </div>
+
+                  {/* Stock notice for service */}
+                  <div className="flex items-center gap-2 p-2.5 rounded-xl bg-purple-100/70 text-purple-900 text-xs">
+                    <span className="font-bold">⚡ Non-Stok:</span>
+                    <span>Item jasa tidak membatasi kuota stok fisik dan selalu tersedia untuk ditransaksikan di kasir.</span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Row 3: Base Unit, Stock, Minimum Alert for Physical Products */}
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">Satuan Dasar *</label>
+                      <input
+                        type="text"
+                        required
+                        value={baseUnit}
+                        onChange={(e) => {
+                          setBaseUnit(e.target.value);
+                          if (units.length > 0) {
+                            const copy = [...units];
+                            copy[0].unitName = e.target.value;
+                            setUnits(copy);
+                          }
+                        }}
+                        placeholder="PCS / KG / BUNGKUS"
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-bold font-mono focus:border-sky-500 focus:outline-none uppercase"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">Stok Dasar *</label>
+                      <input
+                        type="number"
+                        required
+                        value={stockInBaseUnit}
+                        onChange={(e) => setStockInBaseUnit(e.target.value)}
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono font-bold focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">
+                        Batas Peringatan
+                      </label>
+                      <input
+                        type="number"
+                        value={minStockAlert}
+                        onChange={(e) => setMinStockAlert(e.target.value)}
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Row 4: Cost Price, Expiry Date & Image URL */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">
+                        Harga Modal / Beli (Rp)
+                      </label>
+                      <input
+                        type="number"
+                        value={costPrice}
+                        onChange={(e) => handleCostPriceChange(e.target.value)}
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1 flex items-center justify-between">
+                        <span>Tgl Kadaluarsa</span>
+                        <span className="text-[10px] text-slate-400 font-normal">Opsional</span>
+                      </label>
+                      <input
+                        type="date"
+                        value={expiryDate}
+                        onChange={(e) => setExpiryDate(e.target.value)}
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs font-mono focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold text-slate-700 block mb-1">
+                        URL Gambar Produk
+                      </label>
+                      <input
+                        type="url"
+                        value={imageUrl}
+                        onChange={(e) => setImageUrl(e.target.value)}
+                        placeholder="https://..."
+                        className="w-full p-2.5 rounded-xl border border-slate-300 text-xs focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* MULTI SATUAN / TARIF CONFIGURATOR SECTION */}
+              <div className={`p-4 rounded-2xl border space-y-3 ${productType === 'JASA' ? 'bg-purple-50/40 border-purple-200' : 'bg-slate-50 border-slate-200'}`}>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
-                    <Layers className="w-4 h-4 text-sky-600" />
+                    {productType === 'JASA' ? (
+                      <Wrench className="w-4 h-4 text-purple-600" />
+                    ) : (
+                      <Layers className="w-4 h-4 text-sky-600" />
+                    )}
                     <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                      Konfigurasi Multi Satuan & Harga Jual
+                      {productType === 'JASA' ? 'Tarif Layanan & Varian Paket' : 'Konfigurasi Multi Satuan & Harga Jual'}
                     </span>
                   </div>
 
                   <button
                     type="button"
                     onClick={handleAddUnitRow}
-                    className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs flex items-center gap-1 shadow-2xs"
+                    className={`px-2.5 py-1 rounded-lg text-white font-bold text-xs flex items-center gap-1 shadow-2xs ${
+                      productType === 'JASA' ? 'bg-purple-600 hover:bg-purple-500' : 'bg-sky-600 hover:bg-sky-500'
+                    }`}
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>+ Tambah Satuan</span>
+                    <span>{productType === 'JASA' ? '+ Tambah Opsi / Varian Paket' : '+ Tambah Satuan'}</span>
                   </button>
                 </div>
 
-                <div className="space-y-2">
+                <div className="space-y-3">
                   {units.map((unit, idx) => (
                     <div
                       key={unit.id || idx}
-                      className="p-3 bg-white rounded-xl border border-slate-200 grid grid-cols-1 md:grid-cols-12 gap-2 items-center"
+                      className="p-3 bg-white rounded-xl border border-slate-200 space-y-2.5 shadow-2xs"
                     >
-                      <div className="md:col-span-3">
-                        <label className="text-[10px] text-slate-400 block">Nama Satuan</label>
-                        <input
-                          type="text"
-                          required
-                          value={unit.unitName}
-                          onChange={(e) => handleUnitChange(idx, 'unitName', e.target.value)}
-                          placeholder="PCS / PACK / DUS"
-                          className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono focus:border-sky-500 uppercase"
-                        />
+                      <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center">
+                        <div className="md:col-span-5">
+                          <label className="text-[10px] font-bold text-slate-500 block mb-1">Nama Satuan</label>
+                          <input
+                            type="text"
+                            required
+                            value={unit.unitName}
+                            onChange={(e) => handleUnitChange(idx, 'unitName', e.target.value)}
+                            placeholder="PCS / PACK / DUS"
+                            className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono focus:border-sky-500 uppercase"
+                          />
+                        </div>
+
+                        <div className="md:col-span-5">
+                          <label className="text-[10px] font-bold text-slate-500 block mb-1">
+                            Faktor Konversi (x {baseUnit})
+                          </label>
+                          <input
+                            type="number"
+                            min="1"
+                            required
+                            disabled={idx === 0}
+                            value={unit.conversionFactor}
+                            onChange={(e) => handleUnitChange(idx, 'conversionFactor', e.target.value)}
+                            className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono focus:border-sky-500 disabled:bg-slate-100 disabled:text-slate-500"
+                          />
+                        </div>
+
+                        <div className="md:col-span-2 text-right">
+                          {idx > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveUnitRow(idx)}
+                              className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 transition-colors cursor-pointer"
+                              title="Hapus Satuan Ini"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
                       </div>
 
-                      <div className="md:col-span-3">
-                        <label className="text-[10px] text-slate-400 block">
-                          Faktor Konversi (x {baseUnit})
-                        </label>
-                        <input
-                          type="number"
-                          min="1"
-                          required
-                          disabled={idx === 0}
-                          value={unit.conversionFactor}
-                          onChange={(e) => handleUnitChange(idx, 'conversionFactor', e.target.value)}
-                          className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono focus:border-sky-500 disabled:bg-slate-100 disabled:text-slate-500"
-                        />
-                      </div>
+                      {/* Grid 2 Kolom: Harga Modal / Beli Satuan & Harga Jual Satuan */}
+                      <div className="pt-2 border-t border-slate-100 space-y-2">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-600 block mb-1">
+                              {idx === 0 
+                                ? 'Harga Modal / Beli Dasar (Rp) *' 
+                                : `Harga Beli Satuan ${unit.unitName || ''} (Rp)`}
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={unit.costPrice !== undefined ? unit.costPrice : ''}
+                              onChange={(e) => handleUnitChange(idx, 'costPrice', e.target.value)}
+                              placeholder="0"
+                              className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono text-emerald-700 bg-emerald-50/40 focus:border-emerald-500 focus:bg-white"
+                            />
+                            {idx > 0 && (
+                              <span className="text-[9px] text-slate-400 mt-0.5 block">
+                                Estimasi konversi: {unit.conversionFactor} x Rp {formatNumber(units[0]?.costPrice || 0)} = Rp {formatNumber((units[0]?.costPrice || 0) * (unit.conversionFactor || 1))}
+                              </span>
+                            )}
+                          </div>
 
-                      <div className="md:col-span-4">
-                        <label className="text-[10px] text-slate-400 block">Harga Jual (Rp)</label>
-                        <input
-                          type="number"
-                          required
-                          value={unit.sellingPrice}
-                          onChange={(e) => handleUnitChange(idx, 'sellingPrice', e.target.value)}
-                          className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono text-sky-700 focus:border-sky-500"
-                        />
-                      </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-600 block mb-1">
+                              Harga Jual (Rp) *
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              required
+                              value={unit.sellingPrice !== undefined ? unit.sellingPrice : ''}
+                              onChange={(e) => handleUnitChange(idx, 'sellingPrice', e.target.value)}
+                              placeholder="0"
+                              className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono text-sky-700 focus:border-sky-500"
+                            />
+                          </div>
+                        </div>
 
-                      <div className="md:col-span-2 text-right pt-3 md:pt-0">
-                        {idx > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveUnitRow(idx)}
-                            className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 transition-colors"
-                            title="Hapus Satuan Ini"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        )}
+                        {/* Kolom Barcode Satuan berada tepat di bawah Harga Jual dengan Tombol Scan Kamera / Alat Scanner */}
+                        <div>
+                          <div className="flex items-center justify-between mb-1">
+                            <label className="text-[10px] font-bold text-slate-600 flex items-center gap-1">
+                              <Barcode className="w-3.5 h-3.5 text-sky-600" />
+                              <span>Barcode Satuan (Scan Fisik Khusus Satuan Ini)</span>
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setScanningUnitIndex(idx);
+                              }}
+                              className="px-2 py-0.5 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                              title={`Scan Barcode Kemasan ${unit.unitName || ''} via Kamera atau Barcode Scanner Fisik`}
+                            >
+                              <Camera className="w-3 h-3 text-sky-600" />
+                              <span>Scan Kamera</span>
+                            </button>
+                          </div>
+                          <div className="relative">
+                            <input
+                              type="text"
+                              value={unit.barcode || ''}
+                              onChange={(e) => handleUnitChange(idx, 'barcode', e.target.value)}
+                              placeholder={`Contoh: Barcode pada kemasan ${unit.unitName || 'satuan'}...`}
+                              className="w-full p-2 pr-9 rounded-lg border border-slate-200 text-xs font-mono font-medium focus:border-sky-500 bg-slate-50/50"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setScanningUnitIndex(idx);
+                              }}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-sky-600 cursor-pointer"
+                              title="Buka Scanner Kamera"
+                            >
+                              <Camera className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   ))}
                 </div>
               </div>
 
+              {/* Varian Produk Section (Rasa, Warna, Ukuran, dll.) */}
+              <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-6 h-6 rounded-lg bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-xs">
+                      <Sliders className="w-3.5 h-3.5" />
+                    </div>
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 uppercase tracking-wider block">
+                        Varian Produk
+                      </span>
+                      <span className="text-[11px] text-slate-500">
+                        Opsi variasi seperti Rasa, Ukuran, Warna, Aroma, dll.
+                      </span>
+                    </div>
+                  </div>
+                  {variants.length > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200">
+                      {variants.length} Varian Aktif
+                    </span>
+                  )}
+                </div>
+
+                {/* Tipe / Label Varian */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-600 block mb-1">
+                    Tipe / Label Varian:
+                  </label>
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2">
+                    {['Rasa', 'Ukuran', 'Warna', 'Aroma', 'Model'].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setVariantLabel(preset);
+                        }}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                          variantLabel === preset
+                            ? 'bg-indigo-600 text-white shadow-2xs'
+                            : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                    <input
+                      type="text"
+                      value={variantLabel}
+                      onChange={(e) => setVariantLabel(e.target.value)}
+                      placeholder="Label kustom..."
+                      className="w-28 p-1 px-2 rounded-lg border border-slate-200 text-xs font-medium focus:border-indigo-500 bg-white"
+                    />
+                  </div>
+
+                  {/* Saran Cepat */}
+                  <div className="text-[10px] text-slate-500 mb-2 flex items-center gap-1 flex-wrap">
+                    <span className="font-semibold text-slate-600">Saran Cepat:</span>
+                    {(variantLabel === 'Rasa'
+                      ? ['Cokelat', 'Keju', 'Vanilla', 'Stroberi', 'Original', 'Pedas', 'Balado']
+                      : variantLabel === 'Ukuran'
+                      ? ['S', 'M', 'L', 'XL', 'XXL', '250ml', '500ml', '1 Liter']
+                      : variantLabel === 'Warna'
+                      ? ['Hitam', 'Putih', 'Merah', 'Biru', 'Hijau', 'Kuning']
+                      : variantLabel === 'Aroma'
+                      ? ['Lavender', 'Lemon', 'Apel', 'Melati', 'Kopi']
+                      : ['Reguler', 'Premium', 'Special', 'Dingin', 'Hangat']
+                    ).map((sug) => (
+                      <button
+                        key={sug}
+                        type="button"
+                        onClick={() => handleAddVariant(sug)}
+                        className="px-2 py-0.5 rounded-md bg-white hover:bg-indigo-50 hover:text-indigo-700 border border-slate-200 text-slate-600 text-[10px] transition-colors cursor-pointer"
+                      >
+                        + {sug}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Input Varian Baru */}
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={variantInput}
+                    onChange={(e) => setVariantInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleAddVariant();
+                      }
+                    }}
+                    placeholder={`Ketik nama ${variantLabel.toLowerCase()} (lalu tekan Enter atau tombol Tambah)...`}
+                    className="flex-1 p-2 rounded-xl border border-slate-300 text-xs focus:border-indigo-500 focus:outline-none bg-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleAddVariant()}
+                    className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl flex items-center gap-1 shadow-2xs cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Tambah</span>
+                  </button>
+                </div>
+
+                {/* List Varian Terdaftar dengan Pengaturan Harga & Barcode Unik */}
+                {variants.length > 0 ? (
+                  <div className="space-y-2 pt-1">
+                    <div className="hidden sm:grid grid-cols-12 gap-2 text-[10px] font-bold text-slate-500 uppercase px-3">
+                      <div className="col-span-4">Nama Varian</div>
+                      <div className="col-span-3">Harga Jual (Rp)</div>
+                      <div className="col-span-4">Barcode Unik Varian</div>
+                      <div className="col-span-1 text-right">Aksi</div>
+                    </div>
+                    {variants.map((v, vIdx) => (
+                      <div
+                        key={v.id || vIdx}
+                        className="p-2.5 sm:p-3 bg-white border border-slate-200 rounded-xl grid grid-cols-1 sm:grid-cols-12 gap-2 items-center shadow-2xs"
+                      >
+                        <div className="sm:col-span-4 flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-indigo-500 shrink-0" />
+                          <input
+                            type="text"
+                            required
+                            value={v.name}
+                            onChange={(e) => handleVariantChange(vIdx, 'name', e.target.value)}
+                            placeholder="Nama varian"
+                            className="w-full p-1.5 rounded-lg border border-slate-200 text-xs font-bold text-slate-900 focus:border-indigo-500"
+                          />
+                        </div>
+
+                        <div className="sm:col-span-3">
+                          <label className="sm:hidden text-[10px] font-bold text-slate-500 block mb-0.5">Harga Jual (Rp)</label>
+                          <input
+                            type="number"
+                            value={v.price ?? (units[0]?.sellingPrice || 0)}
+                            onChange={(e) => handleVariantChange(vIdx, 'price', Math.max(0, parseFloat(e.target.value) || 0))}
+                            placeholder="Harga varian"
+                            className="w-full p-1.5 rounded-lg border border-slate-200 text-xs font-mono font-bold text-indigo-700 focus:border-indigo-500"
+                          />
+                        </div>
+
+                        <div className="sm:col-span-4">
+                          <label className="sm:hidden text-[10px] font-bold text-slate-500 block mb-0.5">Barcode Unik Varian</label>
+                          <div className="relative">
+                            <Barcode className="w-3.5 h-3.5 text-slate-400 absolute left-2 top-1/2 -translate-y-1/2" />
+                            <input
+                              type="text"
+                              value={v.barcode || ''}
+                              onChange={(e) => handleVariantChange(vIdx, 'barcode', e.target.value)}
+                              placeholder="Barcode unik varian..."
+                              className="w-full pl-7 pr-2 py-1.5 rounded-lg border border-slate-200 text-xs font-mono focus:border-indigo-500 bg-slate-50/50"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="sm:col-span-1 text-right">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              sound.playTap();
+                              setVariants(variants.filter((_, idx) => idx !== vIdx));
+                            }}
+                            className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 transition-colors cursor-pointer"
+                            title="Hapus Varian Ini"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-slate-400 italic">
+                    Belum ada varian ditambahkan. Produk akan dijual standar tanpa pilihan variasi.
+                  </p>
+                )}
+              </div>
+
+              {/* MENU PELANGGAN: HARGA KHUSUS KATEGORI PELANGGAN */}
+              <div className="p-4 bg-gradient-to-r from-sky-50/50 via-indigo-50/30 to-purple-50/50 rounded-2xl border border-sky-200/80 space-y-3.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-sky-100">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-xl bg-sky-600 text-white flex items-center justify-center shadow-xs shrink-0">
+                      <Users className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-black text-slate-900 uppercase tracking-wider">
+                          Menu Pelanggan: Harga Khusus Kategori
+                        </span>
+                        {customerPrices.length > 0 && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-sky-600 text-white">
+                            {customerPrices.length} Aturan Harga
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Atur harga jual khusus otomatis saat pelanggan dengan kategori tertentu (VIP, Reseller, Grosir, dll.) dipilih di kasir.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {availableCategoryNames.slice(0, 5).map((catName) => (
+                      <button
+                        key={catName}
+                        type="button"
+                        onClick={() => handleAddCustomerPrice(catName)}
+                        className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-sky-50 text-slate-700 hover:text-sky-700 border border-slate-200 text-xs font-bold transition-all flex items-center gap-1 cursor-pointer shadow-2xs"
+                      >
+                        <Plus className="w-3 h-3 text-sky-600" />
+                        <span>+ {catName}</span>
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => handleAddCustomerPrice('MEMBER')}
+                      className="px-2.5 py-1.5 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 text-xs font-bold transition-all flex items-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3 h-3" />
+                      <span>+ Lainnya</span>
+                    </button>
+                  </div>
+                </div>
+
+                {customerPrices.length === 0 ? (
+                  <div className="p-3.5 bg-white/70 rounded-xl border border-dashed border-sky-200 text-center space-y-1.5">
+                    <p className="text-xs font-medium text-slate-600">
+                      Belum ada harga khusus pelanggan yang diatur untuk produk ini.
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      Semua pelanggan akan mendapatkan harga jual standar normal: <strong className="text-slate-700">{formatRupiah(units[0]?.sellingPrice || 0)}</strong>.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleAddCustomerPrice('VIP')}
+                      className="mt-1 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold shadow-xs cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Tambah Harga Khusus Pelanggan Sekarang</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {customerPrices.map((cp, cpIdx) => {
+                      const badge = getCustomerCategoryBadge(cp.customerCategory);
+                      const baseNormalPrice = units[0]?.sellingPrice || 0;
+                      // Target unit selling price
+                      const targetUnit = units.find(u => u.unitName.toUpperCase() === (cp.unitName || baseUnit).toUpperCase()) || units[0];
+                      const normalPriceForUnit = targetUnit ? targetUnit.sellingPrice : baseNormalPrice;
+                      const diff = normalPriceForUnit - cp.price;
+                      const diffPercent = normalPriceForUnit > 0 ? Math.round((diff / normalPriceForUnit) * 100) : 0;
+                      const currentUnitName = cp.unitName || baseUnit || 'PCS';
+                      const minQty = cp.minQuantity !== undefined && cp.minQuantity > 0 ? cp.minQuantity : 1;
+
+                      return (
+                        <div
+                          key={cp.id || cpIdx}
+                          className="p-3.5 bg-white rounded-2xl border border-slate-200 shadow-2xs space-y-2.5"
+                        >
+                          <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+                            {/* Kategori Pelanggan Dropdown / Datalist */}
+                            <div className="sm:col-span-3 space-y-1">
+                              <label className="text-[10px] font-bold text-slate-500 block">
+                                Kategori Pelanggan *
+                              </label>
+                              <div className="flex items-center gap-1">
+                                <span className={`w-2 h-2 rounded-full ${badge.dot} shrink-0`} />
+                                <input
+                                  type="text"
+                                  required
+                                  value={cp.customerCategory}
+                                  onChange={(e) => handleUpdateCustomerPrice(cpIdx, 'customerCategory', e.target.value.toUpperCase())}
+                                  placeholder="VIP / MEMBER / GROSIR"
+                                  className="w-full p-2 rounded-lg border border-slate-200 text-xs font-black font-mono focus:border-sky-500 uppercase bg-slate-50/50"
+                                  list={`cat-suggestions-${cpIdx}`}
+                                />
+                                <datalist id={`cat-suggestions-${cpIdx}`}>
+                                  {availableCategoryNames.map((c) => (
+                                    <option key={c} value={c} />
+                                  ))}
+                                </datalist>
+                              </div>
+                            </div>
+
+                            {/* Satuan Terkait */}
+                            <div className="sm:col-span-3 space-y-1">
+                              <label className="text-[10px] font-bold text-slate-500 block">
+                                Berlaku Untuk Satuan
+                              </label>
+                              <select
+                                value={cp.unitName || baseUnit}
+                                onChange={(e) => handleUpdateCustomerPrice(cpIdx, 'unitName', e.target.value)}
+                                className="w-full p-2 rounded-lg border border-slate-200 text-xs font-bold font-mono focus:border-sky-500 bg-white"
+                              >
+                                {units.map((u) => (
+                                  <option key={u.unitName} value={u.unitName}>
+                                    {u.unitName} (Normal: {formatRupiah(u.sellingPrice)})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {/* Syarat Minimal Pembelian (x satuan dan berlaku untuk jumlah selanjutnya) */}
+                            <div className="sm:col-span-2 space-y-1">
+                              <div className="flex items-center justify-between">
+                                <label className="text-[10px] font-bold text-indigo-700 block truncate" title="Jumlah minimal agar harga khusus berlaku">
+                                  Min. Beli (Qty) *
+                                </label>
+                              </div>
+                              <div className="relative">
+                                <input
+                                  type="number"
+                                  required
+                                  min="1"
+                                  value={minQty}
+                                  onChange={(e) => handleUpdateCustomerPrice(cpIdx, 'minQuantity', Math.max(1, parseInt(e.target.value) || 1))}
+                                  placeholder="1"
+                                  className="w-full p-2 pr-7 rounded-lg border border-indigo-200 text-xs font-mono font-black text-indigo-700 focus:border-indigo-500 bg-indigo-50/30 text-center"
+                                />
+                                <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[9px] font-bold text-indigo-500 pointer-events-none truncate max-w-[28px]">
+                                  {currentUnitName}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Harga Khusus (Rp) */}
+                            <div className="sm:col-span-3 space-y-1">
+                              <div className="flex items-center justify-between">
+                                <label className="text-[10px] font-bold text-slate-700 block">
+                                  Harga Khusus (Rp) *
+                                </label>
+                                {diff > 0 ? (
+                                  <span className="text-[9.5px] font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.2 rounded">
+                                    Hemat {diffPercent}%
+                                  </span>
+                                ) : diff < 0 ? (
+                                  <span className="text-[9.5px] font-bold text-amber-600 bg-amber-50 px-1.5 py-0.2 rounded">
+                                    +{formatRupiah(Math.abs(diff))}
+                                  </span>
+                                ) : null}
+                              </div>
+                              <input
+                                type="number"
+                                required
+                                min="0"
+                                step="any"
+                                value={cp.price !== undefined ? cp.price : ''}
+                                onChange={(e) => handleUpdateCustomerPrice(cpIdx, 'price', Math.max(0, parseFloat(e.target.value) || 0))}
+                                placeholder="0"
+                                className="w-full p-2 rounded-lg border border-slate-200 text-xs font-mono font-black text-sky-700 focus:border-sky-500 bg-sky-50/30"
+                              />
+                            </div>
+
+                            {/* Hapus Baris */}
+                            <div className="sm:col-span-1 text-right pt-2 sm:pt-0">
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveCustomerPrice(cpIdx)}
+                                className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 transition-colors cursor-pointer"
+                                title="Hapus Harga Khusus Ini"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Pemicu Syarat Harga Khusus (Live Explanation) */}
+                          <div className="p-2 rounded-xl bg-gradient-to-r from-sky-50 via-indigo-50/40 to-slate-50 border border-sky-100 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-[11px]">
+                            <div className="flex items-center gap-1.5 text-slate-700 truncate">
+                              <span className="font-bold text-sky-700 shrink-0">🎯 Pemicu Harga:</span>
+                              <span className="truncate">
+                                Harga <strong>{formatRupiah(cp.price)}</strong>/{currentUnitName} otomatis berlaku untuk pelanggan <strong>{cp.customerCategory || 'MEMBER'}</strong> jika membeli mulai <strong>{minQty} {currentUnitName} ke atas</strong>.
+                              </span>
+                            </div>
+                            {minQty > 1 && (
+                              <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 font-bold text-[9.5px] shrink-0 border border-indigo-200">
+                                Berlaku mulai pembelian {minQty} {currentUnitName} &amp; seterusnya
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Catatan Khusus baris ini */}
+                          <div className="pt-1 flex items-center gap-2">
+                            <span className="text-[10px] text-slate-400 shrink-0 font-medium">Catatan / Syarat:</span>
+                            <input
+                              type="text"
+                              value={cp.notes || ''}
+                              onChange={(e) => handleUpdateCustomerPrice(cpIdx, 'notes', e.target.value)}
+                              placeholder="Misal: Pembelian partai mulai 5 pcs keatas, khusus member..."
+                              className="w-full p-1 text-[11px] border border-slate-200 rounded-lg focus:border-sky-500 focus:outline-none"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
               {/* Action Buttons */}
-              <div className="pt-3 border-t border-slate-100 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingProduct(null);
-                    setIsAddingNew(false);
-                  }}
-                  className="py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 text-xs font-bold hover:bg-slate-100"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  className="py-2.5 px-6 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold shadow-md shadow-sky-600/20"
-                >
-                  Simpan Produk & Satuan
-                </button>
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
+                <div>
+                  {editingProduct && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        const prod = editingProduct;
+                        setEditingProduct(null);
+                        setIsAddingNew(false);
+                        setProductToDelete(prod);
+                      }}
+                      className="py-2.5 px-3.5 rounded-xl border border-rose-200 text-rose-600 hover:bg-rose-50 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Hapus Produk Ini</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingProduct(null);
+                      setIsAddingNew(false);
+                    }}
+                    className="py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 text-xs font-bold hover:bg-slate-100 cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    className="py-2.5 px-6 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold shadow-md shadow-sky-600/20 cursor-pointer"
+                  >
+                    Simpan Produk & Satuan
+                  </button>
+                </div>
               </div>
             </form>
           </div>
@@ -1734,17 +4602,36 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
             <div className="pt-4 space-y-3">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-bold text-slate-800 uppercase tracking-wider">
-                  Daftar Kategori Tersedia ({categories.length})
+                  Daftar Kategori Tersedia ({mergedCategories.length})
                 </span>
                 <span className="text-slate-400">Klik ikon pensil untuk mengubah warna</span>
               </div>
 
+              {autoDetectedCategories.length > 0 && (
+                <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-amber-900">
+                    Terdeteksi <strong>{autoDetectedCategories.length} kategori baru</strong> dari produk hasil impor yang siap disimpan permanen.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playSuccessChime();
+                      handleSyncDetectedCategories(autoDetectedCategories);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-bold shrink-0 cursor-pointer"
+                  >
+                    Simpan Semua ({autoDetectedCategories.length})
+                  </button>
+                </div>
+              )}
+
               <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
-                {categories.map((cat) => {
+                {mergedCategories.map((cat) => {
                   const productCount = products.filter(
-                    (p) => p.category.toLowerCase() === cat.name.toLowerCase()
+                    (p) => (p.category || '').trim().toLowerCase() === cat.name.trim().toLowerCase()
                   ).length;
                   const color = cat.color || '#0284c7';
+                  const isAutoDetected = cat.id.startsWith('auto_cat_');
 
                   return (
                     <div
@@ -1761,7 +4648,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                         </div>
 
                         <div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-bold text-slate-900 text-xs md:text-sm">
                               {cat.name}
                             </span>
@@ -1775,6 +4662,11 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                             >
                               {color}
                             </span>
+                            {isAutoDetected && (
+                              <span className="px-2 py-0.2 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                                Terdeteksi Impor
+                              </span>
+                            )}
                           </div>
                           <div className="text-[11px] text-slate-500 mt-0.5">
                             {cat.description || 'Tidak ada deskripsi'} •{' '}
@@ -1980,6 +4872,535 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                   </button>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* =================================================================== */}
+      {/* MODAL IMPORT PRODUK MASSAL (EXCEL .XLSX / .XLS)                     */}
+      {/* =================================================================== */}
+      {isCsvModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-xs overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95">
+            {/* Header */}
+            <div className="p-4 sm:p-5 bg-gradient-to-r from-emerald-700 to-teal-800 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center shadow-inner">
+                  <FileSpreadsheet className="w-6 h-6 text-emerald-100" />
+                </div>
+                <div>
+                  <h3 className="font-black text-base md:text-lg leading-tight">Import Produk Massal (Excel .XLSX / .XLS)</h3>
+                  <p className="text-xs text-emerald-100">
+                    Unggah file Excel dengan pemetaan kolom SKU, harga modal/beli, harga jual, stok, satuan, kadaluarsa &amp; URL gambar
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setIsCsvModalOpen(false);
+                }}
+                className="p-1.5 rounded-xl text-emerald-200 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 sm:p-6 overflow-y-auto space-y-5 flex-1">
+              {/* Alert Notification */}
+              {csvImportSuccessMessage && (
+                <div className="p-3.5 bg-emerald-50 border border-emerald-300 rounded-2xl text-xs text-emerald-800 font-bold flex items-center gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{csvImportSuccessMessage}</span>
+                </div>
+              )}
+
+              {/* Step 1: Download Template */}
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Download className="w-4 h-4 text-emerald-600" />
+                    <span>Langkah 1: Unduh Format Template Excel (.XLSX)</span>
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    File Excel resmi telah menyertakan lembar <strong>Contoh Pengisian Realistis</strong> dan <strong>Petunjuk Format</strong> kolom.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleDownloadExcelTemplate}
+                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 shadow-2xs shrink-0 cursor-pointer transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Unduh Template Excel (.XLSX)</span>
+                </button>
+              </div>
+
+              {/* Step 2: Upload Excel File */}
+              <div className="p-4 border-2 border-dashed border-slate-300 hover:border-emerald-500 rounded-2xl text-center transition-colors bg-slate-50/50">
+                <input
+                  type="file"
+                  id="csv-file-input"
+                  accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+                  onChange={handleCsvFileChange}
+                  className="hidden"
+                />
+                <label
+                  htmlFor="csv-file-input"
+                  className="cursor-pointer flex flex-col items-center justify-center py-4 space-y-2"
+                >
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-100 text-emerald-700 flex items-center justify-center shadow-xs">
+                    <Upload className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-slate-800 hover:underline">
+                      {csvFileName ? `File Terpilih: ${csvFileName}` : 'Klik untuk memilih file Excel (.xlsx / .xls) dari komputer/tablet'}
+                    </span>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Mendukung format file spreadsheet Excel (.xlsx, .xls) dan .csv</p>
+                  </div>
+                  {csvRawRows.length > 0 && (
+                    <span className="inline-flex items-center gap-1 px-3 py-1 bg-emerald-100 text-emerald-800 rounded-full text-xs font-black">
+                      <Check className="w-3 h-3" />
+                      <span>{csvRawRows.length} Baris Produk Ditemukan</span>
+                    </span>
+                  )}
+                </label>
+              </div>
+
+              {/* Step 3: Column Mapping (if file loaded) */}
+              {csvHeaders.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                      <Sliders className="w-4 h-4 text-sky-600" />
+                      <span>Langkah 2: Pemetaan Kolom CSV</span>
+                    </h4>
+                    <span className="text-[10px] text-slate-400">Cocokkan kolom tabel Anda dengan sistem</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom SKU / Barcode *
+                      </label>
+                      <select
+                        value={csvMapping.sku}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, sku: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Pilih Kolom --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`sku-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Nama Produk *
+                      </label>
+                      <select
+                        value={csvMapping.name}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, name: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Pilih Kolom --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`name-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Harga Jual *
+                      </label>
+                      <select
+                        value={csvMapping.sellingPrice}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, sellingPrice: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Pilih Kolom --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`price-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Kategori
+                      </label>
+                      <select
+                        value={csvMapping.category}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, category: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Dipetakan (Default: Umum) --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`cat-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Satuan Dasar
+                      </label>
+                      <select
+                        value={csvMapping.baseUnit}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, baseUnit: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Dipetakan (Default: PCS) --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`unit-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Harga Beli / Modal
+                      </label>
+                      <select
+                        value={csvMapping.costPrice}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, costPrice: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Dipetakan (Default: 0) --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`cost-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Stok Awal
+                      </label>
+                      <select
+                        value={csvMapping.stock}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, stock: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Dipetakan (Default: 0) --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`stk-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Batas Min. Stok
+                      </label>
+                      <select
+                        value={csvMapping.minStock}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, minStock: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Dipetakan (Default: 10) --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`min-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Tanggal Kadaluarsa
+                      </label>
+                      <select
+                        value={csvMapping.expiryDate}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, expiryDate: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tidak Ada / Kosong --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`exp-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="sm:col-span-2 md:col-span-2">
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom Varian Produk (Format: Rasa:Harga:Barcode;...)
+                      </label>
+                      <select
+                        value={csvMapping.variants}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, variants: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tanpa Varian --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`var-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="sm:col-span-2 md:col-span-1">
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Kolom URL Gambar (Opsional)
+                      </label>
+                      <select
+                        value={csvMapping.imageUrl}
+                        onChange={(e) => setCsvMapping({ ...csvMapping, imageUrl: e.target.value })}
+                        className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs font-semibold"
+                      >
+                        <option value="">-- Tanpa URL Gambar --</option>
+                        {csvHeaders.map((h) => (
+                          <option key={`img-${h}`} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Preview First 3 Rows */}
+                  <div className="space-y-1.5">
+                    <h5 className="text-[11px] font-bold text-slate-700">Pratinjau Data (3 Baris Teratas):</h5>
+                    <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                      <table className="w-full text-left text-[11px]">
+                        <thead className="bg-slate-100 text-slate-600 font-bold border-b border-slate-200">
+                          <tr>
+                            <th className="py-2 px-3">SKU</th>
+                            <th className="py-2 px-3">Nama Produk</th>
+                            <th className="py-2 px-3">Kategori</th>
+                            <th className="py-2 px-3">Satuan</th>
+                            <th className="py-2 px-3">Harga Jual</th>
+                            <th className="py-2 px-3">Stok</th>
+                            <th className="py-2 px-3">Kadaluarsa</th>
+                            <th className="py-2 px-3">Varian</th>
+                            <th className="py-2 px-3">URL Gambar</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {csvRawRows.slice(0, 3).map((r, i) => {
+                            const skuVal = csvMapping.sku ? r[csvHeaders.indexOf(csvMapping.sku)] : '-';
+                            const nameVal = csvMapping.name ? r[csvHeaders.indexOf(csvMapping.name)] : '-';
+                            const catVal = csvMapping.category ? r[csvHeaders.indexOf(csvMapping.category)] : 'Umum';
+                            const unitVal = csvMapping.baseUnit ? r[csvHeaders.indexOf(csvMapping.baseUnit)] : 'PCS';
+                            const priceVal = csvMapping.sellingPrice ? r[csvHeaders.indexOf(csvMapping.sellingPrice)] : '0';
+                            const stockVal = csvMapping.stock ? r[csvHeaders.indexOf(csvMapping.stock)] : '0';
+                            const expVal = csvMapping.expiryDate ? r[csvHeaders.indexOf(csvMapping.expiryDate)] : '-';
+                            const varVal = csvMapping.variants ? r[csvHeaders.indexOf(csvMapping.variants)] : '-';
+                            const imageUrlVal = csvMapping.imageUrl ? r[csvHeaders.indexOf(csvMapping.imageUrl)] : '';
+
+                            return (
+                              <tr key={`prev-${i}`} className="hover:bg-slate-50 font-mono">
+                                <td className="py-2 px-3 font-bold text-slate-900">{skuVal}</td>
+                                <td className="py-2 px-3 font-sans font-medium text-slate-800">{nameVal}</td>
+                                <td className="py-2 px-3">{catVal}</td>
+                                <td className="py-2 px-3">{unitVal}</td>
+                                <td className="py-2 px-3 text-sky-700 font-bold">{priceVal}</td>
+                                <td className="py-2 px-3">{stockVal}</td>
+                                <td className="py-2 px-3 text-rose-700">{expVal || '-'}</td>
+                                <td className="py-2 px-3 text-slate-500 max-w-xs truncate">{varVal || '-'}</td>
+                                <td className="py-2 px-3 text-slate-500 max-w-[160px] truncate" title={imageUrlVal || ''}>{imageUrlVal || '-'}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setIsCsvModalOpen(false);
+                }}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-900"
+              >
+                Batal
+              </button>
+
+              <button
+                type="button"
+                disabled={csvRawRows.length === 0}
+                onClick={handleExecuteCsvImport}
+                className="px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-black text-xs shadow-md shadow-emerald-500/20 flex items-center gap-2 cursor-pointer transition-all"
+              >
+                <Check className="w-4 h-4" />
+                <span>Impor {csvRawRows.length > 0 ? `${csvRawRows.length} Produk` : ''} Sekarang</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BARCODE SCANNER MODAL (FOR CAMERA & HANDHELD BARCODE SCANNER) */}
+      {scanningUnitIndex !== null && (
+        <BarcodeScannerModal
+          isOpen={true}
+          onClose={() => setScanningUnitIndex(null)}
+          products={products}
+          onBarcodeScanned={(scannedCode) => {
+            sound.playScanBeep();
+            if (scanningUnitIndex === -1) {
+              setBarcode(scannedCode);
+            } else if (scanningUnitIndex >= 0) {
+              handleUnitChange(scanningUnitIndex, 'barcode', scannedCode);
+            }
+            setScanningUnitIndex(null);
+          }}
+        />
+      )}
+
+      {/* IN-APP CONFIRMATION MODAL: DELETE PRODUCT */}
+      {productToDelete && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-slate-900">Hapus Produk Ini?</h3>
+                <p className="text-xs text-slate-500">Tindakan ini tidak dapat dibatalkan</p>
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1">
+              <div className="text-xs font-bold text-slate-900">{productToDelete.name}</div>
+              <div className="text-[11px] text-slate-500 font-mono">
+                SKU / Barcode: {productToDelete.sku || productToDelete.barcode} • Kategori: {productToDelete.category}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                Stok: {productToDelete.stockInBaseUnit} {productToDelete.baseUnit}
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Apakah Anda yakin ingin menghapus produk ini? Produk akan segera dihapus secara permanen dari database toko dan sinkronisasi cloud.
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setProductToDelete(null)}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  sound.playSuccessChime();
+                  const targetId = productToDelete.id;
+                  setProductToDelete(null);
+                  try {
+                    await deleteDocumentFromFirestore('products', targetId);
+                  } catch (err) {
+                    console.warn('[Firestore] Delete product notice:', err);
+                  }
+                  onDeleteProduct(targetId);
+                }}
+                className="px-5 py-2.5 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-600/20 transition-all cursor-pointer flex items-center gap-1.5"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>Ya, Hapus Sekarang</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Printable SKU QR Code Label Modal */}
+      {skuQrProduct && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 select-none">
+          <div className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-slate-900 text-white p-5 relative no-print">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setSkuQrProduct(null);
+                }}
+                className="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <div className="flex items-center gap-2 text-indigo-300 text-[11px] font-bold uppercase tracking-wider">
+                <QrCode className="w-4 h-4" />
+                <span>Label QR Code SKU Produk</span>
+              </div>
+              <h3 className="text-base font-black mt-1 pr-8">{skuQrProduct.name}</h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {skuQrProduct.category} • Stok: {formatNumber(skuQrProduct.stockInBaseUnit)} {skuQrProduct.baseUnit}
+              </p>
+            </div>
+
+            <div className="p-6 flex flex-col items-center text-center space-y-4">
+              {/* Printable Sticker Preview Frame */}
+              <div className="w-full max-w-[300px] p-4 rounded-2xl border-2 border-slate-900 bg-white shadow-sm space-y-2">
+                <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">
+                  {skuQrProduct.category}
+                </div>
+                <div className="text-sm font-black text-slate-900 leading-tight line-clamp-2">
+                  {skuQrProduct.name}
+                </div>
+                <div className="flex justify-center py-1">
+                  {skuQrDataUrl ? (
+                    <img
+                      src={skuQrDataUrl}
+                      alt={`QR SKU ${skuQrProduct.sku || skuQrProduct.barcode}`}
+                      className="w-44 h-44 object-contain"
+                    />
+                  ) : (
+                    <div className="w-44 h-44 flex items-center justify-center text-xs text-slate-400">
+                      Membuat QR...
+                    </div>
+                  )}
+                </div>
+                <div className="px-3 py-1 rounded-lg bg-slate-100 border border-slate-300 font-mono text-xs font-black text-slate-900">
+                  {skuQrProduct.sku || skuQrProduct.barcode}
+                </div>
+                <div className="text-base font-black text-sky-700 font-mono">
+                  {formatRupiah(skuQrProduct.units?.[0]?.sellingPrice || 0)}
+                  <span className="text-xs font-bold text-slate-500">
+                    {' '}
+                    / {skuQrProduct.units?.[0]?.unitName || skuQrProduct.baseUnit}
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-slate-500 leading-relaxed no-print">
+                Tempelkan label ini pada rak atau kemasan produk agar kasir dapat melakukan <strong>Scan Cepat ke Keranjang</strong> atau <strong>Cek Stok SKU</strong> di layar POS.
+              </p>
+
+              <div className="w-full grid grid-cols-2 gap-2.5 pt-1 no-print">
+                <button
+                  type="button"
+                  onClick={() => handleDownloadSkuQrLabel(skuQrProduct)}
+                  className="py-2.5 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Unduh Label PNG</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    window.print();
+                  }}
+                  className="py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm cursor-pointer"
+                >
+                  <Printer className="w-4 h-4" />
+                  <span>Cetak Label</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

@@ -48,6 +48,16 @@ service cloud.firestore {
              data.items is list;
     }
 
+    function isValidOnlineOrder(data) {
+      return data.orderCode is string && data.orderCode.size() > 0 && data.orderCode.size() <= 40 &&
+             data.customerName is string && data.customerName.size() > 0 && data.customerName.size() <= 120 &&
+             data.customerWhatsapp is string && data.customerWhatsapp.size() >= 6 && data.customerWhatsapp.size() <= 30 &&
+             data.fulfillmentType in ['AMBIL_DI_TOKO', 'KIRIM_KURIR'] &&
+             data.status in ['MENUNGGU_KONFIRMASI', 'DIPROSES', 'SIAP_DIAMBIL', 'DIKIRIM', 'SELESAI', 'DIBATALKAN'] &&
+             data.totalAmount is number && data.totalAmount >= 0 &&
+             data.items is list && data.items.size() > 0 && data.items.size() <= 200;
+    }
+
     // Users collection (Kasir / Admin / Manager)
     match /users/{userId} {
       allow read, write: if true;
@@ -65,6 +75,11 @@ service cloud.firestore {
 
     // Customers collection
     match /customers/{customerId} {
+      allow read, write: if true;
+    }
+
+    // Customer categories collection
+    match /customer_categories/{catId} {
       allow read, write: if true;
     }
 
@@ -88,9 +103,26 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Purchases / Restock Orders collection
+    match /purchases/{purchaseId} {
+      allow read, write: if true;
+    }
+
+    // Cashflows (Pengeluaran & Pemasukan)
+    match /cashflows/{cashflowId} {
+      allow read, write: if true;
+    }
+
     // Store settings collection
     match /settings/{settingId} {
       allow read, write: if true;
+    }
+
+    // Online storefront orders collection
+    match /online_orders/{orderId} {
+      allow read: if true;
+      allow create, update: if isValidOnlineOrder(request.resource.data);
+      allow delete: if true;
     }
   }
 }

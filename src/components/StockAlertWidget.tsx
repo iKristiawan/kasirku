@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   AlertTriangle, 
   CheckCircle2, 
@@ -22,6 +22,9 @@ interface StockAlertWidgetProps {
   onQuickSelectProduct?: (product: Product) => void;
 }
 
+const MAX_COLLAPSED_TAGS = 15;
+const MAX_EXPANDED_CARDS = 40;
+
 export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
   products,
   onOpenThresholdSettings,
@@ -30,23 +33,32 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
 }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const [isDismissed, setIsDismissed] = useState(false);
+  const [showAllExpanded, setShowAllExpanded] = useState(false);
 
-  // Compute products below or at minimum threshold
-  const lowStockProducts = products.filter(
-    (p) => p.stockInBaseUnit <= p.minStockAlert
+  // Memoize products below or at minimum threshold
+  const lowStockProducts = useMemo(
+    () => products.filter((p) => (p.productType || 'BARANG') !== 'JASA' && p.stockInBaseUnit <= p.minStockAlert),
+    [products]
   );
 
-  const outOfStockProducts = lowStockProducts.filter(
-    (p) => p.stockInBaseUnit <= 0
+  const outOfStockProducts = useMemo(
+    () => lowStockProducts.filter((p) => p.stockInBaseUnit <= 0),
+    [lowStockProducts]
   );
-  
-  const warningProducts = lowStockProducts.filter(
-    (p) => p.stockInBaseUnit > 0
+
+  const collapsedTags = useMemo(
+    () => lowStockProducts.slice(0, MAX_COLLAPSED_TAGS),
+    [lowStockProducts]
+  );
+
+  const expandedCards = useMemo(
+    () => (showAllExpanded ? lowStockProducts : lowStockProducts.slice(0, MAX_EXPANDED_CARDS)),
+    [lowStockProducts, showAllExpanded]
   );
 
   if (lowStockProducts.length === 0) {
     return (
-      <div className="mx-3 md:mx-4 mt-3 px-3.5 py-2 bg-emerald-50/90 border border-emerald-200/80 rounded-2xl flex items-center justify-between text-xs text-emerald-900 shadow-2xs">
+      <div className="mx-3 md:mx-4 mt-3 px-3.5 py-2 bg-emerald-50/90 border border-emerald-200/80 rounded-2xl flex items-center justify-between text-xs text-emerald-900 shadow-2xs shrink-0">
         <div className="flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
           <span className="font-semibold">
@@ -71,9 +83,9 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
   // If dismissed by user, show a compact floating or mini alert indicator
   if (isDismissed) {
     return (
-      <div className="mx-3 md:mx-4 mt-2 px-3 py-1.5 bg-amber-500 text-slate-900 rounded-xl flex items-center justify-between text-xs font-bold shadow-xs animate-subtle-pulse">
+      <div className="mx-3 md:mx-4 mt-2 px-3 py-1.5 bg-amber-500 text-slate-900 rounded-xl flex items-center justify-between text-xs font-bold shadow-xs shrink-0">
         <div className="flex items-center gap-2">
-          <div className="w-4 h-4 rounded-full bg-slate-950 text-amber-400 flex items-center justify-center animate-ring-pulse">
+          <div className="w-4 h-4 rounded-full bg-slate-950 text-amber-400 flex items-center justify-center">
             <AlertTriangle className="w-2.5 h-2.5 stroke-[2.5]" />
           </div>
           <span>
@@ -98,18 +110,16 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
   }
 
   return (
-    <div className="mx-3 md:mx-4 mt-3 bg-gradient-to-r from-amber-50 via-orange-50 to-amber-50/70 border border-amber-300/80 rounded-2xl shadow-xs overflow-hidden transition-all">
+    <div className="mx-3 md:mx-4 mt-3 bg-gradient-to-r from-amber-50 via-orange-50 to-amber-50/70 border border-amber-300/80 rounded-2xl shadow-xs overflow-hidden transition-all shrink-0 max-h-[38%] flex flex-col">
       {/* Widget Header Summary */}
-      <div className="p-3 md:p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+      <div className="p-3 md:p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shrink-0">
         <div className="flex items-center gap-3">
-          {/* Subtle Ring-Pulsing Alert Beacon for high visibility */}
           <div className="relative shrink-0">
-            <div className="w-8 h-8 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold shadow-xs animate-ring-pulse">
+            <div className="w-8 h-8 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold shadow-xs">
               <AlertTriangle className="w-4 h-4 stroke-[2.5]" />
             </div>
             <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-600"></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-600 ring-2 ring-white"></span>
             </span>
           </div>
 
@@ -118,12 +128,12 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
               <h4 className="text-xs md:text-sm font-bold text-slate-900">
                 Peringatan Stok Menipis
               </h4>
-              <span className="px-2 py-0.5 rounded-md bg-amber-200/90 text-amber-900 font-mono font-bold text-[10px] animate-subtle-pulse inline-flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-600 animate-pulse"></span>
+              <span className="px-2 py-0.5 rounded-md bg-amber-200/90 text-amber-900 font-mono font-bold text-[10px] inline-flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-600"></span>
                 <span>{lowStockProducts.length} Produk Mencapai Batas</span>
               </span>
               {outOfStockProducts.length > 0 && (
-                <span className="px-1.5 py-0.5 rounded-md bg-rose-200 text-rose-900 font-mono font-bold text-[10px] animate-pulse">
+                <span className="px-1.5 py-0.5 rounded-md bg-rose-200 text-rose-900 font-mono font-bold text-[10px]">
                   {outOfStockProducts.length} Habis
                 </span>
               )}
@@ -191,13 +201,13 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
         </div>
       </div>
 
-      {/* Quick horizontal preview tags (when collapsed) */}
+      {/* Quick horizontal preview tags (when collapsed, capped at 15 tags for smooth performance) */}
       {!isExpanded && (
-        <div className="px-3 pb-2.5 flex items-center gap-2 overflow-x-auto no-scrollbar">
+        <div className="px-3 pb-2.5 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
           <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider shrink-0">
             Daftar Cepat:
           </span>
-          {lowStockProducts.map((p) => {
+          {collapsedTags.map((p) => {
             const isZero = p.stockInBaseUnit <= 0;
             return (
               <div
@@ -219,12 +229,24 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
               </div>
             );
           })}
+          {lowStockProducts.length > MAX_COLLAPSED_TAGS && (
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setIsExpanded(true);
+              }}
+              className="px-2.5 py-1 rounded-xl text-[11px] font-bold bg-amber-200 hover:bg-amber-300 text-amber-950 shrink-0 cursor-pointer"
+            >
+              +{lowStockProducts.length - MAX_COLLAPSED_TAGS} lainnya
+            </button>
+          )}
         </div>
       )}
 
       {/* Expanded Detail Panel */}
       {isExpanded && (
-        <div className="border-t border-amber-200/80 bg-white/70 p-3 space-y-2 max-h-56 overflow-y-auto">
+        <div className="border-t border-amber-200/80 bg-white/70 p-3 space-y-2 max-h-56 min-h-0 overflow-y-auto overscroll-contain">
           <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wider mb-1 flex items-center justify-between">
             <span>Rincian Produk di Bawah Ambang Batas:</span>
             <span className="text-[10px] text-slate-400 font-normal">
@@ -233,7 +255,7 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {lowStockProducts.map((p) => {
+            {expandedCards.map((p) => {
               const ratio = p.minStockAlert > 0 ? (p.stockInBaseUnit / p.minStockAlert) * 100 : 0;
               const isZero = p.stockInBaseUnit <= 0;
 
@@ -284,6 +306,23 @@ export const StockAlertWidget: React.FC<StockAlertWidgetProps> = ({
               );
             })}
           </div>
+
+          {lowStockProducts.length > MAX_EXPANDED_CARDS && (
+            <div className="pt-1 text-center">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setShowAllExpanded((prev) => !prev);
+                }}
+                className="px-3 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 text-xs font-bold cursor-pointer"
+              >
+                {showAllExpanded
+                  ? 'Tampilkan Lebih Ringkas (40 Produk)'
+                  : `Tampilkan Semua (${lowStockProducts.length} Produk)`}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

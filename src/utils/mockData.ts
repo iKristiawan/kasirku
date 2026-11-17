@@ -1,4 +1,52 @@
-import { Customer, Product, ProductCategory, StoreSettings, Supplier, User, Transaction, AttendanceRecord, StockOpnameRecord } from '../types/pos';
+import { Customer, Product, ProductCategory, StoreSettings, Supplier, User, Transaction, AttendanceRecord, StockOpnameRecord, CustomPaymentMethod, CustomerCategoryItem } from '../types/pos';
+import { DEFAULT_LOW_STOCK_WHATSAPP_TEMPLATE } from './adminLowStockAlert';
+
+export const DEFAULT_PAYMENT_METHODS: CustomPaymentMethod[] = [
+  {
+    id: 'pm_cash',
+    name: 'Tunai (Cash)',
+    type: 'CASH',
+    isActive: true,
+    isDefault: true,
+    description: 'Pembayaran tunai kasir fisik dengan uang pas / kembalian',
+  },
+  {
+    id: 'pm_qris_bca',
+    name: 'QRIS BCA & All Payment',
+    type: 'QRIS',
+    isActive: true,
+    isDefault: true,
+    accountNumber: 'MID-BCA-994821',
+    accountName: 'PT TOKO BERKAH JAYA',
+    description: 'Scan kode QRIS dinamis/statis via mobile banking & e-wallet',
+  },
+  {
+    id: 'pm_edc_bca',
+    name: 'EDC BCA (Kartu Debit/Kredit)',
+    type: 'CARD',
+    isActive: true,
+    isDefault: true,
+    description: 'Gesek/dip kartu ATM Debit BCA, Flazz, Visa, Mastercard',
+  },
+  {
+    id: 'pm_transfer_bca',
+    name: 'Transfer Bank BCA',
+    type: 'BANK_TRANSFER',
+    isActive: true,
+    isDefault: true,
+    accountNumber: '8830192819',
+    accountName: 'PT TOKO BERKAH JAYA',
+    description: 'Transfer bank antar rekening / m-BCA dengan konfirmasi kasir',
+  },
+  {
+    id: 'pm_piutang',
+    name: 'Piutang (Tempo / Kasbon)',
+    type: 'PIUTANG',
+    isActive: true,
+    isDefault: true,
+    description: 'Catat kasbon belanja tempo bagi pelanggan terdaftar',
+  },
+];
 
 export const INITIAL_CATEGORIES: ProductCategory[] = [
   { id: 'cat_sembako', name: 'Sembako', color: '#d97706', description: 'Beras, minyak goreng, gula, tepung, telur' },
@@ -9,14 +57,18 @@ export const INITIAL_CATEGORIES: ProductCategory[] = [
   { id: 'cat_pembersih', name: 'Pembersih Rumah', color: '#059669', description: 'Deterjen, sabun cuci piring, karbol lantai' },
 ];
 
-export const INITIAL_USERS: User[] = [
-  {
-    id: 'user_admin',
-    name: 'Budi Hartono (Admin)',
-    pin: '1234',
-    role: 'ADMIN',
-    avatarColor: 'bg-indigo-600',
-  },
+export const DEFAULT_ADMIN_USER: User = {
+  id: 'user_admin',
+  name: 'Admin',
+  pin: '1234',
+  role: 'ADMIN',
+  avatarColor: 'bg-indigo-600',
+};
+
+export const STANDARD_DEFAULT_USERS: User[] = [DEFAULT_ADMIN_USER];
+
+export const DEMO_USERS: User[] = [
+  DEFAULT_ADMIN_USER,
   {
     id: 'user_manager',
     name: 'Rian Pratama (Store Manager)',
@@ -40,16 +92,64 @@ export const INITIAL_USERS: User[] = [
   },
 ];
 
+export const INITIAL_USERS: User[] = [DEFAULT_ADMIN_USER];
+
+export const DEFAULT_WHATSAPP_RECEIPT_TEMPLATE = `*NOTA PEMBELIAN - {storeName}*
+Halo {customerName}, terima kasih telah berbelanja!
+
+No. Nota : {invoiceNumber}
+Waktu    : {dateTime}
+--------------------------------
+{itemsList}
+--------------------------------
+*TOTAL AKHIR : {totalAmount}*
+Metode Bayar : {paymentMethod}
+{pointsInfo}
+{summaryLink}
+--------------------------------
+{storeFooter}`;
+
 export const INITIAL_STORE_SETTINGS: StoreSettings = {
   storeName: 'TOKO BERKAH JAYA',
   storeAddress: 'Jl. Merdeka Barat No. 88, Jakarta Pusat',
   storePhone: '0812-3456-7890',
-  storeFooterReceipt: 'Terima kasih telah berbelanja di Toko Berkah Jaya! Barang yang sudah dibeli tidak dapat ditukar.',
+  storeHeaderReceipt: 'Selamat Datang di Toko Berkah Jaya! Belanja Hemat Setiap Hari',
+  storeFooterReceipt: 'Terima kasih telah berbelanja di Toko Berkah Jaya!\nBarang yang sudah dibeli tidak dapat ditukar.',
   storeLogo: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 50" width="160" height="50"><rect x="2" y="2" width="156" height="46" rx="8" fill="none" stroke="black" stroke-width="2.5"/><path d="M14 16 L24 16 L28 32 L40 32 L42 22 L22 22" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="29" cy="35" r="2" fill="black"/><circle cx="39" cy="35" r="2" fill="black"/><text x="48" y="24" font-family="sans-serif" font-weight="900" font-size="13" fill="black" letter-spacing="1">BERKAH JAYA</text><text x="48" y="36" font-family="sans-serif" font-weight="600" font-size="8.5" fill="black" letter-spacing="2">SUPERMARKET</text></svg>',
   showLogoOnReceipt: true,
+  manualOfflineMode: false,
+  dailySalesGoal: 5000000, // Rp 5.000.000 Target Penjualan Harian
+  weeklySalesGoal: 30000000, // Rp 30.000.000 Target Penjualan Mingguan
+  monthlySalesGoal: 120000000, // Rp 120.000.000 Target Penjualan Bulanan
+  autoSendWhatsAppReceipt: false, // Default off until admin activates
+  includeReceiptSummaryInAutoWa: true,
+  includeLoyaltyPointsInAutoWa: true,
+  useCustomWhatsAppTemplate: false,
+  customWhatsAppTemplate: DEFAULT_WHATSAPP_RECEIPT_TEMPLATE,
+  autoAdminLowStockWhatsApp: true,
+  adminWhatsAppNumber: '',
+  adminLowStockTriggerCount: 2,
+  useCustomLowStockWhatsAppTemplate: false,
+  customLowStockWhatsAppTemplate: DEFAULT_LOW_STOCK_WHATSAPP_TEMPLATE,
+  scheduledAdminLowStockWhatsApp: {
+    enabled: false,
+    frequency: 'DAILY',
+    time: '18:00',
+    daysOfWeek: [1, 2, 3, 4, 5, 6],
+    sendEvenIfAllSafe: false,
+    includeOutOfStockSummary: true,
+  },
+  printerConnectionType: 'BLUETOOTH',
+  printerPaperWidth: '58mm',
+  printerDeviceName: '',
+  printerAutoCut: true,
+  autoPrintReceipt: false,
   enablePoints: true,
-  spendPerPoint: 10000, // Rp 10.000 = 1 Poin
+  spendPerPoint: 10000, // Belanja setiap Rp 10.000 (x)
+  pointsPerSpend: 1, // Mendapatkan 1 Poin (y)
   pointValueRupiah: 100, // 1 Poin = Potongan Rp 100
+  autoApplyMaxPoints: false,
+  requireTransactionNote: false,
   enableMembershipDiscount: true,
   membershipDiscounts: {
     silver: 3, // 3%
@@ -59,6 +159,14 @@ export const INITIAL_STORE_SETTINGS: StoreSettings = {
   bcaAccountNumber: '8830192819',
   bcaAccountName: 'PT TOKO BERKAH JAYA',
   bcaMerchantId: 'MID-BCA-994821',
+  customPaymentMethods: DEFAULT_PAYMENT_METHODS,
+  onlineStoreEnabled: true,
+  onlineStoreTagline: 'Belanja kebutuhan harian & layanan toko lebih praktis, stok langsung terhubung ke kasir.',
+  onlineStoreHours: '08:00 - 21:00 WIB',
+  onlineStoreDeliveryFee: 10000,
+  onlineStoreMinFreeDelivery: 100000,
+  onlineStorePickupEnabled: true,
+  onlineStoreDeliveryEnabled: true,
 };
 
 export const INITIAL_PRODUCTS: Product[] = [
@@ -213,6 +321,8 @@ export const INITIAL_CUSTOMERS: Customer[] = [
     creditLimit: 500000,
     totalDebt: 0,
     membershipTier: 'GOLD',
+    customerCategory: 'VIP',
+    isMember: true,
     notes: 'Pelanggan loyal, sering belanja grosir mingguan.',
     createdAt: '2026-01-15',
   },
@@ -226,6 +336,8 @@ export const INITIAL_CUSTOMERS: Customer[] = [
     creditLimit: 750000,
     totalDebt: 154000, // Memiliki piutang yang sedang berjalan
     membershipTier: 'SILVER',
+    customerCategory: 'REGULER',
+    isMember: true,
     notes: 'Sering ambil tempo/kasbon 14 hari.',
     createdAt: '2026-02-10',
   },
@@ -239,6 +351,8 @@ export const INITIAL_CUSTOMERS: Customer[] = [
     creditLimit: 2000000,
     totalDebt: 385000,
     membershipTier: 'PLATINUM',
+    customerCategory: 'GROSIR',
+    isMember: true,
     notes: 'Warung kelontong mitra, order per dus/renceng.',
     createdAt: '2026-01-05',
   },
@@ -252,9 +366,20 @@ export const INITIAL_CUSTOMERS: Customer[] = [
     creditLimit: 150000,
     totalDebt: 0,
     membershipTier: 'REGULER',
+    customerCategory: 'RESELLER',
+    isMember: true,
     notes: 'Member baru.',
     createdAt: '2026-03-01',
   },
+];
+
+export const INITIAL_CUSTOMER_CATEGORIES: CustomerCategoryItem[] = [
+  { id: 'cc_umum', name: 'UMUM', color: 'slate', description: 'Pelanggan umum/walk-in non-member', isSystemDefault: true, createdAt: '2026-01-01' },
+  { id: 'cc_reguler', name: 'REGULER', color: 'blue', description: 'Pelanggan reguler terdaftar', isSystemDefault: true, createdAt: '2026-01-01' },
+  { id: 'cc_member', name: 'MEMBER', color: 'amber', description: 'Pelanggan member setia toko', isSystemDefault: false, createdAt: '2026-01-01' },
+  { id: 'cc_vip', name: 'VIP', color: 'purple', description: 'Pelanggan prioritas VIP', isSystemDefault: false, createdAt: '2026-01-01' },
+  { id: 'cc_reseller', name: 'RESELLER', color: 'sky', description: 'Mitra reseller & dropshipper', isSystemDefault: false, createdAt: '2026-01-01' },
+  { id: 'cc_grosir', name: 'GROSIR', color: 'emerald', description: 'Pembelian kuantiti besar / grosir', isSystemDefault: false, createdAt: '2026-01-01' },
 ];
 
 export const INITIAL_SUPPLIERS: Supplier[] = [

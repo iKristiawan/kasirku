@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useDeferredValue, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { 
@@ -37,11 +37,20 @@ import {
   FileText,
   Clock,
   ArrowRight,
-  FileDown
+  FileDown,
+  Calculator,
+  CalendarDays,
+  ShieldCheck,
+  Flame
 } from 'lucide-react';
 import { Product, Supplier, User, UserRole, StockOpnameRecord, StockOpnameItem, StoreSettings, Transaction } from '../types/pos';
 import { formatRupiah, formatNumber, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import { TouchKeypadModal } from './TouchKeypadModal';
+import { InventoryHealthWidget } from './InventoryHealthWidget';
+import { StockTurnoverHeatmap } from './StockTurnoverHeatmap';
+
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
 
 interface StockReportViewProps {
   products: Product[];
@@ -98,17 +107,75 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   onNavigateToSuppliers,
   onInitiateRestockForProduct,
 }) => {
-  // Navigation Tabs: 'MONITORING' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING'
-  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING'>('MONITORING');
+  // Navigation Tabs: 'MONITORING' | 'STOCK_HEATMAP' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'
+  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'STOCK_HEATMAP' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'>('MONITORING');
 
-  // Forecasting filter states
+  // Verify Stock utility states
+  const [showVerifyStockPanel, setShowVerifyStockPanel] = useState<boolean>(false);
+  const [verifyShowOnlyIssues, setVerifyShowOnlyIssues] = useState<boolean>(true);
+  const [verifyFeedbackMsg, setVerifyFeedbackMsg] = useState<string | null>(null);
+
+  // Optimal Reorder Quantity Report states
+  const [reorderLookbackDays, setReorderLookbackDays] = useState<30 | 60 | 90>(30);
+  const [reorderLeadTimeDays, setReorderLeadTimeDays] = useState<number>(7);
+  const [reorderCycleDays, setReorderCycleDays] = useState<number>(14);
+  const [reorderSafetyDays, setReorderSafetyDays] = useState<number>(5);
+  const [reorderFilterMode, setReorderFilterMode] = useState<'ALL' | 'NEED_REORDER' | 'WITH_HISTORY'>('ALL');
+  const [reorderSupplierFilter, setReorderSupplierFilter] = useState<string>('ALL');
+  const [reorderSearch, setReorderSearch] = useState<string>('');
+
+  // STRICTLY physical products only: Services (JASA) have no stock and must NOT be monitored or opnamed
+  const physicalProducts = useMemo(() => {
+    return products.filter((p) => p.productType !== 'JASA');
+  }, [products]);
+
+  const physicalProductMap = useMemo(() => {
+    const map = new Map<string, Product>();
+    for (let i = 0; i < physicalProducts.length; i++) {
+      map.set(physicalProducts[i].id, physicalProducts[i]);
+    }
+    return map;
+  }, [physicalProducts]);
+
+  const supplierMap = useMemo(() => {
+    const map = new Map<string, Supplier>();
+    for (let i = 0; i < suppliers.length; i++) {
+      map.set(suppliers[i].id, suppliers[i]);
+    }
+    return map;
+  }, [suppliers]);
+
+  // Expiry tracker states
+  const [expiryStatusFilter, setExpiryStatusFilter] = useState<'ALL' | 'EXPIRED' | 'CRITICAL_7D' | 'WARNING_30D' | 'SAFE'>('ALL');
+  const [expirySearch, setExpirySearch] = useState('');
+
+  // Forecasting filter & suggestion states
   const [forecastingSearch, setForecastingSearch] = useState('');
+  const deferredForecastingSearch = useDeferredValue(forecastingSearch);
   const [forecastingUrgency, setForecastingUrgency] = useState<'ALL' | 'CRITICAL' | 'SOON_7D' | 'SAFE'>('ALL');
+  const [leadTimeDays, setLeadTimeDays] = useState<number>(7); // Default 7 hari lead time pengiriman supplier
+  const [safetyStockDays, setSafetyStockDays] = useState<number>(14); // Default 14 hari buffer stok pengaman
+  const [isDraftPOModalOpen, setIsDraftPOModalOpen] = useState<boolean>(false);
+  const [selectedPOSupplierId, setSelectedPOSupplierId] = useState<string>('ALL');
+
+  // Touch Keypad Modal state for tactile tablet stock adjustments & physical counts
+  const [activeKeypad, setActiveKeypad] = useState<{
+    title: string;
+    subtitle?: string;
+    initialValue: number;
+    unitName?: string;
+    onConfirm: (val: number) => void;
+  } | null>(null);
 
   // =========================================================================
   // TAB 1: MONITORING & RINGKASAN STOK STATES
   // =========================================================================
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
+  const deferredReorderSearch = useDeferredValue(reorderSearch);
+  const [monitoringPage, setMonitoringPage] = useState(1);
+  const [reorderPage, setReorderPage] = useState(1);
+  const STOCK_PAGE_SIZE = 50;
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'NEED_RESTOCK' | 'OUT_OF_STOCK' | 'SAFE'>('ALL');
   const [selectedCategory, setSelectedCategory] = useState<string>('SEMUA');
   const [adjustingProduct, setAdjustingProduct] = useState<Product | null>(null);
@@ -116,50 +183,256 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   const [adjustmentType, setAdjustmentType] = useState<'SET' | 'ADD' | 'SUBTRACT'>('SET');
   const [adjustmentReason, setAdjustmentReason] = useState<string>('Stock Opname Fisik');
 
+  // Predictive Restock & Linear Regression States
+  const [isPredictiveRestockActive, setIsPredictiveRestockActive] = useState<boolean>(true);
+  const [onlyShowCritical7Days, setOnlyShowCritical7Days] = useState<boolean>(false);
+
   // Categories
   const categories = useMemo(() => {
-    return ['SEMUA', ...Array.from(new Set(products.map((p) => p.category)))];
-  }, [products]);
+    return ['SEMUA', ...Array.from(new Set(physicalProducts.map((p) => p.category)))];
+  }, [physicalProducts]);
 
   // Calculations for Monitoring
   const totalValuation = useMemo(() => {
-    return products.reduce((acc, p) => acc + p.stockInBaseUnit * p.costPrice, 0);
-  }, [products]);
+    return physicalProducts.reduce((acc, p) => acc + p.stockInBaseUnit * p.costPrice, 0);
+  }, [physicalProducts]);
 
   const totalBaseUnitsCount = useMemo(() => {
-    return products.reduce((acc, p) => acc + p.stockInBaseUnit, 0);
-  }, [products]);
+    return physicalProducts.reduce((acc, p) => acc + p.stockInBaseUnit, 0);
+  }, [physicalProducts]);
 
   const lowStockProducts = useMemo(() => {
-    return products.filter((p) => p.stockInBaseUnit <= p.minStockAlert);
-  }, [products]);
+    return physicalProducts.filter((p) => p.stockInBaseUnit <= p.minStockAlert);
+  }, [physicalProducts]);
 
   const outOfStockProducts = useMemo(() => {
-    return products.filter((p) => p.stockInBaseUnit <= 0);
-  }, [products]);
+    return physicalProducts.filter((p) => p.stockInBaseUnit <= 0);
+  }, [physicalProducts]);
 
   const safeStockProducts = useMemo(() => {
-    return products.filter((p) => p.stockInBaseUnit > p.minStockAlert);
-  }, [products]);
+    return physicalProducts.filter((p) => p.stockInBaseUnit > p.minStockAlert);
+  }, [physicalProducts]);
+
+  // Expiry analytics
+  const expiryAnalytics = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const in30Days = new Date(today);
+    in30Days.setDate(in30Days.getDate() + 30);
+    const in7Days = new Date(today);
+    in7Days.setDate(in7Days.getDate() + 7);
+
+    const itemsWithExpiry = physicalProducts.filter((p) => Boolean(p.expiryDate));
+    const expiredItems = itemsWithExpiry.filter((p) => new Date(p.expiryDate!) < today);
+    const expiringIn7Days = itemsWithExpiry.filter((p) => {
+      const d = new Date(p.expiryDate!);
+      return d >= today && d <= in7Days;
+    });
+    const expiringIn30Days = itemsWithExpiry.filter((p) => {
+      const d = new Date(p.expiryDate!);
+      return d > in7Days && d <= in30Days;
+    });
+    const safeItems = itemsWithExpiry.filter((p) => new Date(p.expiryDate!) > in30Days);
+
+    return {
+      totalTracked: itemsWithExpiry.length,
+      expiredItems,
+      expiringIn7Days,
+      expiringIn30Days,
+      safeItems,
+      alertCount: expiredItems.length + expiringIn7Days.length + expiringIn30Days.length,
+    };
+  }, [physicalProducts]);
+
+  const filteredExpiryProducts = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const in30Days = new Date(today);
+    in30Days.setDate(in30Days.getDate() + 30);
+    const in7Days = new Date(today);
+    in7Days.setDate(in7Days.getDate() + 7);
+
+    return physicalProducts.filter((p) => {
+      if (!p.expiryDate) return false;
+      const expDate = new Date(p.expiryDate);
+      const isExpired = expDate < today;
+      const is7Days = expDate >= today && expDate <= in7Days;
+      const is30Days = expDate > in7Days && expDate <= in30Days;
+      const isSafe = expDate > in30Days;
+
+      if (expiryStatusFilter === 'EXPIRED' && !isExpired) return false;
+      if (expiryStatusFilter === 'CRITICAL_7D' && !is7Days) return false;
+      if (expiryStatusFilter === 'WARNING_30D' && !is30Days) return false;
+      if (expiryStatusFilter === 'SAFE' && !isSafe) return false;
+
+      const matchSearch =
+        p.name.toLowerCase().includes(expirySearch.toLowerCase()) ||
+        p.barcode.toLowerCase().includes(expirySearch.toLowerCase()) ||
+        p.category.toLowerCase().includes(expirySearch.toLowerCase());
+
+      return matchSearch;
+    });
+  }, [physicalProducts, expiryStatusFilter, expirySearch]);
+
+  // =========================================================================
+  // 30-DAY DAILY VELOCITY & LINEAR REGRESSION (PREDICTIVE RESTOCK)
+  // Evaluates daily trend slope (m in y = mx + b), predicts days until depletion,
+  // and flags products running out within 7 days.
+  // =========================================================================
+  const predictiveStockMap = useMemo(() => {
+    const now = Date.now();
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = now - 30 * MS_PER_DAY;
+
+    // 1. Prepare 30-day daily sales buckets for each product: Map<productId, number[30]>
+    const productDailySales = new Map<string, number[]>();
+    physicalProducts.forEach((p) => {
+      productDailySales.set(p.id, new Array(30).fill(0));
+    });
+
+    (transactions || []).forEach((tx) => {
+      if (tx.timestamp >= thirtyDaysAgo && tx.timestamp <= now) {
+        const dayDiff = Math.min(29, Math.max(0, Math.floor((now - tx.timestamp) / MS_PER_DAY)));
+        const dayIndex = 29 - dayDiff; // 0 = 29 days ago, 29 = today
+        tx.items.forEach((item) => {
+          const arr = productDailySales.get(item.productId);
+          if (arr) {
+            const baseQty = item.quantity * (item.conversionFactor || 1);
+            arr[dayIndex] = (arr[dayIndex] || 0) + baseQty;
+          }
+        });
+      }
+    });
+
+    // 2. Perform Linear Regression (y = mx + b)
+    // x values are 0, 1, 2, ..., 29 (N = 30)
+    // mean(x) = 14.5
+    // SS_xx = sum((x - 14.5)^2) = 2247.5
+    const resultMap = new Map<string, {
+      dailyVelocity: number;
+      regressionSlope: number;
+      trendDirection: 'RISING' | 'DECLINING' | 'STABLE';
+      trendPercent: number;
+      projectedRunRate: number;
+      daysUntilDepletion: number;
+      depletionDateStr: string;
+      isDepletingSoon7Days: boolean;
+      recommendedRestockUnits: number;
+      totalSold30Days: number;
+    }>();
+
+    physicalProducts.forEach((prod) => {
+      const dailyArray = productDailySales.get(prod.id) || new Array(30).fill(0);
+      const totalSold = dailyArray.reduce((acc, v) => acc + v, 0);
+      const yMean = totalSold / 30;
+
+      let spXY = 0;
+      for (let i = 0; i < 30; i++) {
+        const xDev = i - 14.5;
+        const yDev = dailyArray[i] - yMean;
+        spXY += xDev * yDev;
+      }
+
+      const slope = spXY / 2247.5; // Change in daily sales per day
+
+      let trendDirection: 'RISING' | 'DECLINING' | 'STABLE' = 'STABLE';
+      if (slope > 0.04) trendDirection = 'RISING';
+      else if (slope < -0.04) trendDirection = 'DECLINING';
+
+      // Trend acceleration percent over 30 days
+      const trendPercent = yMean > 0 ? Math.round((slope * 30 / yMean) * 100) : 0;
+
+      // Projected current daily demand with regression momentum (day 30)
+      const projectedRunRate = Math.max(0, yMean + slope * 15.5);
+      const effectiveVelocity = yMean > 0 ? Math.max(0.08, projectedRunRate) : 0;
+
+      let daysUntilDepletion = 999;
+      let isDepletingSoon7Days = false;
+
+      if (prod.stockInBaseUnit <= 0) {
+        daysUntilDepletion = 0;
+        isDepletingSoon7Days = true;
+      } else if (effectiveVelocity > 0) {
+        daysUntilDepletion = Math.round((prod.stockInBaseUnit / effectiveVelocity) * 10) / 10;
+        if (daysUntilDepletion <= 7) {
+          isDepletingSoon7Days = true;
+        }
+      }
+
+      let depletionDateStr = 'Aman (>30 Hari)';
+      if (prod.stockInBaseUnit <= 0) {
+        depletionDateStr = 'Habis Hari Ini';
+      } else if (daysUntilDepletion <= 30) {
+        const d = new Date(now + daysUntilDepletion * MS_PER_DAY);
+        depletionDateStr = `${d.getDate()} ${MONTH_NAMES[d.getMonth()]}`;
+      }
+
+      // Recommended restock quantity: 21 days supply (7 days lead time + 14 days safety buffer)
+      const targetStock = Math.ceil(effectiveVelocity * 21 + prod.minStockAlert);
+      const recommendedRestockUnits = Math.max(0, targetStock - prod.stockInBaseUnit);
+
+      resultMap.set(prod.id, {
+        dailyVelocity: Math.round(yMean * 10) / 10,
+        regressionSlope: Math.round(slope * 1000) / 1000,
+        trendDirection,
+        trendPercent,
+        projectedRunRate: Math.round(projectedRunRate * 10) / 10,
+        daysUntilDepletion,
+        depletionDateStr,
+        isDepletingSoon7Days,
+        recommendedRestockUnits,
+        totalSold30Days: totalSold,
+      });
+    });
+
+    return resultMap;
+  }, [physicalProducts, transactions]);
+
+  // List of items depleting within 7 days (only active when Predictive Restock toggle is ON)
+  const critical7DaysProducts = useMemo(() => {
+    if (!isPredictiveRestockActive) return [];
+    return physicalProducts.filter((p) => {
+      const pred = predictiveStockMap.get(p.id);
+      return pred?.isDepletingSoon7Days;
+    });
+  }, [physicalProducts, predictiveStockMap, isPredictiveRestockActive]);
 
   const filteredProducts = useMemo(() => {
-    return products.filter((p) => {
+    const q = deferredSearch.trim().toLowerCase();
+    return physicalProducts.filter((p) => {
       const isZero = p.stockInBaseUnit <= 0;
       const isLow = p.stockInBaseUnit <= p.minStockAlert;
+      const pred = predictiveStockMap.get(p.id);
+
+      if (onlyShowCritical7Days && (!isPredictiveRestockActive || !pred?.isDepletingSoon7Days)) {
+        return false;
+      }
 
       if (statusFilter === 'OUT_OF_STOCK' && !isZero) return false;
       if (statusFilter === 'NEED_RESTOCK' && !isLow) return false;
       if (statusFilter === 'SAFE' && isLow) return false;
+      if (selectedCategory !== 'SEMUA' && p.category !== selectedCategory) return false;
+      if (!q) return true;
 
-      const matchCat = selectedCategory === 'SEMUA' || p.category === selectedCategory;
-      const matchSearch =
-        p.name.toLowerCase().includes(search.toLowerCase()) ||
-        p.barcode.toLowerCase().includes(search.toLowerCase()) ||
-        p.baseUnit.toLowerCase().includes(search.toLowerCase());
-
-      return matchCat && matchSearch;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.barcode.toLowerCase().includes(q) ||
+        p.baseUnit.toLowerCase().includes(q)
+      );
     });
-  }, [products, statusFilter, selectedCategory, search]);
+  }, [physicalProducts, statusFilter, selectedCategory, deferredSearch, onlyShowCritical7Days, isPredictiveRestockActive, predictiveStockMap]);
+
+  const monitoringTotalPages = Math.max(1, Math.ceil(filteredProducts.length / STOCK_PAGE_SIZE));
+  const safeMonitoringPage = Math.min(monitoringPage, monitoringTotalPages);
+
+  useEffect(() => {
+    setMonitoringPage(1);
+  }, [deferredSearch, statusFilter, selectedCategory, onlyShowCritical7Days, isPredictiveRestockActive]);
+
+  const paginatedMonitoringProducts = useMemo(() => {
+    const start = (safeMonitoringPage - 1) * STOCK_PAGE_SIZE;
+    return filteredProducts.slice(start, start + STOCK_PAGE_SIZE);
+  }, [filteredProducts, safeMonitoringPage]);
 
   // =========================================================================
   // DEMAND FORECASTING ANALYTICS (Velocity & Runout Days Estimation)
@@ -182,7 +455,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       }
     });
 
-    const items = products.map((prod) => {
+    const items = physicalProducts.map((prod) => {
       const sales = salesVelocityMap.get(prod.id) || { totalBaseSold: 0, txCount: 0 };
       const dailyVelocity = sales.totalBaseSold > 0 ? sales.totalBaseSold / 30 : 0;
       const currentStock = prod.stockInBaseUnit;
@@ -197,9 +470,9 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         daysUntilStockOut = currentStock <= 0 ? 0 : Math.round((currentStock / dailyVelocity) * 10) / 10;
       }
 
-      // Proactive reorder quantity (14 days buffer + min threshold deficit)
-      const bufferDays = 14;
-      const targetBufferStock = Math.ceil(dailyVelocity * bufferDays + minAlert);
+      // Proactive reorder quantity based on Supplier Lead Time + Safety Stock buffer
+      const totalBufferDays = (leadTimeDays || 7) + (safetyStockDays || 14);
+      const targetBufferStock = Math.ceil(dailyVelocity * totalBufferDays + minAlert);
       const recommendedReorderQty = Math.max(0, targetBufferStock - currentStock);
 
       let urgency: 'CRITICAL_ZERO' | 'CRITICAL_MIN' | 'DUE_SOON_3D' | 'WARNING_7D' | 'SAFE';
@@ -242,9 +515,10 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       }
       return a.daysUntilMinThreshold - b.daysUntilMinThreshold;
     });
-  }, [products, transactions]);
+  }, [physicalProducts, transactions, leadTimeDays, safetyStockDays]);
 
   const filteredForecastingList = useMemo(() => {
+    const q = deferredForecastingSearch.trim().toLowerCase();
     return demandForecastingList.filter((item) => {
       if (forecastingUrgency === 'CRITICAL' && item.urgency !== 'CRITICAL_ZERO' && item.urgency !== 'CRITICAL_MIN') {
         return false;
@@ -255,15 +529,273 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       if (forecastingUrgency === 'SAFE' && item.urgency !== 'SAFE') {
         return false;
       }
+      if (!q) return true;
 
-      const matchSearch =
-        item.product.name.toLowerCase().includes(forecastingSearch.toLowerCase()) ||
-        item.product.barcode.toLowerCase().includes(forecastingSearch.toLowerCase()) ||
-        item.product.category.toLowerCase().includes(forecastingSearch.toLowerCase());
-
-      return matchSearch;
+      return (
+        item.product.name.toLowerCase().includes(q) ||
+        item.product.barcode.toLowerCase().includes(q) ||
+        item.product.category.toLowerCase().includes(q)
+      );
     });
-  }, [demandForecastingList, forecastingUrgency, forecastingSearch]);
+  }, [demandForecastingList, forecastingUrgency, deferredForecastingSearch]);
+
+  // =========================================================================
+  // VERIFY STOCK UTILITY (Negative Batches, Negative Stock, Total vs Batch Mismatch)
+  // =========================================================================
+  const stockVerification = useMemo(() => {
+    const results = physicalProducts.map((p) => {
+      const batches = p.batches || [];
+      const negativeBatches = batches.filter((b) => (b.remainingQuantity || 0) < 0);
+      const hasNegativeTotal = p.stockInBaseUnit < 0;
+      const hasBatches = batches.length > 0;
+      const batchSum = batches.reduce((acc, b) => acc + (b.remainingQuantity || 0), 0);
+      const discrepancy = hasBatches ? p.stockInBaseUnit - batchSum : 0;
+      const hasBatchMismatch = hasBatches && Math.abs(discrepancy) > 0.0001;
+      const hasIssue = negativeBatches.length > 0 || hasNegativeTotal || hasBatchMismatch;
+
+      return {
+        product: p,
+        hasBatches,
+        batchCount: batches.length,
+        batchSum,
+        negativeBatches,
+        hasNegativeTotal,
+        hasBatchMismatch,
+        discrepancy,
+        hasIssue,
+      };
+    });
+
+    const resultMap = new Map(results.map((r) => [r.product.id, r]));
+    const issueItems = results.filter((r) => r.hasIssue);
+    const negativeBatchCount = results.filter((r) => r.negativeBatches.length > 0 || r.hasNegativeTotal).length;
+    const mismatchCount = results.filter((r) => r.hasBatchMismatch).length;
+
+    return {
+      results,
+      resultMap,
+      issueItems,
+      negativeBatchCount,
+      mismatchCount,
+    };
+  }, [physicalProducts]);
+
+  // =========================================================================
+  // OPTIMAL REORDER QUANTITY REPORT (Historical Transaction Demand + Variability)
+  // =========================================================================
+  const optimalReorderList = useMemo(() => {
+    const now = Date.now();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const cutoff = now - reorderLookbackDays * oneDayMs;
+
+    // Aggregate daily demand map per product over lookback period
+    const productDailySalesMap = new Map<string, Map<string, number>>();
+    const productTxCountMap = new Map<string, number>();
+
+    transactions.forEach((tx) => {
+      if (tx.timestamp < cutoff) return;
+      if ((tx as { isVoid?: boolean }).isVoid) return;
+      const dayKey = new Date(tx.timestamp).toISOString().slice(0, 10);
+      const seenInTx = new Set<string>();
+
+      tx.items.forEach((item) => {
+        if (!item.productId || item.isService) return;
+        const matchedProd = physicalProductMap.get(item.productId);
+        if (!matchedProd) return;
+        const unitObj = matchedProd.units.find((u) => u.unitName === item.unitName);
+        const factor = item.conversionFactor || unitObj?.conversionFactor || 1;
+        const baseSold = item.quantity * factor;
+
+        if (!productDailySalesMap.has(item.productId)) {
+          productDailySalesMap.set(item.productId, new Map());
+        }
+        const dayMap = productDailySalesMap.get(item.productId)!;
+        dayMap.set(dayKey, (dayMap.get(dayKey) || 0) + baseSold);
+
+        if (!seenInTx.has(item.productId)) {
+          seenInTx.add(item.productId);
+          productTxCountMap.set(item.productId, (productTxCountMap.get(item.productId) || 0) + 1);
+        }
+      });
+    });
+
+    const rows = physicalProducts.map((prod) => {
+      const dayMap = productDailySalesMap.get(prod.id);
+      let historicalSold = 0;
+      const activeDays = dayMap ? dayMap.size : 0;
+      if (dayMap) {
+        dayMap.forEach((v) => {
+          historicalSold += v;
+        });
+      }
+
+      const avgDailyDemand = historicalSold / reorderLookbackDays;
+      // Compute daily variance across all lookbackDays
+      let sumSqDiff = 0;
+      if (dayMap && historicalSold > 0) {
+        dayMap.forEach((v) => {
+          sumSqDiff += Math.pow(v - avgDailyDemand, 2);
+        });
+        const zeroDays = Math.max(0, reorderLookbackDays - activeDays);
+        sumSqDiff += zeroDays * Math.pow(0 - avgDailyDemand, 2);
+      }
+      const dailyStdDev = historicalSold > 0 ? Math.sqrt(sumSqDiff / reorderLookbackDays) : 0;
+
+      const lt = Math.max(1, reorderLeadTimeDays || 7);
+      const cyc = Math.max(1, reorderCycleDays || 14);
+      const saf = Math.max(0, reorderSafetyDays || 5);
+
+      const calculatedRop =
+        avgDailyDemand > 0
+          ? Math.ceil(avgDailyDemand * lt + avgDailyDemand * saf + 1.65 * dailyStdDev * Math.sqrt(lt))
+          : prod.minStockAlert;
+      const reorderPoint = Math.max(prod.minStockAlert, calculatedRop);
+
+      const targetMaxStock =
+        avgDailyDemand > 0
+          ? Math.max(reorderPoint + Math.ceil(avgDailyDemand * cyc), prod.minStockAlert * 2)
+          : prod.minStockAlert * 2;
+
+      const needsReorder =
+        prod.stockInBaseUnit <= reorderPoint ||
+        (avgDailyDemand > 0 && prod.stockInBaseUnit < reorderPoint);
+
+      const optimalReorderQty =
+        prod.stockInBaseUnit < targetMaxStock && (needsReorder || prod.stockInBaseUnit <= prod.minStockAlert)
+          ? Math.max(0, Math.ceil(targetMaxStock - prod.stockInBaseUnit))
+          : 0;
+
+      const daysOfCover =
+        avgDailyDemand > 0
+          ? Math.round((prod.stockInBaseUnit / avgDailyDemand) * 10) / 10
+          : prod.stockInBaseUnit > 0
+          ? 999
+          : 0;
+
+      // Multi-unit pack conversion display (e.g., "2 Dus + 5 PCS")
+      let packSuggestion = `${formatNumber(optimalReorderQty)} ${prod.baseUnit}`;
+      if (optimalReorderQty > 0 && prod.units.length > 1) {
+        const largestUnit = [...prod.units]
+          .filter((u) => (u.conversionFactor || 1) > 1)
+          .sort((a, b) => (b.conversionFactor || 1) - (a.conversionFactor || 1))[0];
+        if (largestUnit && optimalReorderQty >= largestUnit.conversionFactor) {
+          const packs = Math.floor(optimalReorderQty / largestUnit.conversionFactor);
+          const rem = optimalReorderQty % largestUnit.conversionFactor;
+          packSuggestion =
+            rem > 0
+              ? `${formatNumber(packs)} ${largestUnit.unitName} + ${formatNumber(rem)} ${prod.baseUnit}`
+              : `${formatNumber(packs)} ${largestUnit.unitName}`;
+        }
+      }
+
+      const supplier = prod.supplierId ? supplierMap.get(prod.supplierId) || null : null;
+      const estimatedOrderCost = optimalReorderQty * (prod.costPrice || 0);
+
+      return {
+        product: prod,
+        supplier,
+        historicalSold,
+        txFrequency: productTxCountMap.get(prod.id) || 0,
+        activeDays,
+        avgDailyDemand: Math.round(avgDailyDemand * 100) / 100,
+        dailyStdDev: Math.round(dailyStdDev * 100) / 100,
+        reorderPoint,
+        targetMaxStock,
+        optimalReorderQty,
+        packSuggestion,
+        estimatedOrderCost,
+        daysOfCover,
+        needsReorder: optimalReorderQty > 0,
+      };
+    });
+
+    return rows.sort((a, b) => {
+      if (a.needsReorder !== b.needsReorder) return a.needsReorder ? -1 : 1;
+      if (b.optimalReorderQty !== a.optimalReorderQty) return b.optimalReorderQty - a.optimalReorderQty;
+      return b.historicalSold - a.historicalSold;
+    });
+  }, [
+    physicalProducts,
+    physicalProductMap,
+    transactions,
+    supplierMap,
+    reorderLookbackDays,
+    reorderLeadTimeDays,
+    reorderCycleDays,
+    reorderSafetyDays,
+  ]);
+
+  const filteredOptimalReorderList = useMemo(() => {
+    const q = deferredReorderSearch.trim().toLowerCase();
+    return optimalReorderList.filter((row) => {
+      if (reorderFilterMode === 'NEED_REORDER' && !row.needsReorder) return false;
+      if (reorderFilterMode === 'WITH_HISTORY' && row.historicalSold <= 0) return false;
+      if (reorderSupplierFilter !== 'ALL' && (row.product.supplierId || 'NONE') !== reorderSupplierFilter) {
+        return false;
+      }
+      if (q) {
+        const matchName = row.product.name.toLowerCase().includes(q);
+        const matchSku = (row.product.sku || row.product.barcode).toLowerCase().includes(q);
+        const matchCat = row.product.category.toLowerCase().includes(q);
+        if (!matchName && !matchSku && !matchCat) return false;
+      }
+      return true;
+    });
+  }, [optimalReorderList, reorderFilterMode, reorderSupplierFilter, deferredReorderSearch]);
+
+  const reorderTotalPages = Math.max(1, Math.ceil(filteredOptimalReorderList.length / STOCK_PAGE_SIZE));
+  const safeReorderPage = Math.min(reorderPage, reorderTotalPages);
+
+  useEffect(() => {
+    setReorderPage(1);
+  }, [deferredReorderSearch, reorderFilterMode, reorderSupplierFilter, reorderLookbackDays]);
+
+  const paginatedReorderList = useMemo(() => {
+    const start = (safeReorderPage - 1) * STOCK_PAGE_SIZE;
+    return filteredOptimalReorderList.slice(start, start + STOCK_PAGE_SIZE);
+  }, [filteredOptimalReorderList, safeReorderPage]);
+
+  const handleExportOptimalReorderCsv = () => {
+    sound.playTap();
+    const headers = [
+      'SKU/Barcode',
+      'Nama Produk',
+      'Kategori',
+      'Supplier',
+      'Stok Saat Ini',
+      'Satuan',
+      `Terjual (${reorderLookbackDays}h)`,
+      'Rata-rata / Hari',
+      'Reorder Point (ROP)',
+      'Target Stok Maks',
+      'Optimal Reorder Qty',
+      'Konversi Kemasan',
+      'Estimasi Modal PO (Rp)',
+    ];
+    const rows = filteredOptimalReorderList.map((r) => [
+      `"${r.product.sku || r.product.barcode}"`,
+      `"${r.product.name.replace(/"/g, '""')}"`,
+      `"${r.product.category}"`,
+      `"${r.supplier?.name || 'Umum'}"`,
+      r.product.stockInBaseUnit,
+      r.product.baseUnit,
+      r.historicalSold,
+      r.avgDailyDemand,
+      r.reorderPoint,
+      r.targetMaxStock,
+      r.optimalReorderQty,
+      `"${r.packSuggestion}"`,
+      r.estimatedOrderCost,
+    ]);
+    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `optimal-reorder-report-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   // Export Stock Report to PDF using jsPDF
   // Export Stock Report to PDF using jsPDF
@@ -367,6 +899,66 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
 
       const filename = `laporan-demand-forecasting-${new Date().toISOString().slice(0, 10)}.pdf`;
       doc.save(filename);
+    } else if (activeSubTab === 'REORDER_REPORT') {
+      doc.setFontSize(16);
+      doc.setTextColor(14, 116, 144);
+      doc.text(`LAPORAN OPTIMAL REORDER QUANTITY (HISTORIS ${reorderLookbackDays} HARI) - ${storeTitle.toUpperCase()}`, 14, 15);
+
+      doc.setFontSize(8.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text(
+        `Waktu Cetak: ${dateStr} | Lead Time: ${reorderLeadTimeDays}h | Siklus Order: ${reorderCycleDays}h | Buffer Aman: ${reorderSafetyDays}h`,
+        14,
+        21
+      );
+
+      const needCount = filteredOptimalReorderList.filter((r) => r.needsReorder).length;
+      const totalModalPo = filteredOptimalReorderList.reduce((acc, r) => acc + r.estimatedOrderCost, 0);
+      doc.text(
+        `SKU Perlu Reorder: ${needCount} Item | Estimasi Total Anggaran Order Supplier: ${formatRupiah(totalModalPo)}`,
+        14,
+        26
+      );
+
+      const tableData = filteredOptimalReorderList.map((r, idx) => [
+        (idx + 1).toString(),
+        r.product.sku || r.product.barcode,
+        r.product.name,
+        r.supplier?.name || 'Umum',
+        `${formatNumber(r.product.stockInBaseUnit)} ${r.product.baseUnit}`,
+        `${formatNumber(r.historicalSold)} ${r.product.baseUnit}`,
+        `${r.avgDailyDemand}/hr`,
+        `${formatNumber(r.reorderPoint)} ${r.product.baseUnit}`,
+        `${formatNumber(r.optimalReorderQty)} ${r.product.baseUnit}`,
+        r.packSuggestion,
+        formatRupiah(r.estimatedOrderCost),
+      ]);
+
+      autoTable(doc, {
+        startY: 31,
+        head: [
+          [
+            'No',
+            'SKU',
+            'Nama Produk',
+            'Supplier',
+            'Stok Kini',
+            `Terjual (${reorderLookbackDays}h)`,
+            'Laju/Hari',
+            'ROP',
+            'Optimal Order',
+            'Saran Pack',
+            'Est. Biaya PO',
+          ],
+        ],
+        body: tableData,
+        theme: 'grid',
+        headStyles: { fillColor: [14, 116, 144], textColor: 255, fontSize: 8, fontStyle: 'bold' },
+        styles: { fontSize: 7.5, cellPadding: 2 },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+      });
+
+      doc.save(`laporan-optimal-reorder-${new Date().toISOString().slice(0, 10)}.pdf`);
     } else {
       // 2. Export Standard Stock Inventory & Valuation Report
       doc.setFontSize(16);
@@ -490,7 +1082,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
 
   // Opname session computations
   const opnameEntries = useMemo(() => {
-    return products.map((product) => {
+    return physicalProducts.map((product) => {
       const entry = physicalCounts[product.id];
       const hasCount = entry && entry.physicalCount !== '';
       const physicalVal = hasCount ? Number(entry.physicalCount) : product.stockInBaseUnit;
@@ -509,7 +1101,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         notes: entry?.notes || '',
       };
     });
-  }, [products, physicalCounts]);
+  }, [physicalProducts, physicalCounts]);
 
   // Filtered opname rows
   const filteredOpnameRows = useMemo(() => {
@@ -793,6 +1385,21 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             <button
               onClick={() => {
                 sound.playTap();
+                setActiveSubTab('STOCK_HEATMAP');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                activeSubTab === 'STOCK_HEATMAP'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Flame className={`w-3.5 h-3.5 ${activeSubTab === 'STOCK_HEATMAP' ? 'text-amber-300' : 'text-emerald-600'}`} />
+              <span>Heatmap Stok</span>
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playTap();
                 setActiveSubTab('OPNAME_SESSION');
               }}
               className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap ${
@@ -839,6 +1446,46 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             </button>
 
             <button
+              onClick={() => {
+                sound.playTap();
+                setActiveSubTab('REORDER_REPORT');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                activeSubTab === 'REORDER_REPORT'
+                  ? 'bg-cyan-700 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Calculator className="w-3.5 h-3.5 text-cyan-500" />
+              <span>Optimal Reorder Qty</span>
+              {optimalReorderList.filter((r) => r.needsReorder).length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full text-[9px] font-black bg-cyan-500 text-white">
+                  {optimalReorderList.filter((r) => r.needsReorder).length}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playTap();
+                setActiveSubTab('EXPIRY_TRACKER');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                activeSubTab === 'EXPIRY_TRACKER'
+                  ? 'bg-rose-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <CalendarDays className="w-3.5 h-3.5" />
+              <span>Pelacakan Kadaluarsa</span>
+              {expiryAnalytics.alertCount > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full text-[9px] font-black bg-rose-500 text-white">
+                  {expiryAnalytics.alertCount}
+                </span>
+              )}
+            </button>
+
+            <button
               onClick={handleExportStockPdf}
               className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-2xs ml-1 cursor-pointer"
               title="Unduh Arsip Laporan Stok Digital (.PDF)"
@@ -875,6 +1522,37 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setShowVerifyStockPanel((prev) => !prev);
+                    setVerifyFeedbackMsg(null);
+                  }}
+                  className={`px-3.5 py-2 rounded-xl font-bold text-xs flex items-center gap-1.5 transition-colors border shadow-2xs cursor-pointer ${
+                    stockVerification.issueItems.length > 0
+                      ? showVerifyStockPanel
+                        ? 'bg-rose-600 text-white border-rose-600'
+                        : 'bg-rose-50 hover:bg-rose-100 text-rose-800 border-rose-300 ring-1 ring-rose-400/40'
+                      : showVerifyStockPanel
+                      ? 'bg-emerald-600 text-white border-emerald-600'
+                      : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
+                  }`}
+                  title="Periksa stok batch negatif & kecocokan total stok produk vs jumlah batch"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>Verify Stock</span>
+                  {stockVerification.issueItems.length > 0 ? (
+                    <span className="px-1.5 py-0.2 rounded-full text-[10px] font-black bg-rose-600 text-white">
+                      {stockVerification.issueItems.length} Masalah
+                    </span>
+                  ) : (
+                    <span className="px-1.5 py-0.2 rounded-full text-[10px] font-black bg-emerald-600 text-white">
+                      OK
+                    </span>
+                  )}
+                </button>
+
                 <button
                   onClick={handleExportStockPdf}
                   className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center gap-1.5 transition-colors shadow-2xs cursor-pointer"
@@ -918,6 +1596,224 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Verify Stock Audit Panel */}
+            {showVerifyStockPanel && (
+              <div
+                className={`rounded-2xl border-2 p-4 space-y-3 animate-in fade-in duration-150 ${
+                  stockVerification.issueItems.length > 0
+                    ? 'bg-rose-50/90 border-rose-300'
+                    : 'bg-emerald-50/90 border-emerald-300'
+                }`}
+              >
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 pb-2 border-b border-black/10">
+                  <div className="flex items-start gap-2.5">
+                    <div
+                      className={`p-2 rounded-xl shrink-0 ${
+                        stockVerification.issueItems.length > 0
+                          ? 'bg-rose-600 text-white'
+                          : 'bg-emerald-600 text-white'
+                      }`}
+                    >
+                      <ShieldAlert className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-black text-slate-900">
+                        Hasil Verifikasi Integritas Stok &amp; Batch FIFO
+                      </h4>
+                      <p className="text-xs text-slate-600">
+                        Memeriksa {stockVerification.results.length} SKU fisik untuk stok batch negatif, total stok negatif, atau selisih antara total stok produk dan jumlah seluruh batch.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => setVerifyShowOnlyIssues((v) => !v)}
+                      className="px-3 py-1.5 rounded-xl bg-white border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                    >
+                      {verifyShowOnlyIssues
+                        ? `Tampilkan Semua (${stockVerification.results.length})`
+                        : `Hanya Bermasalah (${stockVerification.issueItems.length})`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowVerifyStockPanel(false)}
+                      className="p-1.5 rounded-xl bg-white border border-slate-200 text-slate-500 hover:text-slate-800 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Mini Verification Counters */}
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+                    <div className="text-[10px] font-bold text-slate-400 uppercase">Total SKU Diperiksa</div>
+                    <div className="text-base font-black font-mono text-slate-900">
+                      {formatNumber(stockVerification.results.length)} SKU
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-rose-200">
+                    <div className="text-[10px] font-bold text-rose-600 uppercase">Stok / Batch Negatif</div>
+                    <div className="text-base font-black font-mono text-rose-700">
+                      {formatNumber(stockVerification.negativeBatchCount)} SKU
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-rose-200">
+                    <div className="text-[10px] font-bold text-rose-600 uppercase">Mismatch Stok vs Batch</div>
+                    <div className="text-base font-black font-mono text-rose-700">
+                      {formatNumber(stockVerification.mismatchCount)} SKU
+                    </div>
+                  </div>
+                </div>
+
+                {verifyFeedbackMsg && (
+                  <div className="p-2.5 rounded-xl bg-emerald-100 border border-emerald-300 text-emerald-900 text-xs font-bold flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{verifyFeedbackMsg}</span>
+                  </div>
+                )}
+
+                {(() => {
+                  const rows = verifyShowOnlyIssues
+                    ? stockVerification.issueItems
+                    : stockVerification.results;
+                  if (rows.length === 0) {
+                    return (
+                      <div className="p-5 rounded-xl bg-white border border-emerald-200 text-center space-y-1">
+                        <CheckCircle2 className="w-8 h-8 text-emerald-600 mx-auto" />
+                        <p className="text-sm font-black text-emerald-900">Semua Stok Terverifikasi Bersih!</p>
+                        <p className="text-xs text-slate-500">
+                          Tidak ditemukan stok batch negatif ataupun ketidakcocokan antara total stok produk dan penjumlahan batch.
+                        </p>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto max-h-72 overflow-y-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-slate-100 text-slate-600 uppercase text-[10px] font-bold sticky top-0">
+                          <tr>
+                            <th className="py-2 px-3">Produk &amp; SKU</th>
+                            <th className="py-2 px-3">Stok Produk</th>
+                            <th className="py-2 px-3">Total Batch FIFO</th>
+                            <th className="py-2 px-3">Selisih / Detail Masalah</th>
+                            <th className="py-2 px-3 text-right">Tindakan Cepat</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {rows.map((r) => (
+                            <tr
+                              key={r.product.id}
+                              className={
+                                r.hasIssue
+                                  ? 'bg-rose-50/90 text-rose-950 font-medium'
+                                  : 'bg-white'
+                              }
+                            >
+                              <td className="py-2.5 px-3">
+                                <div className="font-bold text-slate-900">{r.product.name}</div>
+                                <div className="text-[10px] font-mono text-slate-500">
+                                  {r.product.sku || r.product.barcode} • {r.batchCount} Batch
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 font-mono font-bold">
+                                <span className={r.hasNegativeTotal ? 'text-rose-700 font-black' : ''}>
+                                  {formatNumber(r.product.stockInBaseUnit)} {r.product.baseUnit}
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-3 font-mono font-bold">
+                                {r.hasBatches ? (
+                                  <span>
+                                    {formatNumber(r.batchSum)} {r.product.baseUnit}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400 italic">Tanpa data batch</span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <div className="flex flex-wrap gap-1">
+                                  {r.hasNegativeTotal && (
+                                    <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-black">
+                                      Stok Negatif ({r.product.stockInBaseUnit})
+                                    </span>
+                                  )}
+                                  {r.negativeBatches.length > 0 && (
+                                    <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-black">
+                                      {r.negativeBatches.length} Batch Negatif (
+                                      {r.negativeBatches
+                                        .map((b) => `${b.batchNumber || 'Batch'}: ${b.remainingQuantity}`)
+                                        .join(', ')}
+                                      )
+                                    </span>
+                                  )}
+                                  {r.hasBatchMismatch && (
+                                    <span className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-800 border border-rose-300 text-[10px] font-black">
+                                      Mismatch {r.discrepancy > 0 ? `+${r.discrepancy}` : r.discrepancy}{' '}
+                                      {r.product.baseUnit}
+                                    </span>
+                                  )}
+                                  {!r.hasIssue && (
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                                      Cocok &amp; Valid
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  {r.hasBatchMismatch && r.batchSum >= 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        sound.playSuccessChime();
+                                        onUpdateStock(r.product.id, r.batchSum);
+                                        setVerifyFeedbackMsg(
+                                          `Stok "${r.product.name}" disinkronkan ke total batch (${formatNumber(r.batchSum)} ${r.product.baseUnit}).`
+                                        );
+                                      }}
+                                      className="px-2 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10.5px] font-bold cursor-pointer"
+                                    >
+                                      Samakan ke Batch ({formatNumber(r.batchSum)})
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      sound.playTap();
+                                      setAdjustingProduct(r.product);
+                                      setStockAdjustmentVal(Math.max(0, r.product.stockInBaseUnit).toString());
+                                      setAdjustmentType('SET');
+                                      setAdjustmentReason('Koreksi Audit Verify Stock');
+                                    }}
+                                    className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-[10.5px] font-bold cursor-pointer"
+                                  >
+                                    Sesuaikan
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Inventory Health Score Widget (Moved from Kasir POS to Stock Report) */}
+            <InventoryHealthWidget
+              products={products}
+              transactions={transactions || []}
+              onHighlightProduct={(id) => {
+                const prod = products.find((p) => p.id === id);
+                if (prod) setSearch(prod.name);
+              }}
+              onOpenThresholdSettings={onOpenThresholdSettings}
+            />
 
             {/* 4 KPI Summary Cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -982,6 +1878,120 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </div>
               </div>
             </div>
+
+            {/* Predictive Restock Control Bar (Linear Regression Forecasting) */}
+            <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 p-4 rounded-2xl text-white shadow-md border border-indigo-900/60 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="p-1.5 rounded-lg bg-indigo-500/30 text-indigo-300 border border-indigo-400/30">
+                    <Sparkles className="w-4 h-4 text-indigo-300" />
+                  </span>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <span>Fitur Predictive Restock (Regresi Linier 30 Hari)</span>
+                    <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-md bg-indigo-500/20 text-indigo-300 border border-indigo-400/30 font-bold">
+                      y = mx + b
+                    </span>
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
+                  Gunakan kalkulasi regresi linier sederhana berdasarkan data transaksi 30 hari terakhir untuk memprediksi kelangkaan stok mendatang dan menandai (highlight) barang yang akan habis dalam waktu 7 hari.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-3 shrink-0 flex-wrap">
+                {isPredictiveRestockActive && critical7DaysProducts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setOnlyShowCritical7Days(!onlyShowCritical7Days);
+                    }}
+                    className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                      onlyShowCritical7Days
+                        ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30 ring-2 ring-white/30'
+                        : 'bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-700/60'
+                    }`}
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5 text-rose-300 shrink-0" />
+                    <span>Habis &lt; 7 Hari ({critical7DaysProducts.length})</span>
+                  </button>
+                )}
+
+                {/* Explicit Predictive Restock Toggle */}
+                <label 
+                  className="flex items-center gap-3 cursor-pointer bg-slate-800/90 hover:bg-slate-800 px-3.5 py-2 rounded-xl border border-indigo-500/40 select-none shadow-inner transition-all"
+                  title="Toggle fitur Predictive Restock (Regresi Linier 30 Hari)"
+                >
+                  <div className="flex flex-col text-right">
+                    <span className="text-xs font-black text-white flex items-center justify-end gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                      Predictive Restock
+                    </span>
+                    <span className="text-[10px] font-medium text-slate-300">
+                      {isPredictiveRestockActive ? 'Regresi Linier Aktif' : 'Model Prediksi Nonaktif'}
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={isPredictiveRestockActive}
+                    onChange={(e) => {
+                      sound.playTap();
+                      setIsPredictiveRestockActive(e.target.checked);
+                      if (!e.target.checked) setOnlyShowCritical7Days(false);
+                    }}
+                    className="sr-only peer"
+                    aria-label="Predictive Restock"
+                  />
+                  <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500 relative shadow-inner"></div>
+                  <span className={`text-xs font-mono font-black ${isPredictiveRestockActive ? 'text-emerald-400' : 'text-slate-400'}`}>
+                    {isPredictiveRestockActive ? 'ON' : 'OFF'}
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {/* Critical Shortage Warning Banner (< 7 Days) */}
+            {isPredictiveRestockActive && critical7DaysProducts.length > 0 && (
+              <div className="p-3.5 bg-gradient-to-r from-rose-500/10 via-amber-500/10 to-orange-500/10 border-2 border-rose-400/40 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs animate-in fade-in">
+                <div className="flex items-start gap-2.5">
+                  <div className="p-1.5 bg-rose-500 text-white rounded-xl shrink-0 mt-0.5">
+                    <AlertCircle className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-black text-rose-950 uppercase tracking-wide flex items-center gap-2">
+                      <span>Peringatan Dini: {critical7DaysProducts.length} Produk Diprediksi Habis Dalam 7 Hari</span>
+                    </h4>
+                    <p className="text-[11.5px] text-slate-700 mt-0.5">
+                      Berdasarkan akselerasi transaksi kasir 30 hari terakhir, barang ini akan kosong sebelum tanggal jatuh tempo berikutnya jika tidak segera dilakukan pemesanan ulang (Purchase Order).
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setOnlyShowCritical7Days(true);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-white text-rose-700 hover:bg-rose-50 border border-rose-300 text-xs font-bold transition-all shadow-2xs cursor-pointer"
+                  >
+                    Filter Tabel Kritis
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      onNavigateToSuppliers();
+                    }}
+                    className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+                  >
+                    <Truck className="w-3.5 h-3.5" />
+                    <span>Buat Draft PO Kritis</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Filter and Quick Tabs */}
             <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs flex flex-col md:flex-row gap-3 items-center justify-between">
@@ -1056,39 +2066,90 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                       <th className="py-3 px-4">Stok Satuan Dasar</th>
                       <th className="py-3 px-4">Ambang Batas Minimum</th>
                       <th className="py-3 px-4">Rasio & Status</th>
+                      {isPredictiveRestockActive && (
+                        <>
+                          <th className="py-3 px-4">Laju & Tren Regresi (30 Hari)</th>
+                          <th className="py-3 px-4">Prediksi Habis Stok</th>
+                        </>
+                      )}
                       <th className="py-3 px-4">Nilai Aset Stok</th>
-                      <th className="py-3 px-4">Saran Restock</th>
+                      <th className="py-3 px-4">{isPredictiveRestockActive ? 'Rekomendasi Restock' : 'Saran Restock'}</th>
                       <th className="py-3 px-4 text-right">Aksi Manajer</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {filteredProducts.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-8 text-center text-slate-400">
+                        <td colSpan={isPredictiveRestockActive ? 10 : 8} className="py-8 text-center text-slate-400">
                           Tidak ada barang pada kategori atau status filter ini.
                         </td>
                       </tr>
                     ) : (
-                      filteredProducts.map((p) => {
+                      paginatedMonitoringProducts.map((p) => {
                         const isZero = p.stockInBaseUnit <= 0;
                         const isLow = p.stockInBaseUnit <= p.minStockAlert;
                         const ratio = p.minStockAlert > 0 ? (p.stockInBaseUnit / p.minStockAlert) * 100 : 100;
                         const assetValue = p.stockInBaseUnit * p.costPrice;
-                        const recommendedRestock = Math.max(0, p.minStockAlert * 2 - p.stockInBaseUnit);
+                        const pred = predictiveStockMap.get(p.id);
+                        const verifyInfo = stockVerification.resultMap.get(p.id);
+                        const hasVerifyIssue = Boolean(verifyInfo?.hasIssue);
+                        const isDepletingCritical = isPredictiveRestockActive && Boolean(pred?.isDepletingSoon7Days);
+                        const recommendedRestock = isPredictiveRestockActive && pred && pred.recommendedRestockUnits > 0
+                          ? pred.recommendedRestockUnits
+                          : Math.max(0, p.minStockAlert * 2 - p.stockInBaseUnit);
 
                         return (
                           <tr 
                             key={p.id} 
                             className={`hover:bg-slate-50/80 transition-colors ${
-                              isZero ? 'bg-rose-50/30' : isLow ? 'bg-amber-50/20' : ''
+                              hasVerifyIssue
+                                ? 'bg-rose-100/90 border-l-4 border-l-rose-600 ring-1 ring-rose-300'
+                                : isDepletingCritical
+                                ? 'bg-rose-50/80 border-l-4 border-l-rose-600 ring-1 ring-rose-200/90 shadow-2xs'
+                                : isZero
+                                ? 'bg-rose-50/30'
+                                : isLow
+                                ? 'bg-amber-50/20'
+                                : ''
                             }`}
                           >
                             <td className="py-3.5 px-4">
-                              <div className="font-bold text-slate-900">{p.name}</div>
+                              <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                                <span>{p.name}</span>
+                                {verifyInfo?.hasNegativeTotal && (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-black uppercase bg-rose-700 text-white">
+                                    Stok Negatif
+                                  </span>
+                                )}
+                                {verifyInfo && verifyInfo.negativeBatches.length > 0 && (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-black uppercase bg-rose-700 text-white">
+                                    Batch Negatif ({verifyInfo.negativeBatches.length})
+                                  </span>
+                                )}
+                                {verifyInfo?.hasBatchMismatch && (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-black uppercase bg-rose-600 text-white">
+                                    Mismatch Batch ({verifyInfo.discrepancy > 0 ? `+${verifyInfo.discrepancy}` : verifyInfo.discrepancy})
+                                  </span>
+                                )}
+                                {isDepletingCritical && (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-black uppercase bg-rose-600 text-white shadow-2xs flex items-center gap-1">
+                                    <AlertTriangle className="w-3 h-3 text-white shrink-0" />
+                                    <span>Habis &lt; 7 Hari</span>
+                                  </span>
+                                )}
+                              </div>
                               <div className="text-[11px] text-slate-400 font-mono flex items-center gap-1 mt-0.5">
-                                <span>SKU: {p.barcode}</span>
+                                <span>SKU: {p.sku || p.barcode}</span>
                                 <span>·</span>
                                 <span className="text-sky-600 font-medium">{p.units.length} Satuan</span>
+                                {verifyInfo?.hasBatches && (
+                                  <>
+                                    <span>·</span>
+                                    <span className={verifyInfo.hasIssue ? 'text-rose-700 font-bold' : 'text-slate-500'}>
+                                      Batch Sum: {formatNumber(verifyInfo.batchSum)}
+                                    </span>
+                                  </>
+                                )}
                               </div>
                             </td>
 
@@ -1123,14 +2184,14 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                               <span className="text-xs text-slate-400 ml-1">{p.baseUnit}</span>
                             </td>
 
-                            <td className="py-3.5 px-4 w-44">
+                            <td className="py-3.5 px-4 w-36">
                               <div className="space-y-1">
                                 <div className="flex items-center justify-between text-[10px] font-bold">
                                   {isZero ? (
                                     <span className="text-rose-600 uppercase">Habis Total</span>
                                   ) : isLow ? (
                                     <span className="text-amber-700 uppercase flex items-center gap-1">
-                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
                                       <span>Menipis</span>
                                     </span>
                                   ) : (
@@ -1150,17 +2211,80 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                               </div>
                             </td>
 
+                            {/* Predictive Restock Columns */}
+                            {isPredictiveRestockActive && (
+                              <>
+                                <td className="py-3.5 px-4 font-mono text-xs">
+                                  <div className="font-bold text-slate-800">
+                                    {pred?.dailyVelocity || 0} <span className="text-[10px] text-slate-400 font-normal">{p.baseUnit}/hari</span>
+                                  </div>
+                                  <div className="mt-0.5">
+                                    {pred?.trendDirection === 'RISING' ? (
+                                      <span className="inline-flex items-center gap-0.5 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200">
+                                        <TrendingUp className="w-3 h-3 text-emerald-600" />
+                                        <span>+{pred.trendPercent}% (Naik)</span>
+                                      </span>
+                                    ) : pred?.trendDirection === 'DECLINING' ? (
+                                      <span className="inline-flex items-center gap-0.5 text-[10px] font-bold text-rose-700 bg-rose-50 px-1.5 py-0.2 rounded border border-rose-200">
+                                        <TrendingDown className="w-3 h-3 text-rose-600" />
+                                        <span>{pred.trendPercent}% (Turun)</span>
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded font-medium">
+                                        Stabil (→)
+                                      </span>
+                                    )}
+                                  </div>
+                                </td>
+
+                                <td className="py-3.5 px-4">
+                                  {isDepletingCritical ? (
+                                    <div className="space-y-0.5">
+                                      <span className="px-2 py-0.5 rounded-md bg-rose-600 text-white font-black text-[10.5px] font-mono shadow-2xs flex items-center gap-1 w-fit">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{(pred?.daysUntilDepletion ?? 0) <= 0 ? 'Habis Hari Ini' : `Habis ~${pred?.daysUntilDepletion} hari`}</span>
+                                      </span>
+                                      <div className="text-[10px] text-rose-800 font-mono font-bold">
+                                        Est: {pred?.depletionDateStr}
+                                      </div>
+                                    </div>
+                                  ) : pred && pred.daysUntilDepletion <= 14 ? (
+                                    <div className="space-y-0.5">
+                                      <span className="px-2 py-0.5 rounded-md bg-amber-500 text-slate-950 font-bold text-[10.5px] font-mono w-fit flex items-center gap-1">
+                                        <Clock className="w-3 h-3 text-slate-900" />
+                                        <span>~{pred.daysUntilDepletion} hari</span>
+                                      </span>
+                                      <div className="text-[10px] text-amber-800 font-mono">
+                                        Est: {pred.depletionDateStr}
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <div className="font-mono text-xs font-semibold text-slate-600">
+                                      {pred && pred.daysUntilDepletion > 90 ? '> 90 Hari (Aman)' : `~${pred?.daysUntilDepletion || 99} Hari`}
+                                    </div>
+                                  )}
+                                </td>
+                              </>
+                            )}
+
                             <td className="py-3.5 px-4 font-mono font-bold text-slate-900 tabular-nums">
                               {formatRupiah(assetValue)}
                             </td>
 
                             <td className="py-3.5 px-4">
-                              {isLow ? (
-                                <span className="font-mono font-bold text-amber-700 text-xs">
-                                  +{recommendedRestock > 0 ? recommendedRestock : p.minStockAlert} {p.baseUnit}
-                                </span>
+                              {recommendedRestock > 0 ? (
+                                <div>
+                                  <span className="font-mono font-bold text-sky-700 text-xs">
+                                    +{recommendedRestock} {p.baseUnit}
+                                  </span>
+                                  {isPredictiveRestockActive && (
+                                    <span className="text-[9.5px] text-indigo-600 font-semibold block">
+                                      Lead Time + 14h Buffer
+                                    </span>
+                                  )}
+                                </div>
                               ) : (
-                                <span className="text-slate-400 text-xs">-</span>
+                                <span className="text-slate-400 text-xs">Cukup</span>
                               )}
                             </td>
 
@@ -1201,6 +2325,45 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   </tbody>
                 </table>
               </div>
+
+              {filteredProducts.length > STOCK_PAGE_SIZE && (
+                <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600">
+                  <span>
+                    Menampilkan{' '}
+                    <strong className="text-slate-900">
+                      {(safeMonitoringPage - 1) * STOCK_PAGE_SIZE + 1}–{Math.min(safeMonitoringPage * STOCK_PAGE_SIZE, filteredProducts.length)}
+                    </strong>{' '}
+                    dari <strong className="text-slate-900">{filteredProducts.length}</strong> produk
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={safeMonitoringPage <= 1}
+                      onClick={() => {
+                        sound.playTap();
+                        setMonitoringPage((p) => Math.max(1, p - 1));
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                    >
+                      Sebelumnya
+                    </button>
+                    <span className="px-2.5 font-mono font-bold text-slate-800">
+                      Hal {safeMonitoringPage} / {monitoringTotalPages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={safeMonitoringPage >= monitoringTotalPages}
+                      onClick={() => {
+                        sound.playTap();
+                        setMonitoringPage((p) => Math.min(monitoringTotalPages, p + 1));
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                    >
+                      Berikutnya
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1554,23 +2717,36 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                                   <Minus className="w-3.5 h-3.5" />
                                 </button>
 
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="1"
-                                  value={physicalCounts[product.id]?.physicalCount !== undefined ? physicalCounts[product.id].physicalCount : ''}
-                                  onChange={(e) => handlePhysicalCountChange(product.id, e.target.value)}
-                                  placeholder={String(product.stockInBaseUnit)}
-                                  className={`w-20 text-center py-1.5 px-2 rounded-lg font-mono font-black text-sm border focus:outline-none ${
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    sound.playTap();
+                                    const currentVal = physicalCounts[product.id]?.physicalCount !== '' && physicalCounts[product.id]?.physicalCount !== undefined
+                                      ? Number(physicalCounts[product.id].physicalCount)
+                                      : product.stockInBaseUnit;
+                                    setActiveKeypad({
+                                      title: 'Hitung Fisik (Stock Opname)',
+                                      subtitle: `${product.name} (${product.barcode})`,
+                                      initialValue: currentVal,
+                                      unitName: product.baseUnit,
+                                      onConfirm: (val) => handlePhysicalCountChange(product.id, String(val)),
+                                    });
+                                  }}
+                                  className={`w-20 text-center py-1.5 px-2 rounded-lg font-mono font-black text-sm border focus:outline-none cursor-pointer transition-all active:scale-95 ${
                                     hasCount
                                       ? isDiscrepant
                                         ? difference < 0
-                                          ? 'border-rose-400 bg-rose-50/60 text-rose-800 focus:border-rose-600'
-                                          : 'border-emerald-400 bg-emerald-50/60 text-emerald-800 focus:border-emerald-600'
-                                        : 'border-slate-300 bg-white text-slate-900 focus:border-sky-500'
-                                      : 'border-dashed border-slate-300 bg-white/70 text-slate-400'
+                                          ? 'border-rose-400 bg-rose-50/80 text-rose-800'
+                                          : 'border-emerald-400 bg-emerald-50/80 text-emerald-800'
+                                        : 'border-slate-300 bg-white text-slate-900'
+                                      : 'border-dashed border-slate-300 bg-white text-slate-400'
                                   }`}
-                                />
+                                  title="Sentuh untuk Input via Numpad Layar Sentuh Tablet"
+                                >
+                                  {physicalCounts[product.id]?.physicalCount !== undefined && physicalCounts[product.id]?.physicalCount !== ''
+                                    ? physicalCounts[product.id].physicalCount
+                                    : <span className="text-slate-400 font-normal">{product.stockInBaseUnit}</span>}
+                                </button>
 
                                 <button
                                   type="button"
@@ -1908,19 +3084,74 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               </div>
             </div>
 
+            {/* Supplier Lead Time & Safety Stock Automated Restock Parameters */}
+            <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-2xs flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-3.5 flex-wrap">
+                <span className="font-bold text-slate-800 flex items-center gap-1.5">
+                  <Sliders className="w-4 h-4 text-indigo-600" />
+                  <span>Parameter Otomasi Restock Supplier:</span>
+                </span>
+
+                <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
+                  <span className="text-slate-600 font-semibold">Lead Time Supplier:</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="60"
+                    value={leadTimeDays}
+                    onChange={(e) => setLeadTimeDays(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-12 p-1 bg-white border border-slate-300 rounded text-center font-bold font-mono focus:outline-none"
+                  />
+                  <span className="text-slate-400">Hari</span>
+                </div>
+
+                <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
+                  <span className="text-slate-600 font-semibold">Target Stok Pengaman:</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="90"
+                    value={safetyStockDays}
+                    onChange={(e) => setSafetyStockDays(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-12 p-1 bg-white border border-slate-300 rounded text-center font-bold font-mono focus:outline-none"
+                  />
+                  <span className="text-slate-400">Hari</span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <div className="text-[11px] text-indigo-900 bg-indigo-50 px-3 py-1.5 rounded-xl border border-indigo-200 font-medium">
+                  Total Buffer: <strong>{leadTimeDays + safetyStockDays} Hari</strong> penjualan harian
+                </div>
+              </div>
+            </div>
+
             {/* Forecasting Table */}
             <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
-              <div className="p-4 bg-slate-900 text-white flex items-center justify-between">
+              <div className="p-4 bg-slate-900 text-white flex flex-col md:flex-row md:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-bold flex items-center gap-2">
                     <TrendingUp className="w-4 h-4 text-indigo-400" />
                     <span>Tabel Analisis Prediksi Permintaan (Demand Forecasting)</span>
                   </h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Memproyeksikan laju penjualan harian dan estimasi tanggal produk menembus ambang batas minimum.
+                    Perhitungan otomatis rekomendasi restock berdasarkan rata-rata laju jual harian (daily velocity) dan lead time supplier {leadTimeDays} hari.
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setIsDraftPOModalOpen(true);
+                    }}
+                    className="px-3.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer border border-emerald-400/40"
+                    title="Generate Draft Surat Pesanan (PO) Otomatis Berdasarkan Laju Jual & Lead Time"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                    <span>Generate Draft PO Otomatis</span>
+                  </button>
+
                   <button
                     type="button"
                     onClick={handleExportStockPdf}
@@ -2054,6 +3285,591 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               </div>
             </div>
           </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* SUBTAB 5: PELACAKAN KADALUARSA (EXPIRED DATE TRACKER & REPORTS)    */}
+        {/* =================================================================== */}
+        {activeSubTab === 'EXPIRY_TRACKER' && (
+          <div className="space-y-5 animate-in fade-in duration-150">
+            {/* KPI Overview for Expiry Tracking */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+                <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  Total Dipantau
+                </div>
+                <div className="text-xl md:text-2xl font-black text-slate-900 mt-1 font-mono">
+                  {expiryAnalytics.totalTracked} <span className="text-xs font-semibold text-slate-500">SKU</span>
+                </div>
+                <div className="text-[10px] text-slate-500 mt-0.5">Produk fisik ber-expired date</div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-rose-200 bg-rose-50/20 shadow-2xs">
+                <div className="text-[11px] font-bold text-rose-600 uppercase tracking-wider flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  <span>Sudah Kadaluarsa</span>
+                </div>
+                <div className="text-xl md:text-2xl font-black text-rose-600 mt-1 font-mono">
+                  {expiryAnalytics.expiredItems.length} <span className="text-xs font-semibold text-rose-500">SKU</span>
+                </div>
+                <div className="text-[10px] text-rose-600/80 mt-0.5">Harus segera ditarik / dimusnahkan</div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-amber-200 bg-amber-50/20 shadow-2xs">
+                <div className="text-[11px] font-bold text-amber-700 uppercase tracking-wider flex items-center gap-1">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  <span>Kritis (&le; 7 Hari)</span>
+                </div>
+                <div className="text-xl md:text-2xl font-black text-amber-700 mt-1 font-mono">
+                  {expiryAnalytics.expiringIn7Days.length} <span className="text-xs font-semibold text-amber-600">SKU</span>
+                </div>
+                <div className="text-[10px] text-amber-700/80 mt-0.5">Segera flash sale atau retur supplier</div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-emerald-200 bg-emerald-50/20 shadow-2xs">
+                <div className="text-[11px] font-bold text-emerald-700 uppercase tracking-wider flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Aman (&gt; 30 Hari)</span>
+                </div>
+                <div className="text-xl md:text-2xl font-black text-emerald-700 mt-1 font-mono">
+                  {expiryAnalytics.safeItems.length} <span className="text-xs font-semibold text-emerald-600">SKU</span>
+                </div>
+                <div className="text-[10px] text-emerald-700/80 mt-0.5">Masa simpan produk masih panjang</div>
+              </div>
+            </div>
+
+            {/* Filter and Search Bar */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
+              <div className="flex flex-col md:flex-row gap-3 items-center justify-between">
+                <div className="relative flex-1 w-full">
+                  <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input
+                    type="text"
+                    value={expirySearch}
+                    onChange={(e) => setExpirySearch(e.target.value)}
+                    placeholder="Cari nama produk kadaluarsa, barcode, atau kategori..."
+                    className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs md:text-sm text-slate-900 focus:outline-none focus:border-rose-500"
+                  />
+                </div>
+
+                <div className="flex items-center gap-1.5 overflow-x-auto w-full md:w-auto pb-1 md:pb-0">
+                  {[
+                    { id: 'ALL', label: `Semua (${expiryAnalytics.totalTracked})` },
+                    { id: 'EXPIRED', label: `Kadaluarsa (${expiryAnalytics.expiredItems.length})`, color: 'text-rose-700 bg-rose-50 border-rose-200' },
+                    { id: 'CRITICAL_7D', label: `Kritis 7 Hari (${expiryAnalytics.expiringIn7Days.length})`, color: 'text-amber-800 bg-amber-50 border-amber-200' },
+                    { id: 'WARNING_30D', label: `Mendekati 30 Hari (${expiryAnalytics.expiringIn30Days.length})` },
+                    { id: 'SAFE', label: `Aman (${expiryAnalytics.safeItems.length})` },
+                  ].map((filterTab) => (
+                    <button
+                      key={filterTab.id}
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setExpiryStatusFilter(filterTab.id as any);
+                      }}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all border ${
+                        expiryStatusFilter === filterTab.id
+                          ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
+                          : 'bg-slate-50 hover:bg-slate-100 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      {filterTab.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Table of Expiring Products */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs md:text-sm">
+                  <thead className="bg-slate-50 text-slate-600 uppercase text-[10px] font-bold border-b border-slate-200">
+                    <tr>
+                      <th className="py-3 px-4">Produk</th>
+                      <th className="py-3 px-4">Kategori</th>
+                      <th className="py-3 px-4">Sisa Stok</th>
+                      <th className="py-3 px-4">Tanggal Kadaluarsa</th>
+                      <th className="py-3 px-4">Status &amp; Sisa Waktu</th>
+                      <th className="py-3 px-4 text-right">Aksi Cepat</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredExpiryProducts.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="text-center py-12 text-slate-400 space-y-2">
+                          <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto" />
+                          <p className="text-sm font-bold text-slate-700">Tidak ada produk dalam filter ini!</p>
+                          <p className="text-xs text-slate-400">
+                            Semua stok dalam kondisi masa simpan yang baik atau belum diatur tanggal kadaluarsanya.
+                          </p>
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredExpiryProducts.map((p) => {
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0);
+                        const expDate = new Date(p.expiryDate!);
+                        const isExpired = expDate < today;
+                        const diffDays = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+                        const is7Days = !isExpired && diffDays <= 7;
+                        const is30Days = !isExpired && diffDays <= 30;
+
+                        return (
+                          <tr key={p.id} className="hover:bg-slate-50/80 transition-colors">
+                            <td className="py-3 px-4">
+                              <div className="font-bold text-slate-900">{p.name}</div>
+                              <div className="text-[10px] font-mono text-slate-400 flex items-center gap-1 mt-0.5">
+                                <span>SKU: {p.sku || p.barcode}</span>
+                              </div>
+                            </td>
+
+                            <td className="py-3 px-4">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">
+                                {p.category}
+                              </span>
+                            </td>
+
+                            <td className="py-3 px-4 font-mono font-bold text-slate-800">
+                              {formatNumber(p.stockInBaseUnit)} {p.baseUnit}
+                            </td>
+
+                            <td className="py-3 px-4 font-mono font-bold text-slate-900">
+                              <span className="flex items-center gap-1.5">
+                                <CalendarDays className="w-3.5 h-3.5 text-slate-400" />
+                                <span>{p.expiryDate}</span>
+                              </span>
+                            </td>
+
+                            <td className="py-3 px-4">
+                              {isExpired ? (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black bg-rose-100 text-rose-700 border border-rose-300 shadow-2xs animate-pulse">
+                                  <ShieldAlert className="w-3 h-3" />
+                                  <span>KADALUARSA (LEWAT {Math.abs(diffDays)} HARI)</span>
+                                </span>
+                              ) : is7Days ? (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black bg-amber-100 text-amber-800 border border-amber-300 shadow-2xs">
+                                  <AlertTriangle className="w-3 h-3" />
+                                  <span>KRITIS (SISA {diffDays} HARI)</span>
+                                </span>
+                              ) : is30Days ? (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                                  <span>Waspada (Sisa {diffDays} Hari)</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                  <Check className="w-3 h-3" />
+                                  <span>Aman ({diffDays} Hari)</span>
+                                </span>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-4 text-right">
+                              <div className="flex items-center justify-end gap-1.5">
+                                {onInitiateRestockForProduct && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onInitiateRestockForProduct(p, Math.max(1, (p.minStockAlert * 2) - p.stockInBaseUnit))}
+                                    className="px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white rounded-lg font-bold text-xs shadow-2xs flex items-center gap-1 cursor-pointer transition-colors"
+                                  >
+                                    <Truck className="w-3 h-3" />
+                                    <span>Pesan PO</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    sound.playTap();
+                                    setAdjustingProduct(p);
+                                    setStockAdjustmentVal(p.stockInBaseUnit.toString());
+                                    setAdjustmentType('SET');
+                                    setAdjustmentReason('Pemusnahan Barang Kadaluarsa');
+                                  }}
+                                  className="px-2.5 py-1 bg-slate-100 hover:bg-rose-50 text-slate-700 hover:text-rose-700 rounded-lg font-bold text-xs transition-colors border border-slate-200"
+                                >
+                                  Sesuaikan Stok
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* SUBTAB: OPTIMAL REORDER QUANTITY REPORT (HISTORICAL DEMAND)         */}
+        {/* =================================================================== */}
+        {activeSubTab === 'REORDER_REPORT' && (
+          <div className="space-y-5 animate-in fade-in duration-150">
+            {/* KPI Summary Cards */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
+              <div className="bg-white p-4 rounded-2xl border border-cyan-200 shadow-2xs">
+                <div className="text-[11px] font-bold text-cyan-700 uppercase">Perlu Reorder Sekarang</div>
+                <div className="text-2xl font-black text-slate-900 font-mono mt-1">
+                  {formatNumber(optimalReorderList.filter((r) => r.needsReorder).length)}{' '}
+                  <span className="text-xs font-bold text-slate-400">SKU</span>
+                </div>
+                <p className="text-[10.5px] text-slate-500 mt-0.5">Di bawah Reorder Point (ROP)</p>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+                <div className="text-[11px] font-bold text-slate-500 uppercase">Total Unit Reorder Disarankan</div>
+                <div className="text-2xl font-black text-cyan-700 font-mono mt-1">
+                  {formatNumber(filteredOptimalReorderList.reduce((acc, r) => acc + r.optimalReorderQty, 0))}
+                </div>
+                <p className="text-[10.5px] text-slate-500 mt-0.5">Siklus {reorderCycleDays} hari + Safety {reorderSafetyDays} hari</p>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-emerald-200 shadow-2xs">
+                <div className="text-[11px] font-bold text-emerald-700 uppercase">Estimasi Anggaran PO</div>
+                <div className="text-xl md:text-2xl font-black text-emerald-700 font-mono mt-1">
+                  {formatRupiah(filteredOptimalReorderList.reduce((acc, r) => acc + r.estimatedOrderCost, 0))}
+                </div>
+                <p className="text-[10.5px] text-slate-500 mt-0.5">Berdasarkan harga modal pokok saat ini</p>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+                <div className="text-[11px] font-bold text-slate-500 uppercase">Produk Memiliki Histori Jual</div>
+                <div className="text-2xl font-black text-slate-900 font-mono mt-1">
+                  {formatNumber(optimalReorderList.filter((r) => r.historicalSold > 0).length)}{' '}
+                  <span className="text-xs font-bold text-slate-400">/ {optimalReorderList.length}</span>
+                </div>
+                <p className="text-[10.5px] text-slate-500 mt-0.5">Periode data {reorderLookbackDays} hari terakhir</p>
+              </div>
+            </div>
+
+            {/* Parameters & Action Controls */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                <div>
+                  <h3 className="text-sm font-black text-slate-900 flex items-center gap-2">
+                    <Calculator className="w-4 h-4 text-cyan-600" />
+                    <span>Parameter Perhitungan Optimal Reorder Quantity</span>
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    ROP = (Rata-rata Harian × Lead Time) + (Rata-rata Harian × Buffer) + Cadangan Fluktuasi Permintaan (95% Service Level)
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleExportOptimalReorderCsv}
+                    className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Ekspor CSV</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportStockPdf}
+                    className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                  >
+                    <FileDown className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Ekspor PDF</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                <div>
+                  <label className="text-[11px] font-bold text-slate-600 block mb-1">Histori Penjualan</label>
+                  <select
+                    value={reorderLookbackDays}
+                    onChange={(e) => setReorderLookbackDays(Number(e.target.value) as 30 | 60 | 90)}
+                    className="w-full p-2 rounded-xl border border-slate-300 bg-slate-50 font-bold text-slate-800"
+                  >
+                    <option value={30}>30 Hari Terakhir</option>
+                    <option value={60}>60 Hari Terakhir</option>
+                    <option value={90}>90 Hari Terakhir</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-600 block mb-1">Lead Time Supplier (Hari)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={60}
+                    value={reorderLeadTimeDays}
+                    onChange={(e) => setReorderLeadTimeDays(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-full p-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold text-slate-800"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-600 block mb-1">Siklus Pembelian / Order (Hari)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={90}
+                    value={reorderCycleDays}
+                    onChange={(e) => setReorderCycleDays(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-full p-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold text-slate-800"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-600 block mb-1">Safety Buffer Tambahan (Hari)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    value={reorderSafetyDays}
+                    onChange={(e) => setReorderSafetyDays(Math.max(0, parseInt(e.target.value) || 0))}
+                    className="w-full p-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold text-slate-800"
+                  />
+                </div>
+              </div>
+
+              {/* Filters Row */}
+              <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2 pt-2">
+                <div className="relative flex-1">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input
+                    type="text"
+                    value={reorderSearch}
+                    onChange={(e) => setReorderSearch(e.target.value)}
+                    placeholder="Cari nama produk, SKU, atau kategori..."
+                    className="w-full pl-9 pr-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs focus:outline-none focus:border-cyan-500 focus:bg-white"
+                  />
+                </div>
+
+                <select
+                  value={reorderSupplierFilter}
+                  onChange={(e) => setReorderSupplierFilter(e.target.value)}
+                  className="px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-700"
+                >
+                  <option value="ALL">Semua Supplier</option>
+                  {suppliers.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      Supplier: {s.name}
+                    </option>
+                  ))}
+                  <option value="NONE">Tanpa Supplier Tetap</option>
+                </select>
+
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+                  {[
+                    { key: 'ALL' as const, label: 'Semua' },
+                    { key: 'NEED_REORDER' as const, label: 'Perlu Reorder' },
+                    { key: 'WITH_HISTORY' as const, label: 'Ada Penjualan' },
+                  ].map((f) => (
+                    <button
+                      key={f.key}
+                      type="button"
+                      onClick={() => setReorderFilterMode(f.key)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                        reorderFilterMode === f.key
+                          ? 'bg-cyan-700 text-white shadow-2xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Optimal Reorder Table */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-600 uppercase text-[10.5px] font-bold border-b border-slate-200">
+                    <tr>
+                      <th className="py-3 px-4">Produk &amp; Supplier</th>
+                      <th className="py-3 px-4">Stok &amp; Ketahanan</th>
+                      <th className="py-3 px-4">Terjual ({reorderLookbackDays}h)</th>
+                      <th className="py-3 px-4">Rata-rata / Hari</th>
+                      <th className="py-3 px-4">Reorder Point (ROP)</th>
+                      <th className="py-3 px-4">Optimal Reorder Qty</th>
+                      <th className="py-3 px-4">Est. Biaya Order</th>
+                      <th className="py-3 px-4 text-right">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredOptimalReorderList.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-10 text-center text-slate-400">
+                          Tidak ada produk yang sesuai filter laporan reorder ini.
+                        </td>
+                      </tr>
+                    ) : (
+                      paginatedReorderList.map((r) => (
+                        <tr
+                          key={r.product.id}
+                          className={
+                            r.needsReorder
+                              ? 'bg-cyan-50/40 hover:bg-cyan-50/80'
+                              : 'hover:bg-slate-50'
+                          }
+                        >
+                          <td className="py-3 px-4">
+                            <div className="font-bold text-slate-900">{r.product.name}</div>
+                            <div className="text-[10.5px] text-slate-500 flex items-center gap-1.5 mt-0.5 flex-wrap">
+                              <span className="font-mono">{r.product.sku || r.product.barcode}</span>
+                              <span>•</span>
+                              <span className="font-semibold text-sky-700">
+                                {r.supplier ? r.supplier.name : 'Supplier Umum'}
+                              </span>
+                            </div>
+                          </td>
+
+                          <td className="py-3 px-4 font-mono">
+                            <div
+                              className={`font-black ${
+                                r.product.stockInBaseUnit <= 0
+                                  ? 'text-rose-600'
+                                  : r.needsReorder
+                                  ? 'text-amber-700'
+                                  : 'text-slate-900'
+                              }`}
+                            >
+                              {formatNumber(r.product.stockInBaseUnit)} {r.product.baseUnit}
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                              {r.daysOfCover >= 999
+                                ? 'Cukup (>99 hari)'
+                                : `Tahan ~${r.daysOfCover} hari`}
+                            </div>
+                          </td>
+
+                          <td className="py-3 px-4 font-mono">
+                            <div className="font-bold text-slate-800">
+                              {formatNumber(r.historicalSold)} {r.product.baseUnit}
+                            </div>
+                            <div className="text-[10px] text-slate-400">
+                              {r.txFrequency} transaksi
+                            </div>
+                          </td>
+
+                          <td className="py-3 px-4 font-mono">
+                            <div className="font-bold text-indigo-700">
+                              {r.avgDailyDemand} {r.product.baseUnit}/hr
+                            </div>
+                            {r.dailyStdDev > 0 && (
+                              <div className="text-[10px] text-slate-400">σ ±{r.dailyStdDev}</div>
+                            )}
+                          </td>
+
+                          <td className="py-3 px-4 font-mono">
+                            <div className="font-bold text-slate-800">
+                              {formatNumber(r.reorderPoint)} {r.product.baseUnit}
+                            </div>
+                            <div className="text-[10px] text-slate-400">
+                              Target Maks: {formatNumber(r.targetMaxStock)}
+                            </div>
+                          </td>
+
+                          <td className="py-3 px-4">
+                            {r.optimalReorderQty > 0 ? (
+                              <div>
+                                <span className="px-2.5 py-1 rounded-lg bg-cyan-700 text-white font-mono font-black text-xs inline-block">
+                                  +{formatNumber(r.optimalReorderQty)} {r.product.baseUnit}
+                                </span>
+                                {r.packSuggestion !== `${formatNumber(r.optimalReorderQty)} ${r.product.baseUnit}` && (
+                                  <div className="text-[10px] font-bold text-cyan-800 mt-1">
+                                    ≈ {r.packSuggestion}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10.5px] font-bold">
+                                Stok Optimal
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="py-3 px-4 font-mono font-bold text-slate-900">
+                            {r.optimalReorderQty > 0 ? formatRupiah(r.estimatedOrderCost) : '-'}
+                          </td>
+
+                          <td className="py-3 px-4 text-right">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                if (onInitiateRestockForProduct && r.optimalReorderQty > 0) {
+                                  onInitiateRestockForProduct(r.product, r.optimalReorderQty);
+                                } else {
+                                  onNavigateToSuppliers();
+                                }
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold inline-flex items-center gap-1 shadow-2xs cursor-pointer"
+                            >
+                              <Truck className="w-3.5 h-3.5" />
+                              <span>Order PO</span>
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {filteredOptimalReorderList.length > STOCK_PAGE_SIZE && (
+                <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600">
+                  <span>
+                    Menampilkan{' '}
+                    <strong className="text-slate-900">
+                      {(safeReorderPage - 1) * STOCK_PAGE_SIZE + 1}–{Math.min(safeReorderPage * STOCK_PAGE_SIZE, filteredOptimalReorderList.length)}
+                    </strong>{' '}
+                    dari <strong className="text-slate-900">{filteredOptimalReorderList.length}</strong> produk
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={safeReorderPage <= 1}
+                      onClick={() => {
+                        sound.playTap();
+                        setReorderPage((p) => Math.max(1, p - 1));
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                    >
+                      Sebelumnya
+                    </button>
+                    <span className="px-2.5 font-mono font-bold text-slate-800">
+                      Hal {safeReorderPage} / {reorderTotalPages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={safeReorderPage >= reorderTotalPages}
+                      onClick={() => {
+                        sound.playTap();
+                        setReorderPage((p) => Math.min(reorderTotalPages, p + 1));
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-bold cursor-pointer"
+                    >
+                      Berikutnya
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* SUBTAB: HEATMAP PERPUTARAN STOK (30 HARI TERAKHIR)                  */}
+        {/* =================================================================== */}
+        {activeSubTab === 'STOCK_HEATMAP' && (
+          <StockTurnoverHeatmap
+            products={products}
+            transactions={transactions}
+            onInitiateRestockForProduct={onInitiateRestockForProduct}
+            onSelectProductForMonitoring={(prod) => {
+              setSearch(prod.name);
+              setActiveSubTab('MONITORING');
+            }}
+          />
         )}
 
       </div>
@@ -2422,18 +4238,42 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               </div>
 
               <div>
-                <label className="text-xs font-bold text-slate-700 block mb-1">
-                  Jumlah Satuan Dasar ({adjustingProduct.baseUnit})
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  step="1"
-                  required
-                  value={stockAdjustmentVal}
-                  onChange={(e) => setStockAdjustmentVal(e.target.value)}
-                  className="w-full p-3 rounded-xl border border-slate-300 text-base font-mono font-bold focus:border-sky-500 focus:outline-none"
-                />
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-bold text-slate-700">
+                    Jumlah Satuan Dasar ({adjustingProduct.baseUnit})
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setActiveKeypad({
+                        title: 'Koreksi Stok Fisik',
+                        subtitle: `${adjustingProduct.name} (${adjustingProduct.barcode})`,
+                        initialValue: parseFloat(stockAdjustmentVal) || 0,
+                        unitName: adjustingProduct.baseUnit,
+                        onConfirm: (val) => setStockAdjustmentVal(val.toString()),
+                      });
+                    }}
+                    className="text-[11px] font-bold text-sky-700 hover:text-sky-800 bg-sky-50 px-2.5 py-1 rounded-lg border border-sky-200 flex items-center gap-1 active:scale-95"
+                  >
+                    <Calculator className="w-3.5 h-3.5" />
+                    <span>Numpad Sentuh</span>
+                  </button>
+                </div>
+                <div className="relative">
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    required
+                    value={stockAdjustmentVal}
+                    onChange={(e) => setStockAdjustmentVal(e.target.value)}
+                    className="w-full p-3 rounded-xl border border-slate-300 text-base font-mono font-bold focus:border-sky-500 focus:outline-none pr-12"
+                  />
+                  <div className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400 uppercase pointer-events-none">
+                    {adjustingProduct.baseUnit}
+                  </div>
+                </div>
               </div>
 
               <div>
@@ -2467,6 +4307,311 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* MODAL 4: DRAFT PURCHASE ORDER (PO) GENERATOR                        */}
+      {/* =================================================================== */}
+      {isDraftPOModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-3 select-none">
+          <div className="bg-white rounded-3xl max-w-4xl w-full max-h-[92vh] flex flex-col shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
+            {/* Header */}
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between shrink-0 bg-slate-900 text-white">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-sky-500/20 border border-sky-400/30 flex items-center justify-center text-sky-400">
+                  <FileSpreadsheet className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-base font-bold text-white">Draft Purchase Order (PO) Otomatis</h3>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-400/30 font-bold">
+                      REKOMENDASI SISTEM
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    No. PO: PO-{new Date().toISOString().slice(0, 10).replace(/-/g, '')}-DRAFT • Lead Time: {leadTimeDays} Hari • Safety Stock: {safetyStockDays} Hari
+                  </p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setIsDraftPOModalOpen(false)}
+                className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Filter & Summary stats */}
+            <div className="p-4 bg-slate-50 border-b border-slate-200 shrink-0">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs font-bold text-slate-700 whitespace-nowrap">Filter Supplier:</label>
+                  <select
+                    value={selectedPOSupplierId}
+                    onChange={(e) => setSelectedPOSupplierId(e.target.value)}
+                    className="p-2 rounded-xl border border-slate-300 bg-white text-xs font-bold text-slate-800 focus:outline-none focus:border-sky-500"
+                  >
+                    <option value="ALL">Semua Supplier Rekanan</option>
+                    {suppliers.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name} ({s.contactPerson})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Calculation notice */}
+                <div className="text-[11px] text-slate-500 bg-white px-3 py-1.5 rounded-xl border border-slate-200">
+                  Buffer Total: <span className="font-bold text-slate-800">{leadTimeDays + safetyStockDays} hari penjualan</span>
+                </div>
+              </div>
+
+              {/* KPI Badges */}
+              {(() => {
+                const poItems = demandForecastingList.filter((item) => {
+                  if (item.recommendedReorderQty <= 0) return false;
+                  if (selectedPOSupplierId !== 'ALL' && item.product.supplierId !== selectedPOSupplierId) return false;
+                  return true;
+                });
+                const totalUnits = poItems.reduce((acc, it) => acc + it.recommendedReorderQty, 0);
+                const totalEstBudget = poItems.reduce((acc, it) => acc + (it.recommendedReorderQty * it.product.costPrice), 0);
+
+                return (
+                  <div className="grid grid-cols-3 gap-3 mt-3">
+                    <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Item yang Dipesan</div>
+                      <div className="text-lg font-black text-slate-900 font-mono">{poItems.length} SKU</div>
+                    </div>
+                    <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Total Unit Restock</div>
+                      <div className="text-lg font-black text-sky-700 font-mono">{formatNumber(totalUnits)} Unit</div>
+                    </div>
+                    <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Estimasi Total Biaya Modal</div>
+                      <div className="text-lg font-black text-emerald-700 font-mono">{formatRupiah(totalEstBudget)}</div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Items Table */}
+            <div className="flex-1 overflow-y-auto p-4">
+              {(() => {
+                const poItems = demandForecastingList.filter((item) => {
+                  if (item.recommendedReorderQty <= 0) return false;
+                  if (selectedPOSupplierId !== 'ALL' && item.product.supplierId !== selectedPOSupplierId) return false;
+                  return true;
+                });
+
+                if (poItems.length === 0) {
+                  return (
+                    <div className="py-12 text-center text-slate-400">
+                      <CheckCircle2 className="w-12 h-12 mx-auto text-emerald-500 mb-2 opacity-80" />
+                      <p className="font-bold text-slate-700">Tidak ada produk yang memerlukan restock untuk filter ini.</p>
+                      <p className="text-xs text-slate-500 mt-1">Stok aman atau belum melampaui buffer batas waktu pemesanan.</p>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="overflow-x-auto rounded-2xl border border-slate-200">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-100/90 text-slate-600 font-bold uppercase text-[10px] tracking-wider border-b border-slate-200">
+                        <tr>
+                          <th className="py-2.5 px-3">No</th>
+                          <th className="py-2.5 px-3">Produk & Barcode</th>
+                          <th className="py-2.5 px-3">Supplier</th>
+                          <th className="py-2.5 px-3 text-right">Sisa Stok</th>
+                          <th className="py-2.5 px-3 text-right">Kecepatan/Hari</th>
+                          <th className="py-2.5 px-3 text-center bg-sky-50 text-sky-900">Saran Order</th>
+                          <th className="py-2.5 px-3 text-right">Harga Modal</th>
+                          <th className="py-2.5 px-3 text-right">Subtotal Estimasi</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {poItems.map((item, idx) => {
+                          const supp = suppliers.find((s) => s.id === item.product.supplierId);
+                          const subtotal = item.recommendedReorderQty * item.product.costPrice;
+                          return (
+                            <tr key={item.product.id} className="hover:bg-slate-50/80">
+                              <td className="py-2.5 px-3 font-mono text-slate-400">{idx + 1}</td>
+                              <td className="py-2.5 px-3">
+                                <div className="font-bold text-slate-800">{item.product.name}</div>
+                                <div className="font-mono text-[10px] text-slate-400">{item.product.barcode}</div>
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-600 font-medium">
+                                {supp ? supp.name : <span className="text-slate-400 italic">Umum</span>}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-700">
+                                {formatNumber(item.currentStock)} {item.product.baseUnit}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600">
+                                {item.dailyVelocity} /hr
+                              </td>
+                              <td className="py-2.5 px-3 text-center bg-sky-50/60 font-mono font-black text-sky-700 text-sm">
+                                {formatNumber(item.recommendedReorderQty)} {item.product.baseUnit}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600">
+                                {formatRupiah(item.product.costPrice)}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-700">
+                                {formatRupiah(subtotal)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Footer with Actions */}
+            <div className="p-4 border-t border-slate-100 bg-white flex flex-wrap items-center justify-between gap-2 shrink-0">
+              <div className="text-xs text-slate-400">
+                Tekan tombol di kanan untuk mengirim atau menyimpan dokumen pemesanan.
+              </div>
+
+              <div className="flex items-center gap-2">
+                {/* Share to WhatsApp */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    const poItems = demandForecastingList.filter((item) => {
+                      if (item.recommendedReorderQty <= 0) return false;
+                      if (selectedPOSupplierId !== 'ALL' && item.product.supplierId !== selectedPOSupplierId) return false;
+                      return true;
+                    });
+                    if (poItems.length === 0) return;
+
+                    const supp = suppliers.find((s) => s.id === selectedPOSupplierId);
+                    const totalUnits = poItems.reduce((acc, it) => acc + it.recommendedReorderQty, 0);
+                    const totalEstBudget = poItems.reduce((acc, it) => acc + (it.recommendedReorderQty * it.product.costPrice), 0);
+                    const storeName = storeSettings?.storeName || 'Toko Retail POS';
+                    const poNo = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-DRAFT`;
+                    const dateFormatted = new Date().toLocaleDateString('id-ID', { dateStyle: 'long' });
+
+                    let msg = `*DRAFT PURCHASE ORDER (PO)*\n`;
+                    msg += `No: ${poNo}\n`;
+                    msg += `Tanggal: ${dateFormatted}\n`;
+                    msg += `Toko: ${storeName}\n`;
+                    msg += `Supplier: ${supp ? supp.name : 'Supplier Rekanan'}\n\n`;
+                    msg += `*Daftar Pesanan Restock:*\n`;
+                    poItems.forEach((it, idx) => {
+                      msg += `${idx + 1}. ${it.product.name} (${it.product.barcode})\n`;
+                      msg += `   Jumlah: ${it.recommendedReorderQty} ${it.product.baseUnit} @ ${formatRupiah(it.product.costPrice)}\n`;
+                    });
+                    msg += `\n*Total Pesanan:* ${totalUnits} unit (${poItems.length} SKU)\n`;
+                    msg += `*Estimasi Biaya:* ${formatRupiah(totalEstBudget)}\n`;
+                    msg += `_Catatan: Berdasarkan lead time ${leadTimeDays} hari kerja & safety stock ${safetyStockDays} hari._`;
+
+                    const phone = supp?.phone || '';
+                    window.open(formatWhatsAppUrl(phone, msg), '_blank');
+                  }}
+                  className="py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-2 shadow-md shadow-emerald-600/20 active:scale-95"
+                >
+                  <MessageCircle className="w-4 h-4" />
+                  <span>Kirim PO via WhatsApp</span>
+                </button>
+
+                {/* Export PDF */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    const poItems = demandForecastingList.filter((item) => {
+                      if (item.recommendedReorderQty <= 0) return false;
+                      if (selectedPOSupplierId !== 'ALL' && item.product.supplierId !== selectedPOSupplierId) return false;
+                      return true;
+                    });
+                    if (poItems.length === 0) return;
+
+                    const supp = suppliers.find((s) => s.id === selectedPOSupplierId);
+                    const storeName = storeSettings?.storeName || 'Toko Retail POS';
+                    const poNo = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-DRAFT`;
+
+                    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+                    doc.setFontSize(16);
+                    doc.setTextColor(15, 23, 42);
+                    doc.text(`DRAFT PURCHASE ORDER - ${storeName.toUpperCase()}`, 14, 15);
+
+                    doc.setFontSize(9);
+                    doc.setTextColor(100, 116, 139);
+                    doc.text(`Nomor PO: ${poNo} | Tanggal: ${new Date().toLocaleDateString('id-ID', { dateStyle: 'long' })}`, 14, 21);
+                    doc.text(`Supplier: ${supp ? supp.name : 'Semua Supplier'} | Parameter: Lead Time ${leadTimeDays} Hari, Safety Stock ${safetyStockDays} Hari`, 14, 26);
+
+                    const tableData = poItems.map((it, idx) => {
+                      const itemSupp = suppliers.find((s) => s.id === it.product.supplierId);
+                      return [
+                        (idx + 1).toString(),
+                        it.product.barcode,
+                        it.product.name,
+                        itemSupp ? itemSupp.name : 'Umum',
+                        `${formatNumber(it.currentStock)} ${it.product.baseUnit}`,
+                        `${formatNumber(it.recommendedReorderQty)} ${it.product.baseUnit}`,
+                        formatRupiah(it.product.costPrice),
+                        formatRupiah(it.recommendedReorderQty * it.product.costPrice),
+                      ];
+                    });
+
+                    autoTable(doc, {
+                      startY: 31,
+                      head: [['No', 'Barcode', 'Nama Barang', 'Supplier', 'Stok Kini', 'Jumlah Order', 'Harga Pokok', 'Subtotal']],
+                      body: tableData,
+                      theme: 'grid',
+                      headStyles: { fillColor: [15, 23, 42], textColor: 255, fontSize: 8.5, fontStyle: 'bold' },
+                      styles: { fontSize: 8, cellPadding: 2.5 },
+                      alternateRowStyles: { fillColor: [248, 250, 252] },
+                    });
+
+                    const finalY = (doc as any).lastAutoTable?.finalY || 40;
+                    const totalEst = poItems.reduce((acc, it) => acc + it.recommendedReorderQty * it.product.costPrice, 0);
+                    doc.setFontSize(10);
+                    doc.setTextColor(15, 23, 42);
+                    doc.text(`TOTAL ESTIMASI DRAFT PO: ${formatRupiah(totalEst)}`, 14, finalY + 8);
+
+                    doc.save(`Draft-PO-${new Date().toISOString().slice(0, 10)}.pdf`);
+                  }}
+                  className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs flex items-center gap-2 shadow-2xs active:scale-95"
+                >
+                  <FileDown className="w-4 h-4" />
+                  <span>Ekspor PDF</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setIsDraftPOModalOpen(false)}
+                  className="py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-100"
+                >
+                  Tutup
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tactile Touch Keypad Modal for Tablet Numbers */}
+      {activeKeypad && (
+        <TouchKeypadModal
+          isOpen={!!activeKeypad}
+          onClose={() => setActiveKeypad(null)}
+          title={activeKeypad.title}
+          subtitle={activeKeypad.subtitle}
+          initialValue={activeKeypad.initialValue}
+          unitName={activeKeypad.unitName}
+          min={0}
+          max={999999}
+          quickPresets={[1, 5, 10, 20, 50, 100]}
+          onConfirm={(val) => {
+            activeKeypad.onConfirm(val);
+            setActiveKeypad(null);
+          }}
+        />
       )}
     </div>
   );

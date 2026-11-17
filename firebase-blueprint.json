@@ -31,6 +31,9 @@
         "totalPoints": { "type": "number", "description": "Loyalty points balance" },
         "creditLimit": { "type": "number", "description": "Maximum allowed debt" },
         "totalDebt": { "type": "number", "description": "Outstanding unsettled debt" },
+        "customerCategory": { "type": "string", "description": "Customer category e.g. UMUM, REGULER, MEMBER, VIP" },
+        "isMember": { "type": "boolean", "description": "Official member status eligible to earn and redeem loyalty points" },
+        "membershipId": { "type": "string", "description": "Unique customer membership ID encoded into member QR code for fast checkout scan" },
         "notes": { "type": "string", "description": "Optional manager notes" },
         "createdAt": { "type": "string", "description": "Registration date" }
       }
@@ -62,6 +65,13 @@
         "bankRefNumber": { "type": "string", "description": "Transfer or QRIS ref ID" },
         "dueDate": { "type": "string", "description": "Due date if debt" },
         "paidAt": { "type": "string", "description": "Debt settlement timestamp" },
+        "notes": { "type": "string", "description": "Optional transaction note or internal/customer remark" },
+        "auditLogs": { "type": "array", "description": "Administrator post-transaction edit audit log entries" },
+        "customerRating": { "type": "number", "description": "Customer satisfaction star rating (1 to 5)" },
+        "customerRatingTags": { "type": "array", "description": "Selected quick service quality feedback tags" },
+        "customerRatingComment": { "type": "string", "description": "Optional customer satisfaction comment" },
+        "customerRatedAt": { "type": "number", "description": "Unix timestamp in ms when rating was submitted" },
+        "customerRatingChannel": { "type": "string", "description": "RECEIPT_MODAL | DIGITAL_LINK" },
         "items": { "type": "array", "description": "List of sold items with units and prices" }
       }
     },
@@ -104,15 +114,45 @@
         "storeName": { "type": "string", "description": "Store title" },
         "storeAddress": { "type": "string", "description": "Store address" },
         "storePhone": { "type": "string", "description": "Store hotline" },
-        "storeFooterReceipt": { "type": "string", "description": "Receipt footer greeting" },
+        "storeFooterReceipt": { "type": "string", "description": "Personalized 2-line receipt footer greeting or return policy" },
         "storeLogo": { "type": "string", "description": "Logo data URL" },
         "showLogoOnReceipt": { "type": "boolean", "description": "Toggle receipt logo" },
+        "dailySalesGoal": { "type": "number", "description": "Daily sales target in IDR" },
+        "weeklySalesGoal": { "type": "number", "description": "Weekly sales target in IDR" },
+        "monthlySalesGoal": { "type": "number", "description": "Monthly sales target in IDR" },
+        "autoSendWhatsAppReceipt": { "type": "boolean", "description": "Auto-send WhatsApp receipt notification after checkout" },
+        "includeReceiptSummaryInAutoWa": { "type": "boolean", "description": "Include transaction summary link in auto WhatsApp notification" },
+        "includeLoyaltyPointsInAutoWa": { "type": "boolean", "description": "Include loyalty point balance info in auto WhatsApp notification" },
+        "useCustomWhatsAppTemplate": { "type": "boolean", "description": "Use custom WhatsApp message template for receipts" },
+        "customWhatsAppTemplate": { "type": "string", "description": "Customizable WhatsApp receipt message template with placeholders" },
+        "autoAdminLowStockWhatsApp": { "type": "boolean", "description": "Automatically send WhatsApp alert to admin when multiple products hit minimum stock in a single day" },
+        "adminWhatsAppNumber": { "type": "string", "description": "Admin WhatsApp phone number for daily low-stock alert notifications" },
+        "adminLowStockTriggerCount": { "type": "number", "description": "Minimum number of distinct products hitting low stock in a single day before triggering admin WhatsApp alert" },
+        "useCustomLowStockWhatsAppTemplate": { "type": "boolean", "description": "Toggle custom WhatsApp template for low-stock alerts" },
+        "customLowStockWhatsAppTemplate": { "type": "string", "description": "Customizable WhatsApp low-stock alert template with product and stock placeholders" },
+        "scheduledAdminLowStockWhatsApp": { "type": "object", "description": "Scheduled recurring WhatsApp low-stock report settings (enabled, frequency, time, daysOfWeek, sendEvenIfAllSafe, includeOutOfStockSummary)" },
+        "printerConnectionType": { "type": "string", "description": "Thermal printer connection mode: BLUETOOTH or USB" },
+        "printerPaperWidth": { "type": "string", "description": "Thermal printer paper width: 58mm or 80mm" },
+        "printerDeviceName": { "type": "string", "description": "Paired thermal printer device label" },
+        "printerAutoCut": { "type": "boolean", "description": "Enable ESC/POS auto cut command" },
+        "autoPrintReceipt": { "type": "boolean", "description": "Automatically trigger receipt print sequence after successful checkout" },
+        "requireTransactionNote": { "type": "boolean", "description": "Force cashier prompt for a Transaction Note before completing any sale" },
         "enablePoints": { "type": "boolean", "description": "Loyalty program toggle" },
-        "spendPerPoint": { "type": "number", "description": "Spend threshold per 1 point" },
+        "spendPerPoint": { "type": "number", "description": "Spend threshold X in Rupiah to earn Y points" },
+        "pointsPerSpend": { "type": "number", "description": "Number of Y points earned per spendPerPoint threshold" },
         "pointValueRupiah": { "type": "number", "description": "Rupiah value per 1 point" },
+        "autoApplyMaxPoints": { "type": "boolean", "description": "Automatically apply maximum redeemable points discount on checkout when member has points" },
         "bcaAccountNumber": { "type": "string", "description": "BCA account number" },
         "bcaAccountName": { "type": "string", "description": "BCA account name" },
-        "bcaMerchantId": { "type": "string", "description": "BCA merchant ID" }
+        "bcaMerchantId": { "type": "string", "description": "BCA merchant ID" },
+        "customPaymentMethods": { "type": "array", "description": "Customizable list of active store payment methods including uploaded static QRIS JPGs" },
+        "onlineStoreEnabled": { "type": "boolean", "description": "Toggle customer-facing online storefront availability" },
+        "onlineStoreTagline": { "type": "string", "description": "Storefront hero tagline displayed to online shoppers" },
+        "onlineStoreHours": { "type": "string", "description": "Online store operating hours" },
+        "onlineStoreDeliveryFee": { "type": "number", "description": "Flat courier delivery fee for online orders in IDR" },
+        "onlineStoreMinFreeDelivery": { "type": "number", "description": "Minimum order subtotal for free local courier delivery in IDR" },
+        "onlineStorePickupEnabled": { "type": "boolean", "description": "Allow store pickup fulfillment for online orders" },
+        "onlineStoreDeliveryEnabled": { "type": "boolean", "description": "Allow local courier delivery fulfillment for online orders" }
       }
     },
     "categories": {
@@ -142,6 +182,64 @@
         "generalReason": { "type": "string", "description": "General audit objective or period" },
         "notes": { "type": "string", "description": "Optional session notes" },
         "items": { "type": "array", "description": "List of audited products with physical vs system count" }
+      }
+    },
+    "cashflows": {
+      "path": "cashflows/{cashflowId}",
+      "description": "Financial cashflow records for tracking daily store operational expenses (pengeluaran) and miscellaneous incomes (pemasukan)",
+      "fields": {
+        "id": { "type": "string", "description": "Unique cashflow record ID" },
+        "type": { "type": "string", "description": "Cashflow type: PENGELUARAN or PEMASUKAN" },
+        "category": { "type": "string", "description": "Expense or income category" },
+        "amount": { "type": "number", "description": "Transaction nominal amount in IDR" },
+        "date": { "type": "string", "description": "Transaction date YYYY-MM-DD" },
+        "timestamp": { "type": "number", "description": "Transaction timestamp in ms" },
+        "paymentMethod": { "type": "string", "description": "Payment source: CASH, TRANSFER_BCA, QRIS, LAINNYA" },
+        "description": { "type": "string", "description": "Detailed description or notes" },
+        "referenceNumber": { "type": "string", "description": "Optional receipt or invoice reference code" },
+        "recordedBy": { "type": "string", "description": "Name of user who created the record" },
+        "createdAt": { "type": "string", "description": "ISO timestamp of creation" }
+      }
+    },
+    "customer_categories": {
+      "path": "customer_categories/{catId}",
+      "description": "Master customer categories (e.g. UMUM, MEMBER, VIP, RESELLER, GROSIR) for special pricing rules",
+      "fields": {
+        "id": { "type": "string", "description": "Unique customer category ID" },
+        "name": { "type": "string", "description": "Uppercase category name" },
+        "color": { "type": "string", "description": "Color token e.g. purple, sky, emerald, amber" },
+        "description": { "type": "string", "description": "Optional category description" },
+        "isSystemDefault": { "type": "boolean", "description": "Whether category is a seeded default" },
+        "createdAt": { "type": "string", "description": "ISO creation timestamp" }
+      }
+    },
+    "online_orders": {
+      "path": "online_orders/{orderId}",
+      "description": "Customer-submitted online storefront orders pending confirmation, fulfillment, and POS settlement",
+      "fields": {
+        "id": { "type": "string", "description": "Unique online order ID" },
+        "orderCode": { "type": "string", "description": "Human-friendly order tracking code e.g. ONL-20261116-4821" },
+        "createdAt": { "type": "number", "description": "Order creation timestamp in ms" },
+        "updatedAt": { "type": "number", "description": "Last status update timestamp in ms" },
+        "customerName": { "type": "string", "description": "Online shopper full name" },
+        "customerWhatsapp": { "type": "string", "description": "Online shopper WhatsApp contact number" },
+        "customerAddress": { "type": "string", "description": "Delivery address when fulfillmentType is KIRIM_KURIR" },
+        "customerNote": { "type": "string", "description": "Optional customer order instructions" },
+        "membershipId": { "type": "string", "description": "Optional registered customer membership ID" },
+        "fulfillmentType": { "type": "string", "description": "AMBIL_DI_TOKO | KIRIM_KURIR" },
+        "paymentMethodId": { "type": "string", "description": "Selected payment method ID" },
+        "paymentMethodName": { "type": "string", "description": "Selected payment method label" },
+        "paymentMethodType": { "type": "string", "description": "CASH | QRIS | BANK_TRANSFER | CARD | COD | OTHER" },
+        "subtotal": { "type": "number", "description": "Order items subtotal in IDR" },
+        "deliveryFee": { "type": "number", "description": "Courier delivery fee in IDR" },
+        "discount": { "type": "number", "description": "Discount amount in IDR" },
+        "totalAmount": { "type": "number", "description": "Final total payable in IDR" },
+        "status": { "type": "string", "description": "MENUNGGU_KONFIRMASI | DIPROSES | SIAP_DIAMBIL | DIKIRIM | SELESAI | DIBATALKAN" },
+        "items": { "type": "array", "description": "List of ordered products/services with unit and variant" },
+        "linkedTransactionId": { "type": "string", "description": "POS transaction ID once finalized by cashier" },
+        "linkedInvoiceNumber": { "type": "string", "description": "POS invoice number once finalized by cashier" },
+        "processedByName": { "type": "string", "description": "Staff name who processed the order" },
+        "cancelReason": { "type": "string", "description": "Optional reason when order is cancelled" }
       }
     }
   }

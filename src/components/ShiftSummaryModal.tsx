@@ -15,7 +15,8 @@ import {
   Receipt,
   AlertTriangle,
   Sparkles,
-  Calculator
+  Calculator,
+  FileSpreadsheet
 } from 'lucide-react';
 import { Transaction, User, StoreSettings } from '../types/pos';
 import { formatRupiah, formatDateTime, formatNumber } from '../utils/formatters';
@@ -42,6 +43,7 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
   const [openingCashFloat, setOpeningCashFloat] = useState<number>(200000);
   const [countedPhysicalCash, setCountedPhysicalCash] = useState<string>('200000');
   const [autoDownloadPdfOnClose, setAutoDownloadPdfOnClose] = useState<boolean>(true);
+  const [csvExportedNotice, setCsvExportedNotice] = useState<boolean>(false);
 
   if (!isOpen) return null;
 
@@ -208,6 +210,118 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
     // Download PDF
     const fileName = `audit-shift-${paperSize}-${currentUser.name.replace(/\s+/g, '_')}-${new Date().toISOString().slice(0, 10)}.pdf`;
     doc.save(fileName);
+  };
+
+  // Export current shift summary & financial reconciliation as CSV
+  const exportShiftSummaryCsv = () => {
+    sound.playTap();
+    const escapeCsv = (val: string | number | undefined | null): string => {
+      const str = val === undefined || val === null ? '' : String(val);
+      if (/[",\r\n]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const row = (cells: Array<string | number | undefined | null>) =>
+      cells.map(escapeCsv).join(',');
+
+    const nowTs = Date.now();
+    const dateStamp = new Date(nowTs).toISOString().slice(0, 10);
+    const timeStamp = new Date(nowTs).toTimeString().slice(0, 5).replace(':', '');
+    const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
+
+    const cashCount = shiftTx.filter((tx) => tx.paymentMethod === 'CASH').length;
+    const qrisCount = shiftTx.filter((tx) => tx.paymentMethod === 'QRIS_BCA').length;
+    const edcCount = shiftTx.filter((tx) => tx.paymentMethod === 'EDC_BCA').length;
+    const transferCount = shiftTx.filter((tx) => tx.paymentMethod === 'TRANSFER_BCA').length;
+    const piutangCount = shiftTx.filter((tx) => tx.paymentMethod === 'PIUTANG').length;
+    const knownMethods = new Set(['CASH', 'QRIS_BCA', 'EDC_BCA', 'TRANSFER_BCA', 'PIUTANG']);
+    const otherTxs = shiftTx.filter((tx) => !knownMethods.has(tx.paymentMethod));
+    const otherTotal = otherTxs.reduce((acc, tx) => acc + tx.finalAmount, 0);
+    const totalAllMethods = grandTotalShift + otherTotal;
+
+    const discrepancyStatus =
+      cashDiscrepancy === 0
+        ? 'COCOK / PAS'
+        : cashDiscrepancy > 0
+        ? 'SELISIH LEBIH'
+        : 'SELISIH KURANG';
+
+    const csvLines: string[] = [
+      row(['LAPORAN REKONSILIASI SHIFT KASIR']),
+      row(['Nama Toko', storeTitle]),
+      row(['Waktu Audit / Ekspor', formatDateTime(nowTs)]),
+      row(['Petugas / Kasir', currentUser.name]),
+      row(['Role / Jabatan', currentUser.role]),
+      row(['Total Transaksi Shift', shiftTx.length]),
+      row(['Total Omzet Shift (Rp)', totalAllMethods]),
+      '',
+      row(['RINCIAN PENERIMAAN PER METODE PEMBAYARAN']),
+      row(['Metode Pembayaran', 'Jumlah Transaksi', 'Total Nominal (Rp)']),
+      row(['Tunai (Cash)', cashCount, cashTotal]),
+      row(['QRIS BCA', qrisCount, qrisTotal]),
+      row(['Kartu Kredit / EDC BCA', edcCount, edcTotal]),
+      row(['Transfer Bank BCA', transferCount, transferTotal]),
+      row(['Piutang / Kasbon', piutangCount, piutangTotal]),
+      ...(otherTxs.length > 0 ? [row(['Metode Pembayaran Lainnya', otherTxs.length, otherTotal])] : []),
+      row(['TOTAL KESELURUHAN', shiftTx.length, totalAllMethods]),
+      '',
+      row(['REKONSILIASI KAS LACI (CASH DRAWER AUDIT)']),
+      row(['Komponen Rekonsiliasi', 'Nominal (Rp)', 'Keterangan']),
+      row(['Modal Awal Laci (Opening Float)', openingCashFloat, 'Kas awal shift']),
+      row(['Penerimaan Tunai Shift', cashTotal, `${cashCount} transaksi tunai`]),
+      row(['Target Kas di Laci (Expected Cash)', expectedCashInDrawer, 'Modal Awal + Penerimaan Tunai']),
+      row(['Hitungan Kas Fisik Aktual (Counted Cash)', parsedPhysicalCash, 'Input fisik petugas']),
+      row(['Selisih Kas (Discrepancy)', cashDiscrepancy, discrepancyStatus]),
+      '',
+      row(['DETAIL TRANSAKSI DALAM SHIFT']),
+      row([
+        'No',
+        'No. Invoice',
+        'Waktu Transaksi',
+        'Kasir',
+        'Pelanggan',
+        'Metode Pembayaran',
+        'Status Pembayaran',
+        'Subtotal (Rp)',
+        'Diskon Member (Rp)',
+        'Diskon Poin (Rp)',
+        'Total Akhir (Rp)',
+        'Jumlah Item',
+      ]),
+      ...shiftTx.map((tx, idx) =>
+        row([
+          idx + 1,
+          tx.invoiceNumber,
+          formatDateTime(tx.timestamp),
+          tx.cashierName || currentUser.name,
+          tx.customerName || 'Pelanggan Umum',
+          tx.paymentMethod,
+          tx.paymentStatus,
+          tx.subtotal,
+          tx.membershipDiscountAmount || tx.discount || 0,
+          tx.pointsDiscountAmount || 0,
+          tx.finalAmount,
+          (tx.items || []).reduce((sum, it) => sum + (it.quantity || 0), 0),
+        ])
+      ),
+    ];
+
+    const csvContent = '\uFEFF' + csvLines.join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const safeUserName = currentUser.name.replace(/[^a-zA-Z0-9_-]+/g, '_');
+    link.href = url;
+    link.download = `shift-summary-${safeUserName}-${dateStamp}-${timeStamp}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    setCsvExportedNotice(true);
+    setTimeout(() => setCsvExportedNotice(false), 3000);
   };
 
   const handleCloseShiftWithAudit = () => {
@@ -428,8 +542,27 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-2 shrink-0">
-          <div className="flex items-center gap-1.5 w-full sm:w-auto">
+        <div className="pt-3 border-t border-slate-100 flex flex-col gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 w-full">
+            <button
+              type="button"
+              onClick={exportShiftSummaryCsv}
+              className="flex-1 sm:flex-none py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+              title="Ekspor ringkasan & detail transaksi shift ke file CSV untuk rekonsiliasi keuangan"
+            >
+              {csvExportedNotice ? (
+                <>
+                  <CheckCircle className="w-3.5 h-3.5 text-white" />
+                  <span>CSV Tersimpan</span>
+                </>
+              ) : (
+                <>
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-100" />
+                  <span>Ekspor CSV</span>
+                </>
+              )}
+            </button>
+
             <button
               type="button"
               onClick={() => generateShiftAuditPdf(printerPaperSize)}
@@ -437,7 +570,7 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
               title={`Unduh Laporan Audit Format Thermal ${printerPaperSize}`}
             >
               <FileDown className="w-3.5 h-3.5 text-sky-400" />
-              <span>Unduh PDF Audit ({printerPaperSize})</span>
+              <span>PDF Audit ({printerPaperSize})</span>
             </button>
 
             <button
@@ -450,14 +583,14 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
               title="Cetak lewat dialog browser"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Cetak Browser</span>
+              <span className="hidden sm:inline">Cetak</span>
             </button>
           </div>
 
           <button
             type="button"
             onClick={handleCloseShiftWithAudit}
-            className="w-full sm:w-auto py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+            className="w-full py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer"
           >
             <LogOut className="w-4 h-4" />
             <span>Tutup Kasir &amp; Selesaikan Shift</span>

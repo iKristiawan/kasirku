@@ -72,6 +72,11 @@ class SoundEffects {
     }
   }
 
+  // Alias for playSuccessChime
+  playSuccess() {
+    this.playSuccessChime();
+  }
+
   // Tap button feedback
   playTap() {
     try {

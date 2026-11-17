@@ -23,7 +23,13 @@ import {
   AlertCircle,
   ChevronRight,
   X,
-  Cloud
+  Cloud,
+  CalendarRange,
+  Wrench,
+  PackagePlus,
+  CalendarDays,
+  Wallet,
+  Globe
 } from 'lucide-react';
 import { User, UserRole, StoreSettings, Product } from '../types/pos';
 import { sound } from '../utils/audio';
@@ -37,6 +43,7 @@ interface NavbarProps {
   storeSettings: StoreSettings;
   cartItemCount: number;
   lowStockCount?: number;
+  pendingOnlineOrdersCount?: number;
   activeShiftCount?: number;
   isCurrentUserClockedIn?: boolean;
   products?: Product[];
@@ -52,6 +59,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   storeSettings,
   cartItemCount,
   lowStockCount = 0,
+  pendingOnlineOrdersCount = 0,
   activeShiftCount = 0,
   isCurrentUserClockedIn = false,
   products = [],
@@ -63,7 +71,27 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   // Products approaching or below minimum threshold
   const lowStockAlertItems = React.useMemo(() => {
-    return products.filter((p) => p.stockInBaseUnit <= p.minStockAlert);
+    return products.filter((p) => p.productType !== 'JASA' && p.stockInBaseUnit <= p.minStockAlert);
+  }, [products]);
+
+  // Products expiring within 30 days or already expired (excluding JASA)
+  const expiringAlertItems = React.useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const in30Days = new Date(today);
+    in30Days.setDate(in30Days.getDate() + 30);
+
+    return products.filter((p) => {
+      if (p.productType === 'JASA' || !p.expiryDate) return false;
+      const exp = new Date(p.expiryDate);
+      return exp <= in30Days;
+    });
+  }, [products]);
+
+  const totalAlertCount = lowStockAlertItems.length + expiringAlertItems.length;
+
+  const serviceCount = React.useMemo(() => {
+    return products.filter((p) => p.productType === 'JASA').length;
   }, [products]);
 
   useEffect(() => {
@@ -122,25 +150,61 @@ export const Navbar: React.FC<NavbarProps> = ({
   const canAccessManagement = currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER';
   const canAccessSettings = currentUser.role === 'ADMIN';
 
-  const navItems = [
+  const effectiveLowStockCount = products.length > 0 ? lowStockAlertItems.length : lowStockCount;
+  const hasCriticalZeroStock = React.useMemo(
+    () => lowStockAlertItems.some((p) => p.stockInBaseUnit <= 0),
+    [lowStockAlertItems]
+  );
+
+  const navItems: Array<{
+    id: string;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+    badge?: string | number | null;
+    lowStockBadge?: number | null;
+    iconLowStockCount?: number | null;
+    allowed: boolean;
+  }> = [
     {
       id: 'pos',
       label: 'Kasir',
       icon: ShoppingCart,
       badge: cartItemCount > 0 ? cartItemCount : null,
+      lowStockBadge: effectiveLowStockCount > 0 ? effectiveLowStockCount : null,
+      allowed: true,
+    },
+    {
+      id: 'online-orders',
+      label: 'Toko Online',
+      icon: Globe,
+      badge: pendingOnlineOrdersCount > 0 ? pendingOnlineOrdersCount : null,
       allowed: true,
     },
     {
       id: 'products',
       label: 'Barang',
       icon: Package,
+      iconLowStockCount: effectiveLowStockCount > 0 ? effectiveLowStockCount : null,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'services',
+      label: 'Jasa',
+      icon: Wrench,
+      badge: serviceCount > 0 ? serviceCount : null,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'purchases',
+      label: 'Pembelian',
+      icon: PackagePlus,
       allowed: canAccessManagement,
     },
     {
       id: 'stock-report',
       label: 'Laporan Stok',
       icon: BarChart3,
-      badge: lowStockCount > 0 ? `${lowStockCount} Menipis` : null,
+      badge: effectiveLowStockCount > 0 ? `${effectiveLowStockCount} Menipis` : null,
       allowed: canAccessManagement,
     },
     {
@@ -178,6 +242,24 @@ export const Navbar: React.FC<NavbarProps> = ({
       id: 'profit-loss',
       label: 'Laba Rugi',
       icon: TrendingUp,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'finance',
+      label: 'Keuangan',
+      icon: Wallet,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'sales-dashboard',
+      label: 'Dashboard Sales',
+      icon: BarChart3,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'monthly-sales',
+      label: 'Laporan Bulanan',
+      icon: CalendarRange,
       allowed: canAccessManagement,
     },
     {
@@ -221,17 +303,51 @@ export const Navbar: React.FC<NavbarProps> = ({
                   sound.playTap();
                   setActiveTab(item.id);
                 }}
+                title={
+                  item.iconLowStockCount
+                    ? `${item.iconLowStockCount} produk telah mencapai atau di bawah batas stok minimum`
+                    : undefined
+                }
+                aria-label={
+                  item.iconLowStockCount
+                    ? `${item.label} (${item.iconLowStockCount} produk mencapai batas stok minimum)`
+                    : item.label
+                }
                 className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs md:text-sm font-semibold transition-all whitespace-nowrap relative ${
                   isActive
                     ? 'bg-sky-600 text-white shadow-md shadow-sky-600/30 font-bold'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
               >
-                <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-slate-400'}`} />
+                <span className="relative inline-flex items-center justify-center shrink-0">
+                  <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-slate-400'}`} />
+                  {item.iconLowStockCount && item.iconLowStockCount > 0 && (
+                    <>
+                      {hasCriticalZeroStock && (
+                        <span className="absolute -top-1.5 -right-2 min-w-[16px] h-4 rounded-full bg-rose-400 animate-ping opacity-75 pointer-events-none" />
+                      )}
+                      <span
+                        data-testid="navbar-products-low-stock-badge"
+                        className="absolute -top-1.5 -right-2 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white text-[9px] font-black font-mono leading-none flex items-center justify-center border-[1.5px] border-slate-900 shadow-sm tabular-nums"
+                      >
+                        {item.iconLowStockCount > 99 ? '99+' : item.iconLowStockCount}
+                      </span>
+                    </>
+                  )}
+                </span>
                 <span>{item.label}</span>
                 {item.badge && (
                   <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-400 text-slate-900 ml-0.5">
                     {item.badge}
+                  </span>
+                )}
+                {item.lowStockBadge && (
+                  <span
+                    title={`${item.lowStockBadge} produk dengan stok di bawah/pada ambang batas minimum`}
+                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-black bg-rose-500 text-white shadow-xs ml-0.5"
+                  >
+                    <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
+                    <span>{item.lowStockBadge}</span>
                   </span>
                 )}
               </button>
@@ -244,32 +360,38 @@ export const Navbar: React.FC<NavbarProps> = ({
           {/* Cloud Sync Status Indicator */}
           <div 
             title={
-              cloudSyncStatus === 'SYNCED'
+              storeSettings.manualOfflineMode
+                ? 'Mode Local Only (Cloud Sync dijeda — data tetap tersimpan di perangkat)'
+                : cloudSyncStatus === 'SYNCED'
                 ? 'Terhubung ke Database Firebase Firestore (Real-time Multi-Device Sync Aktif)'
                 : cloudSyncStatus === 'CONNECTING'
                 ? 'Menghubungkan ke Cloud Firestore...'
                 : 'Mode Offline (LocalStorage Aktif)'
             }
             className={`hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
-              cloudSyncStatus === 'SYNCED'
+              storeSettings.manualOfflineMode
+                ? 'bg-amber-950/80 border-amber-500/60 text-amber-300'
+                : cloudSyncStatus === 'SYNCED'
                 ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300'
                 : cloudSyncStatus === 'CONNECTING'
                 ? 'bg-sky-950/70 border-sky-500/50 text-sky-300'
                 : 'bg-slate-800 border-slate-700 text-slate-400'
             }`}
           >
-            <Cloud className="w-3.5 h-3.5" />
+            <Cloud className={`w-3.5 h-3.5 ${storeSettings.manualOfflineMode ? 'text-amber-400' : ''}`} />
             <span
               className={`w-1.5 h-1.5 rounded-full ${
-                cloudSyncStatus === 'SYNCED'
+                storeSettings.manualOfflineMode
+                  ? 'bg-amber-400'
+                  : cloudSyncStatus === 'SYNCED'
                   ? 'bg-emerald-400 animate-pulse'
                   : cloudSyncStatus === 'CONNECTING'
                   ? 'bg-sky-400 animate-ping'
                   : 'bg-slate-500'
               }`}
             />
-            <span className="font-mono text-[11px]">
-              {cloudSyncStatus === 'SYNCED' ? 'Cloud Sync' : cloudSyncStatus === 'CONNECTING' ? 'Syncing...' : 'Offline'}
+            <span className="font-mono text-[11px] font-bold">
+              {storeSettings.manualOfflineMode ? 'Local Only' : cloudSyncStatus === 'SYNCED' ? 'Firebase Aktif' : cloudSyncStatus === 'CONNECTING' ? 'Menghubungkan...' : 'Offline'}
             </span>
           </div>
 
@@ -313,18 +435,18 @@ export const Navbar: React.FC<NavbarProps> = ({
                 sound.playTap();
                 setIsNotificationOpen(!isNotificationOpen);
               }}
-              title="Pusat Peringatan Stok Kritis"
+              title="Pusat Peringatan Stok & Kadaluarsa"
               className={`p-2 rounded-lg border transition-all relative cursor-pointer ${
-                lowStockAlertItems.length > 0
+                totalAlertCount > 0
                   ? 'bg-amber-950/70 border-amber-500/70 text-amber-300 hover:bg-amber-900/90 shadow-md shadow-amber-500/20'
                   : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
               }`}
             >
               <Bell className="w-4 h-4" />
-              {lowStockAlertItems.length > 0 && (
+              {totalAlertCount > 0 && (
                 <>
                   <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 text-white text-[9px] font-black rounded-full flex items-center justify-center shadow-xs">
-                    {lowStockAlertItems.length > 9 ? '9+' : lowStockAlertItems.length}
+                    {totalAlertCount > 9 ? '9+' : totalAlertCount}
                   </span>
                   <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-400 rounded-full animate-ping opacity-75" />
                 </>
@@ -345,9 +467,9 @@ export const Navbar: React.FC<NavbarProps> = ({
                         <AlertTriangle className="w-4 h-4" />
                       </div>
                       <div>
-                        <h4 className="text-xs font-bold leading-tight">Pusat Notifikasi Stok</h4>
+                        <h4 className="text-xs font-bold leading-tight">Pusat Notifikasi Toko</h4>
                         <p className="text-[10px] text-slate-400">
-                          {lowStockAlertItems.length} produk mendekati atau di bawah batas minimum
+                          {lowStockAlertItems.length} stok kritis · {expiringAlertItems.length} mendekati/expired
                         </p>
                       </div>
                     </div>
@@ -359,48 +481,93 @@ export const Navbar: React.FC<NavbarProps> = ({
                     </button>
                   </div>
 
-                  <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 p-1">
-                    {lowStockAlertItems.length === 0 ? (
+                  <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 p-1">
+                    {/* Expiring section if any */}
+                    {expiringAlertItems.length > 0 && (
+                      <div className="p-2 bg-rose-50/60 rounded-xl mb-1">
+                        <div className="text-[11px] font-bold text-rose-800 flex items-center gap-1.5 mb-1.5">
+                          <CalendarDays className="w-3.5 h-3.5 text-rose-600" />
+                          <span>Peringatan Kadaluarsa ({expiringAlertItems.length})</span>
+                        </div>
+                        <div className="space-y-1">
+                          {expiringAlertItems.map((prod) => {
+                            const expDate = new Date(prod.expiryDate!);
+                            const today = new Date();
+                            today.setHours(0, 0, 0, 0);
+                            const isExpired = expDate < today;
+                            const diffDays = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+                            return (
+                              <div key={`exp-${prod.id}`} className="p-2 bg-white rounded-lg border border-rose-100 flex items-center justify-between gap-2 shadow-2xs">
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-bold text-slate-900 truncate">{prod.name}</p>
+                                  <p className="text-[10px] text-slate-500 font-mono">
+                                    Exp: {prod.expiryDate} {isExpired ? '(LEWAT)' : `(sisa ${diffDays} hari)`}
+                                  </p>
+                                </div>
+                                <span className={`px-2 py-0.5 rounded text-[9px] font-black shrink-0 ${
+                                  isExpired ? 'bg-rose-600 text-white' : 'bg-amber-100 text-amber-800'
+                                }`}>
+                                  {isExpired ? 'KADALUARSA' : `${diffDays} HARI`}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Low stock section */}
+                    {lowStockAlertItems.length > 0 && (
+                      <div className="p-2">
+                        <div className="text-[11px] font-bold text-slate-700 flex items-center gap-1.5 mb-1.5 px-1">
+                          <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Stok Menipis / Habis ({lowStockAlertItems.length})</span>
+                        </div>
+                        <div className="space-y-1">
+                          {lowStockAlertItems.map((prod) => {
+                            const isZero = prod.stockInBaseUnit <= 0;
+                            return (
+                              <div
+                                key={prod.id}
+                                className="p-2 hover:bg-slate-50 rounded-lg transition-colors flex items-center justify-between gap-2"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className={`w-2 h-2 rounded-full shrink-0 ${isZero ? 'bg-rose-500 animate-ping' : 'bg-amber-500 animate-pulse'}`} />
+                                    <span className="font-bold text-xs text-slate-900 truncate">
+                                      {prod.name}
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 mt-0.5 flex items-center gap-1.5 font-mono">
+                                    <span>{prod.category}</span>
+                                    <span>·</span>
+                                    <span className={isZero ? 'text-rose-600 font-bold' : 'text-amber-700 font-bold'}>
+                                      Sisa: {prod.stockInBaseUnit} / Min: {prod.minStockAlert} {prod.baseUnit}
+                                    </span>
+                                  </div>
+                                </div>
+                                <span className={`px-2 py-0.5 rounded text-[9px] font-black shrink-0 ${
+                                  isZero ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-800'
+                                }`}>
+                                  {isZero ? 'HABIS' : 'MENIPIS'}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {totalAlertCount === 0 && (
                       <div className="p-6 text-center text-slate-500">
                         <ShieldCheck className="w-8 h-8 text-emerald-500 mx-auto mb-1.5" />
-                        <p className="text-xs font-bold text-slate-800">Semua Stok Berada di Batas Aman</p>
-                        <p className="text-[11px] text-slate-400 mt-0.5">Tidak ada produk yang mendekati ambang minimum.</p>
+                        <p className="text-xs font-bold text-slate-800">Semua Stok Aman & Terkendali</p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">Tidak ada stok kritis atau mendekati kadaluarsa.</p>
                       </div>
-                    ) : (
-                      lowStockAlertItems.map((prod) => {
-                        const isZero = prod.stockInBaseUnit <= 0;
-                        return (
-                          <div
-                            key={prod.id}
-                            className="p-2.5 hover:bg-slate-50 rounded-xl transition-colors flex items-center justify-between gap-2"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-1.5">
-                                <span className={`w-2 h-2 rounded-full shrink-0 ${isZero ? 'bg-rose-500 animate-ping' : 'bg-amber-500 animate-pulse'}`} />
-                                <span className="font-bold text-xs text-slate-900 truncate">
-                                  {prod.name}
-                                </span>
-                              </div>
-                              <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-2 font-mono">
-                                <span>{prod.category}</span>
-                                <span>·</span>
-                                <span className={isZero ? 'text-rose-600 font-bold' : 'text-amber-700 font-bold'}>
-                                  Sisa: {prod.stockInBaseUnit} / Min: {prod.minStockAlert} {prod.baseUnit}
-                                </span>
-                              </div>
-                            </div>
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-black shrink-0 ${
-                              isZero ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-800'
-                            }`}>
-                              {isZero ? 'HABIS' : 'MENIPIS'}
-                            </span>
-                          </div>
-                        );
-                      })
                     )}
                   </div>
 
-                  {lowStockAlertItems.length > 0 && (
+                  {totalAlertCount > 0 && (
                     <div className="p-2 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
                       <button
                         onClick={() => {
@@ -410,7 +577,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                         }}
                         className="w-full py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl flex items-center justify-center gap-1 shadow-xs cursor-pointer"
                       >
-                        <span>Buka Laporan Stok & Forecasting</span>
+                        <span>Buka Laporan Stok & Kadaluarsa</span>
                         <ChevronRight className="w-3.5 h-3.5" />
                       </button>
                     </div>

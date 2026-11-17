@@ -35,6 +35,7 @@ import {
 import { Transaction, Product } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateOnly } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import { getItemFifoCogs } from '../utils/fifoUtils';
 
 interface SalesChartViewProps {
   transactions: Transaction[];
@@ -103,8 +104,7 @@ export const SalesChartView: React.FC<SalesChartViewProps> = ({
         let txCOGS = 0;
         tx.items.forEach((item) => {
           const prod = productMap.get(item.productId);
-          const itemCost = item.costPrice ?? (prod?.costPrice || 0);
-          txCOGS += item.quantity * item.conversionFactor * itemCost;
+          txCOGS += getItemFifoCogs(item, prod);
         });
 
         existing.cogs += txCOGS;
@@ -135,8 +135,7 @@ export const SalesChartView: React.FC<SalesChartViewProps> = ({
         let txCOGS = 0;
         tx.items.forEach((item) => {
           const prod = productMap.get(item.productId);
-          const itemCost = item.costPrice ?? (prod?.costPrice || 0);
-          txCOGS += item.quantity * item.conversionFactor * itemCost;
+          txCOGS += getItemFifoCogs(item, prod);
         });
 
         targetWeek.cogs += txCOGS;
