@@ -31,8 +31,10 @@ import {
   Wallet,
   Globe
 } from 'lucide-react';
-import { User, UserRole, StoreSettings, Product } from '../types/pos';
+import { User, UserRole, StoreSettings, Product, Transaction, Customer } from '../types/pos';
 import { sound } from '../utils/audio';
+import { formatRupiah } from '../utils/formatters';
+import { getUpcomingDuePiutangEntries } from './PiutangDueAlertBanner';
 
 interface NavbarProps {
   currentUser: User;
@@ -47,6 +49,8 @@ interface NavbarProps {
   activeShiftCount?: number;
   isCurrentUserClockedIn?: boolean;
   products?: Product[];
+  transactions?: Transaction[];
+  customers?: Customer[];
   cloudSyncStatus?: 'SYNCED' | 'CONNECTING' | 'OFFLINE';
 }
 
@@ -63,6 +67,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeShiftCount = 0,
   isCurrentUserClockedIn = false,
   products = [],
+  transactions = [],
+  customers = [],
   cloudSyncStatus = 'SYNCED',
 }) => {
   const [time, setTime] = useState<string>('');
@@ -88,7 +94,25 @@ export const Navbar: React.FC<NavbarProps> = ({
     });
   }, [products]);
 
-  const totalAlertCount = lowStockAlertItems.length + expiringAlertItems.length;
+  const piutangAlertOverview = React.useMemo(
+    () =>
+      getUpcomingDuePiutangEntries({
+        transactions,
+        customers,
+        storeName: storeSettings.storeName,
+        bcaAccountNumber: storeSettings.bcaAccountNumber,
+        bcaAccountName: storeSettings.bcaAccountName,
+      }),
+    [transactions, customers, storeSettings.storeName, storeSettings.bcaAccountNumber, storeSettings.bcaAccountName]
+  );
+
+  const urgentPiutangItems = React.useMemo(
+    () => [...piutangAlertOverview.upcoming3Days, ...piutangAlertOverview.overdue],
+    [piutangAlertOverview]
+  );
+
+  const totalAlertCount =
+    lowStockAlertItems.length + expiringAlertItems.length + urgentPiutangItems.length;
 
   const serviceCount = React.useMemo(() => {
     return products.filter((p) => p.productType === 'JASA').length;
@@ -223,6 +247,10 @@ export const Navbar: React.FC<NavbarProps> = ({
       id: 'piutang',
       label: 'Piutang',
       icon: CreditCard,
+      badge:
+        urgentPiutangItems.length > 0
+          ? `${urgentPiutangItems.length} Tempo`
+          : null,
       allowed: canAccessManagement,
     },
     {
@@ -469,7 +497,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                       <div>
                         <h4 className="text-xs font-bold leading-tight">Pusat Notifikasi Toko</h4>
                         <p className="text-[10px] text-slate-400">
-                          {lowStockAlertItems.length} stok kritis · {expiringAlertItems.length} mendekati/expired
+                          {urgentPiutangItems.length} piutang tempo · {lowStockAlertItems.length} stok kritis · {expiringAlertItems.length} expired
                         </p>
                       </div>
                     </div>
@@ -482,6 +510,57 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </div>
 
                   <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 p-1">
+                    {/* Urgent Piutang due in <= 3 days / overdue */}
+                    {urgentPiutangItems.length > 0 && (
+                      <div className="p-2 bg-amber-50/70 rounded-xl mb-1">
+                        <div className="text-[11px] font-bold text-amber-900 flex items-center justify-between gap-1.5 mb-1.5">
+                          <span className="flex items-center gap-1.5">
+                            <CreditCard className="w-3.5 h-3.5 text-amber-600" />
+                            <span>Piutang Jatuh Tempo ({urgentPiutangItems.length})</span>
+                          </span>
+                          {canAccessManagement && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setIsNotificationOpen(false);
+                                setActiveTab('sales-dashboard');
+                              }}
+                              className="text-[10px] font-bold text-sky-700 hover:underline cursor-pointer"
+                            >
+                              Buka Dashboard
+                            </button>
+                          )}
+                        </div>
+                        <div className="space-y-1">
+                          {urgentPiutangItems.slice(0, 5).map((entry) => (
+                            <div
+                              key={`piutang-${entry.transaction.id}`}
+                              className="p-2 bg-white rounded-lg border border-amber-200 flex items-center justify-between gap-2 shadow-2xs"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-bold text-slate-900 truncate">
+                                  {entry.customerName}
+                                </p>
+                                <p className="text-[10px] text-slate-500 font-mono">
+                                  {entry.urgencyLabel} · {formatRupiah(entry.transaction.finalAmount)}
+                                </p>
+                              </div>
+                              <a
+                                href={entry.waUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={() => sound.playTap()}
+                                className="px-2 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[9.5px] font-bold whitespace-nowrap shrink-0"
+                              >
+                                Kirim WA
+                              </a>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Expiring section if any */}
                     {expiringAlertItems.length > 0 && (
                       <div className="p-2 bg-rose-50/60 rounded-xl mb-1">

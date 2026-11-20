@@ -73,6 +73,13 @@ import {
   CategorySalesGoal,
   LowStockReportScheduleConfig,
   LowStockScheduleFrequency,
+  CashflowRecord,
+  DailySalesReportScheduleConfig,
+  DailySalesScheduleIntervalMode,
+  RestockOrder,
+  CustomerCategoryItem,
+  OnlineOrder,
+  EmployeeActivityLog,
 } from '../types/pos';
 import {
   DEFAULT_PAYMENT_METHODS,
@@ -114,6 +121,16 @@ import {
   collectLowStockHitsFromProducts,
   buildScheduledLowStockWhatsAppMessage,
 } from '../utils/adminLowStockAlert';
+import {
+  DEFAULT_DAILY_SALES_SCHEDULE,
+  normalizeDailySalesSchedule,
+  loadScheduledDailySalesDispatch,
+  resetScheduledDailySalesDispatch,
+  getNextDailySalesDispatchInfo,
+  formatDailySalesScheduleSummaryLabel,
+  computeTodaySalesClosingSummary,
+  buildDailySalesClosingWhatsAppMessage,
+} from '../utils/adminDailySalesAlert';
 
 const PRESET_LOGOS = [
   {
@@ -138,15 +155,21 @@ interface SettingsViewProps {
   users: User[];
   products: Product[];
   categories?: ProductCategory[];
+  customerCategories?: CustomerCategoryItem[];
   customers: Customer[];
   suppliers: Supplier[];
+  purchases?: RestockOrder[];
   transactions: Transaction[];
+  cashflows?: CashflowRecord[];
   attendances?: AttendanceRecord[];
   stockOpnames?: StockOpnameRecord[];
+  onlineOrders?: OnlineOrder[];
+  activityLogs?: EmployeeActivityLog[];
+  currentUserRole?: UserRole;
   onUpdateStoreSettings: (settings: StoreSettings) => void;
   onUpdateUsers: (users: User[]) => void;
   onResetToDemoData: () => void;
-  onRestoreBackup: (backup: BackupPayload) => void;
+  onRestoreBackup: (backup: BackupPayload) => Promise<void> | void;
   onClearDatabaseExceptUsers?: () => Promise<void> | void;
 }
 
@@ -155,17 +178,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   users,
   products,
   categories = [],
+  customerCategories = [],
   customers,
   suppliers,
+  purchases = [],
   transactions,
+  cashflows = [],
   attendances = [],
   stockOpnames = [],
+  onlineOrders = [],
+  activityLogs = [],
+  currentUserRole = 'ADMIN',
   onUpdateStoreSettings,
   onUpdateUsers,
   onResetToDemoData,
   onRestoreBackup,
   onClearDatabaseExceptUsers,
 }) => {
+  const isAdminUser = currentUserRole === 'ADMIN';
   const [formSettings, setFormSettings] = useState<StoreSettings>({
     ...storeSettings,
     dailySalesGoal: storeSettings.dailySalesGoal ?? 5000000,
@@ -185,6 +215,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       storeSettings.customLowStockWhatsAppTemplate || DEFAULT_LOW_STOCK_WHATSAPP_TEMPLATE,
     scheduledAdminLowStockWhatsApp: normalizeLowStockSchedule(
       storeSettings.scheduledAdminLowStockWhatsApp || DEFAULT_LOW_STOCK_SCHEDULE
+    ),
+    scheduledDailySalesReportWhatsApp: normalizeDailySalesSchedule(
+      storeSettings.scheduledDailySalesReportWhatsApp || DEFAULT_DAILY_SALES_SCHEDULE
     ),
     printerConnectionType: storeSettings.printerConnectionType || 'BLUETOOTH',
     printerPaperWidth: storeSettings.printerPaperWidth || '58mm',
@@ -207,6 +240,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [dailyLowStockLedger, setDailyLowStockLedger] = useState(() => loadDailyLowStockLedger());
   const [scheduledDispatchState, setScheduledDispatchState] = useState(() =>
     loadScheduledLowStockDispatch()
+  );
+  const [scheduledDailySalesDispatchState, setScheduledDailySalesDispatchState] = useState(() =>
+    loadScheduledDailySalesDispatch()
   );
   const [lowStockPreviewTab, setLowStockPreviewTab] = useState<'THRESHOLD' | 'SCHEDULED'>(
     storeSettings.scheduledAdminLowStockWhatsApp?.enabled ? 'SCHEDULED' : 'THRESHOLD'
@@ -312,6 +348,40 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       return {
         ...prev,
         scheduledAdminLowStockWhatsApp: {
+          ...current,
+          daysOfWeek: nextDays,
+        },
+      };
+    });
+  };
+
+  const updateDailySalesSchedule = (patch: Partial<DailySalesReportScheduleConfig>) => {
+    setFormSettings((prev) => {
+      const current = normalizeDailySalesSchedule(prev.scheduledDailySalesReportWhatsApp);
+      return {
+        ...prev,
+        scheduledDailySalesReportWhatsApp: normalizeDailySalesSchedule({
+          ...current,
+          ...patch,
+        }),
+      };
+    });
+  };
+
+  const handleToggleDailySalesDay = (dayIndex: number) => {
+    sound.playTap();
+    setFormSettings((prev) => {
+      const current = normalizeDailySalesSchedule(prev.scheduledDailySalesReportWhatsApp);
+      const exists = current.daysOfWeek.includes(dayIndex);
+      if (exists && current.daysOfWeek.length <= 1) {
+        return prev;
+      }
+      const nextDays = exists
+        ? current.daysOfWeek.filter((d) => d !== dayIndex)
+        : [...current.daysOfWeek, dayIndex].sort((a, b) => a - b);
+      return {
+        ...prev,
+        scheduledDailySalesReportWhatsApp: {
           ...current,
           daysOfWeek: nextDays,
         },
@@ -430,6 +500,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [backupNotice, setBackupNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [importCandidate, setImportCandidate] = useState<BackupPayload | null>(null);
   const [restoreUsersOption, setRestoreUsersOption] = useState<boolean>(true);
+  const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
   const importFileInputRef = useRef<HTMLInputElement>(null);
 
   // Custom Payment Methods & Static QRIS JPG state
@@ -712,6 +783,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       scheduledAdminLowStockWhatsApp: normalizeLowStockSchedule(
         formSettings.scheduledAdminLowStockWhatsApp
       ),
+      scheduledDailySalesReportWhatsApp: normalizeDailySalesSchedule(
+        formSettings.scheduledDailySalesReportWhatsApp
+      ),
       printerConnectionType: formSettings.printerConnectionType || 'BLUETOOTH',
       printerPaperWidth: formSettings.printerPaperWidth || '58mm',
       printerDeviceName: formSettings.printerDeviceName?.trim() || '',
@@ -981,41 +1055,76 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   // =========================================================================
   // BACKUP & RESTORE HANDLERS
   // =========================================================================
-  const handleExportBackup = () => {
-    sound.playTap();
+  const buildFullBackupPayload = (fileNamePrefix: string): {
+    fileName: string;
+    payload: BackupPayload;
+    dateFormatted: string;
+  } => {
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, '0');
     const dateStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-    const fileName = `backup-kasirku-${dateStr}-${timeStr}.json`;
+    const fileName = `${fileNamePrefix}-${dateStr}-${timeStr}.json`;
 
     const payload: BackupPayload = {
       app: 'Kasir Toko Tablet POS',
-      version: '1.0',
+      version: '2.0',
       exportedAt: now.toISOString(),
       timestamp: now.getTime(),
       stats: {
         productCount: products.length,
         customerCount: customers.length,
         supplierCount: suppliers.length,
+        purchaseCount: purchases.length,
         transactionCount: transactions.length,
+        cashflowCount: cashflows.length,
         attendanceCount: attendances.length,
         userCount: userList.length,
         categoryCount: categories.length,
+        customerCategoryCount: customerCategories.length,
         stockOpnameCount: stockOpnames.length,
+        onlineOrderCount: onlineOrders.length,
+        activityLogCount: activityLogs.length,
       },
       data: {
         products,
+        categories,
+        customerCategories,
         customers,
         suppliers,
+        purchases,
         transactions,
+        cashflows,
         attendances,
-        storeSettings: formSettings,
-        users: userList,
-        categories,
         stockOpnames,
+        onlineOrders,
+        activityLogs,
+        storeSettings: {
+          ...formSettings,
+          customPaymentMethods: paymentMethods,
+        },
+        users: userList,
       },
     };
+
+    return {
+      fileName,
+      payload,
+      dateFormatted: now.toLocaleString('id-ID', { dateStyle: 'full', timeStyle: 'short' }),
+    };
+  };
+
+  const handleExportBackup = () => {
+    if (!isAdminUser) {
+      sound.playError();
+      setBackupNotice({
+        type: 'error',
+        message: 'Akses ditolak: Hanya akun dengan peran Admin yang dapat mengunduh arsip backup data.',
+      });
+      return;
+    }
+    sound.playTap();
+    const { fileName, payload } = buildFullBackupPayload('backup-kasirku');
 
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -1030,7 +1139,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     sound.playSuccessChime();
     setBackupNotice({
       type: 'success',
-      message: `File cadangan "${fileName}" berhasil diunduh. Berisi ${products.length} produk, ${customers.length} pelanggan, ${suppliers.length} supplier, ${transactions.length} transaksi, ${attendances.length} absensi, dan ${stockOpnames.length} riwayat Stock Opname.`,
+      message: `Backup database "${fileName}" berhasil diunduh (${products.length} produk, ${customers.length} pelanggan, ${suppliers.length} supplier, ${purchases.length} PO pembelian, ${transactions.length} transaksi, ${cashflows.length} cashflow, ${stockOpnames.length} stock opname, dan ${onlineOrders.length} pesanan online).`,
     });
     setTimeout(() => setBackupNotice(null), 6000);
   };
@@ -1059,39 +1168,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   });
 
   const createBackupPayloadObject = () => {
+    const { payload, dateFormatted } = buildFullBackupPayload('kasirku-backup-mingguan');
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, '0');
     const dateStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const fileName = `kasirku-backup-mingguan-${dateStr}.json`;
-
-    const payload: BackupPayload = {
-      app: 'Kasir Toko Tablet POS',
-      version: '1.0',
-      exportedAt: now.toISOString(),
-      timestamp: now.getTime(),
-      stats: {
-        productCount: products.length,
-        customerCount: customers.length,
-        supplierCount: suppliers.length,
-        transactionCount: transactions.length,
-        attendanceCount: attendances.length,
-        userCount: userList.length,
-        categoryCount: categories.length,
-        stockOpnameCount: stockOpnames.length,
-      },
-      data: {
-        products,
-        customers,
-        suppliers,
-        transactions,
-        attendances,
-        storeSettings: formSettings,
-        users: userList,
-        categories,
-        stockOpnames,
-      },
-    };
-    return { fileName, payload, dateFormatted: now.toLocaleString('id-ID', { dateStyle: 'full', timeStyle: 'short' }) };
+    return { fileName, payload, dateFormatted };
   };
 
   const handleGenerateSundayBackup = (manual = false) => {
@@ -1173,6 +1255,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   }, [autoSundayBackupEnabled]);
 
   const handleImportFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!isAdminUser) {
+      sound.playError();
+      setBackupNotice({
+        type: 'error',
+        message: 'Akses ditolak: Hanya Admin yang dapat mengunggah dan memulihkan data dari file backup.',
+      });
+      e.target.value = '';
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -1184,56 +1275,90 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         const parsed = JSON.parse(text);
 
         // Normalize format: support standard BackupPayload or direct object
-        const rawData = parsed.data || parsed;
-        const candidateProducts = Array.isArray(rawData.products) ? rawData.products : [];
-        const candidateCustomers = Array.isArray(rawData.customers) ? rawData.customers : [];
-        const candidateSuppliers = Array.isArray(rawData.suppliers) ? rawData.suppliers : [];
-        const candidateTransactions = Array.isArray(rawData.transactions) ? rawData.transactions : [];
-        const candidateAttendances = Array.isArray(rawData.attendances) ? rawData.attendances : [];
-        const candidateStockOpnames = Array.isArray(rawData.stockOpnames) ? rawData.stockOpnames : [];
-        const candidateSettings = rawData.storeSettings || formSettings;
-        const candidateUsers = Array.isArray(rawData.users) ? rawData.users : undefined;
-        const candidateCategories = Array.isArray(rawData.categories) ? rawData.categories : undefined;
+        const rawData = parsed && typeof parsed === 'object' ? (parsed.data || parsed) : null;
+        if (!rawData || typeof rawData !== 'object') {
+          throw new Error('Struktur JSON tidak valid.');
+        }
 
-        if (
-          candidateProducts.length === 0 &&
-          candidateCustomers.length === 0 &&
-          candidateTransactions.length === 0
-        ) {
+        const hasRecognizedCollection = [
+          'products',
+          'customers',
+          'suppliers',
+          'purchases',
+          'transactions',
+          'cashflows',
+          'attendances',
+          'stockOpnames',
+          'categories',
+          'customerCategories',
+          'onlineOrders',
+          'activityLogs',
+          'users',
+        ].some((key) => Array.isArray(rawData[key]));
+        const hasSettings = Boolean(rawData.storeSettings && typeof rawData.storeSettings === 'object');
+
+        if (!hasRecognizedCollection && !hasSettings) {
           sound.playError();
           setBackupNotice({
             type: 'error',
-            message: 'File JSON tidak valid atau tidak memiliki data produk/pelanggan/transaksi yang dikenali.',
+            message: 'File JSON tidak dikenali sebagai file backup database aplikasi kasir.',
           });
           setTimeout(() => setBackupNotice(null), 5000);
           return;
         }
 
+        const candidateProducts = Array.isArray(rawData.products) ? rawData.products : [];
+        const candidateCustomers = Array.isArray(rawData.customers) ? rawData.customers : [];
+        const candidateSuppliers = Array.isArray(rawData.suppliers) ? rawData.suppliers : [];
+        const candidatePurchases = Array.isArray(rawData.purchases) ? rawData.purchases : [];
+        const candidateTransactions = Array.isArray(rawData.transactions) ? rawData.transactions : [];
+        const candidateCashflows = Array.isArray(rawData.cashflows) ? rawData.cashflows : [];
+        const candidateAttendances = Array.isArray(rawData.attendances) ? rawData.attendances : [];
+        const candidateStockOpnames = Array.isArray(rawData.stockOpnames) ? rawData.stockOpnames : [];
+        const candidateOnlineOrders = Array.isArray(rawData.onlineOrders) ? rawData.onlineOrders : [];
+        const candidateActivityLogs = Array.isArray(rawData.activityLogs) ? rawData.activityLogs : [];
+        const candidateSettings = hasSettings ? rawData.storeSettings : formSettings;
+        const candidateUsers = Array.isArray(rawData.users) ? rawData.users : undefined;
+        const candidateCategories = Array.isArray(rawData.categories) ? rawData.categories : [];
+        const candidateCustomerCategories = Array.isArray(rawData.customerCategories)
+          ? rawData.customerCategories
+          : customerCategories;
+
         const validPayload: BackupPayload = {
           app: parsed.app || 'Kasir Toko Tablet POS',
-          version: parsed.version || '1.0',
+          version: parsed.version || '2.0',
           exportedAt: parsed.exportedAt || new Date().toISOString(),
           timestamp: parsed.timestamp || Date.now(),
           stats: {
             productCount: candidateProducts.length,
             customerCount: candidateCustomers.length,
             supplierCount: candidateSuppliers.length,
+            purchaseCount: candidatePurchases.length,
             transactionCount: candidateTransactions.length,
+            cashflowCount: candidateCashflows.length,
             attendanceCount: candidateAttendances.length,
             userCount: candidateUsers ? candidateUsers.length : userList.length,
-            categoryCount: candidateCategories ? candidateCategories.length : categories.length,
+            categoryCount: candidateCategories.length,
+            customerCategoryCount: candidateCustomerCategories.length,
             stockOpnameCount: candidateStockOpnames.length,
+            onlineOrderCount: candidateOnlineOrders.length,
+            activityLogCount: candidateActivityLogs.length,
           },
           data: {
             products: candidateProducts,
+            categories: candidateCategories,
+            customerCategories: candidateCustomerCategories,
             customers: candidateCustomers,
             suppliers: candidateSuppliers,
+            purchases: candidatePurchases,
             transactions: candidateTransactions,
+            cashflows: candidateCashflows,
             attendances: candidateAttendances,
+            stockOpnames: candidateStockOpnames,
+            onlineOrders: candidateOnlineOrders,
+            activityLogs: candidateActivityLogs,
             storeSettings: candidateSettings,
             users: candidateUsers,
-            categories: candidateCategories,
-            stockOpnames: candidateStockOpnames,
           },
         };
 
@@ -1251,34 +1376,61 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     e.target.value = '';
   };
 
-  const handleConfirmRestore = () => {
-    if (!importCandidate) return;
+  const handleConfirmRestore = async () => {
+    if (!importCandidate || isRestoringBackup) return;
 
-    sound.playSuccessChime();
-    const payloadToRestore: BackupPayload = {
-      ...importCandidate,
-      data: {
-        ...importCandidate.data,
-        users: restoreUsersOption && importCandidate.data.users ? importCandidate.data.users : userList,
-      },
-    };
+    sound.playTap();
+    setIsRestoringBackup(true);
+    try {
+      const payloadToRestore: BackupPayload = {
+        ...importCandidate,
+        data: {
+          ...importCandidate.data,
+          users:
+            restoreUsersOption && importCandidate.data.users && importCandidate.data.users.length > 0
+              ? importCandidate.data.users
+              : userList,
+        },
+      };
 
-    onRestoreBackup(payloadToRestore);
-    setFormSettings({ ...payloadToRestore.data.storeSettings });
-    if (restoreUsersOption && payloadToRestore.data.users && payloadToRestore.data.users.length > 0) {
-      setUserList([...payloadToRestore.data.users]);
+      await onRestoreBackup(payloadToRestore);
+
+      if (payloadToRestore.data.storeSettings) {
+        setFormSettings({ ...payloadToRestore.data.storeSettings });
+        if (
+          Array.isArray(payloadToRestore.data.storeSettings.customPaymentMethods) &&
+          payloadToRestore.data.storeSettings.customPaymentMethods.length > 0
+        ) {
+          setPaymentMethods([...payloadToRestore.data.storeSettings.customPaymentMethods]);
+        }
+      }
+      if (restoreUsersOption && payloadToRestore.data.users && payloadToRestore.data.users.length > 0) {
+        setUserList([...payloadToRestore.data.users]);
+      }
+
+      const prodCount = payloadToRestore.data.products.length;
+      const custCount = payloadToRestore.data.customers.length;
+      const poCount = payloadToRestore.data.purchases?.length || 0;
+      const txCount = payloadToRestore.data.transactions.length;
+      const cfCount = payloadToRestore.data.cashflows?.length || 0;
+
+      sound.playSuccessChime();
+      setImportCandidate(null);
+      setBackupNotice({
+        type: 'success',
+        message: `Restore from Backup berhasil! Seluruh data lama telah diganti (${prodCount} produk, ${custCount} pelanggan, ${poCount} PO pembelian, ${txCount} transaksi, ${cfCount} catatan cashflow).`,
+      });
+      setTimeout(() => setBackupNotice(null), 7000);
+    } catch (err) {
+      sound.playError();
+      setBackupNotice({
+        type: 'error',
+        message: 'Terjadi kendala saat mengganti data di cloud. Periksa koneksi internet Anda lalu coba kembali.',
+      });
+      setTimeout(() => setBackupNotice(null), 6000);
+    } finally {
+      setIsRestoringBackup(false);
     }
-
-    const prodCount = payloadToRestore.data.products.length;
-    const custCount = payloadToRestore.data.customers.length;
-    const txCount = payloadToRestore.data.transactions.length;
-
-    setImportCandidate(null);
-    setBackupNotice({
-      type: 'success',
-      message: `Data berhasil dipulihkan! (${prodCount} produk, ${custCount} pelanggan, ${txCount} riwayat transaksi aktif).`,
-    });
-    setTimeout(() => setBackupNotice(null), 6000);
   };
 
   return (
@@ -3380,6 +3532,406 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
             );
           })()}
 
+          {/* Card 2.2c: Jadwal Laporan Penjualan Harian Otomatis Saat Jam Tutup Toko (WhatsApp Admin) */}
+          {(() => {
+            const closingSchedule = normalizeDailySalesSchedule(
+              formSettings.scheduledDailySalesReportWhatsApp
+            );
+            const todayClosingSummary = computeTodaySalesClosingSummary({
+              transactions,
+              products,
+              cashflows,
+            });
+            const closingPreviewMessage = buildDailySalesClosingWhatsAppMessage({
+              storeName: formSettings.storeName || 'TOKO BERKAH JAYA',
+              summary: todayClosingSummary,
+              schedule: closingSchedule,
+            });
+            const closingTestUrl = buildAdminWhatsAppUrl(
+              formSettings.adminWhatsAppNumber,
+              closingPreviewMessage
+            );
+            const nextClosingInfo = getNextDailySalesDispatchInfo(
+              closingSchedule,
+              new Date(),
+              scheduledDailySalesDispatchState
+            );
+            const DAY_OPTIONS = [
+              { idx: 1, label: 'Sen' },
+              { idx: 2, label: 'Sel' },
+              { idx: 3, label: 'Rab' },
+              { idx: 4, label: 'Kam' },
+              { idx: 5, label: 'Jum' },
+              { idx: 6, label: 'Sab' },
+              { idx: 0, label: 'Min' },
+            ];
+
+            return (
+              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                  <div className="flex items-start gap-2.5">
+                    <div className="p-2 rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-200 shrink-0">
+                      <TrendingUp className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="text-sm font-bold text-slate-900">
+                          Jadwal Laporan Penjualan Harian (Jam Tutup Toko via WhatsApp)
+                        </h3>
+                        <span
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase whitespace-nowrap ${
+                            closingSchedule.enabled
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-slate-100 text-slate-500'
+                          }`}
+                        >
+                          {closingSchedule.enabled
+                            ? formatDailySalesScheduleSummaryLabel(closingSchedule)
+                            : 'Nonaktif'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Kirim rekap otomatis omzet, laba FIFO, metode bayar, dan produk terlaris hari ini ke WhatsApp Admin tepat saat jam tutup toko sesuai interval yang ditentukan.
+                      </p>
+                    </div>
+                  </div>
+
+                  <label className="relative inline-flex items-center cursor-pointer shrink-0 self-start sm:self-auto">
+                    <input
+                      type="checkbox"
+                      checked={closingSchedule.enabled}
+                      onChange={(e) => {
+                        sound.playTap();
+                        updateDailySalesSchedule({ enabled: e.target.checked });
+                      }}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+                  </label>
+                </div>
+
+                {/* Baris 1: Jam Tutup Toko + Interval Mode + Nomor Admin */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+                  {/* Jam Tutup Toko */}
+                  <div className="lg:col-span-4 space-y-2">
+                    <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Jam Tutup Toko (Waktu Kirim)</span>
+                    </label>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <input
+                        type="time"
+                        value={closingSchedule.closingTime}
+                        onChange={(e) => updateDailySalesSchedule({ closingTime: e.target.value })}
+                        className="p-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono font-bold text-slate-900 focus:border-emerald-500 focus:outline-none"
+                      />
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {['17:00', '20:00', '21:00', '22:00'].map((tPreset) => (
+                          <button
+                            key={tPreset}
+                            type="button"
+                            onClick={() => {
+                              sound.playTap();
+                              updateDailySalesSchedule({ closingTime: tPreset });
+                            }}
+                            className={`px-2 py-1.5 rounded-lg text-[10.5px] font-mono font-bold border whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                              closingSchedule.closingTime === tPreset
+                                ? 'bg-emerald-600 text-white border-emerald-600'
+                                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                            }`}
+                          >
+                            {tPreset}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Interval Pengiriman */}
+                  <div className="lg:col-span-5 space-y-2">
+                    <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Interval Pengiriman Laporan</span>
+                    </label>
+                    <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl border border-slate-200">
+                      {(
+                        [
+                          { id: 'DAILY', label: 'Setiap Hari Tutup' },
+                          { id: 'EVERY_N_DAYS', label: 'Setiap N Hari' },
+                          { id: 'DAYS_OF_WEEK', label: 'Hari Pilihan' },
+                        ] as { id: DailySalesScheduleIntervalMode; label: string }[]
+                      ).map((opt) => {
+                        const active = closingSchedule.intervalMode === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => {
+                              sound.playTap();
+                              updateDailySalesSchedule({ intervalMode: opt.id });
+                            }}
+                            className={`px-2 py-2 rounded-lg text-[11px] font-bold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                              active
+                                ? 'bg-white text-slate-900 shadow-2xs'
+                                : 'text-slate-600 hover:text-slate-900'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {closingSchedule.intervalMode === 'EVERY_N_DAYS' && (
+                      <div className="flex items-center gap-2 pt-1">
+                        <span className="text-[11px] font-semibold text-slate-600">
+                          Kirim otomatis setiap:
+                        </span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          value={closingSchedule.intervalDays}
+                          onChange={(e) =>
+                            updateDailySalesSchedule({
+                              intervalDays: Math.min(30, Math.max(1, parseInt(e.target.value, 10) || 1)),
+                            })
+                          }
+                          className="w-16 p-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center text-slate-900 focus:border-emerald-500 focus:outline-none tabular-nums"
+                        />
+                        <span className="text-[11px] font-semibold text-slate-600">
+                          hari sekali saat jam tutup
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Nomor Admin + Ringkasan Hari Ini */}
+                  <div className="lg:col-span-3 space-y-1.5">
+                    <span className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                      <Phone className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Target WA &amp; Omzet Hari Ini</span>
+                    </span>
+                    <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-slate-500">WA Admin</span>
+                        <span className="font-mono font-bold text-slate-900 truncate">
+                          {formSettings.adminWhatsAppNumber?.trim() || 'Belum diisi'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
+                        <span className="text-slate-500">
+                          {formatNumber(todayClosingSummary.transactionCount)} nota
+                        </span>
+                        <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                          {formatRupiah(todayClosingSummary.totalNetRevenue)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Pemilih Hari Pilihan */}
+                {closingSchedule.intervalMode === 'DAYS_OF_WEEK' && (
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-bold text-slate-700 block">
+                      Pilih Hari Operasional Pengiriman Laporan Penutupan
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {DAY_OPTIONS.map((d) => {
+                        const isSelected = closingSchedule.daysOfWeek.includes(d.idx);
+                        return (
+                          <button
+                            key={d.idx}
+                            type="button"
+                            onClick={() => handleToggleDailySalesDay(d.idx)}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-bold border whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                              isSelected
+                                ? 'bg-emerald-600 text-white border-emerald-600 shadow-2xs'
+                                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                            }`}
+                          >
+                            {d.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Komponen Isi Laporan Penjualan Harian */}
+                <div className="space-y-2">
+                  <span className="text-xs font-bold text-slate-700 block">
+                    Komponen Data yang Disertakan di Pesan WhatsApp
+                  </span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                    <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer hover:bg-slate-100/70 transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={closingSchedule.includePaymentBreakdown}
+                        onChange={(e) => {
+                          sound.playTap();
+                          updateDailySalesSchedule({ includePaymentBreakdown: e.target.checked });
+                        }}
+                        className="mt-0.5 w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                      />
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">
+                          Rincian Metode Bayar
+                        </span>
+                        <span className="text-[10.5px] text-slate-500">
+                          Cash, QRIS, Transfer BCA, dan Piutang.
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer hover:bg-slate-100/70 transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={closingSchedule.includeProfitSummary}
+                        onChange={(e) => {
+                          sound.playTap();
+                          updateDailySalesSchedule({ includeProfitSummary: e.target.checked });
+                        }}
+                        className="mt-0.5 w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                      />
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">
+                          Ringkasan HPP &amp; Laba Kotor
+                        </span>
+                        <span className="text-[10.5px] text-slate-500">
+                          HPP FIFO beserta persentase margin kotor.
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer hover:bg-slate-100/70 transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={closingSchedule.includeExpenseSummary}
+                        onChange={(e) => {
+                          sound.playTap();
+                          updateDailySalesSchedule({ includeExpenseSummary: e.target.checked });
+                        }}
+                        className="mt-0.5 w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                      />
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">
+                          Biaya Cashflow &amp; Laba Bersih
+                        </span>
+                        <span className="text-[10.5px] text-slate-500">
+                          Pemasukan/pengeluaran operasional hari ini.
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer hover:bg-slate-100/70 transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={closingSchedule.includeTopProducts}
+                        onChange={(e) => {
+                          sound.playTap();
+                          updateDailySalesSchedule({ includeTopProducts: e.target.checked });
+                        }}
+                        className="mt-0.5 w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                      />
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">
+                          5 Produk Terlaris Hari Ini
+                        </span>
+                        <span className="text-[10.5px] text-slate-500">
+                          Ranking qty &amp; omzet produk teratas.
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer hover:bg-slate-100/70 transition-colors sm:col-span-2">
+                      <input
+                        type="checkbox"
+                        checked={closingSchedule.sendOnlyIfHasTransactions}
+                        onChange={(e) => {
+                          sound.playTap();
+                          updateDailySalesSchedule({ sendOnlyIfHasTransactions: e.target.checked });
+                        }}
+                        className="mt-0.5 w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                      />
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">
+                          Lewati pengiriman jika hari tersebut 0 transaksi (toko libur)
+                        </span>
+                        <span className="text-[10.5px] text-slate-500">
+                          Jika tidak dicentang, Admin tetap menerima konfirmasi tutup toko Rp 0 saat jam tutup tiba.
+                        </span>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Bar Status Jadwal & Uji Kirim */}
+                <div className="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-bold text-emerald-950">
+                      Jadwal Berikutnya:{' '}
+                      <span className="font-mono text-emerald-700">{nextClosingInfo}</span>
+                    </div>
+                    <p className="text-[11px] text-emerald-800">
+                      {scheduledDailySalesDispatchState.lastDispatchedAt
+                        ? `Terakhir dipicu: ${formatDateTime(
+                            scheduledDailySalesDispatchState.lastDispatchedAt
+                          )} (${formatNumber(
+                            scheduledDailySalesDispatchState.lastTransactionCount ?? 0
+                          )} nota · ${formatRupiah(
+                            scheduledDailySalesDispatchState.lastNetRevenue ?? 0
+                          )})`
+                        : 'Belum ada laporan penutupan harian yang dijalankan pada perangkat ini.'}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setScheduledDailySalesDispatchState(resetScheduledDailySalesDispatch());
+                      }}
+                      className="px-3 py-2 rounded-xl bg-white hover:bg-emerald-100 text-emerald-900 border border-emerald-300 text-[11px] font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Reset Status Hari Ini</span>
+                    </button>
+                    <a
+                      href={closingTestUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => sound.playTap()}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1.5 shadow-xs whitespace-nowrap shrink-0 transition-colors"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Uji Kirim Laporan Penutupan</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                </div>
+
+                {/* Live Preview */}
+                <div className="p-3.5 rounded-xl bg-slate-900 text-slate-100 space-y-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                      <MessageCircle className="w-3 h-3" />
+                      <span>Pratinjau Pesan Laporan Tutup Toko (Data Hari Ini)</span>
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      Target: {formSettings.adminWhatsAppNumber?.trim() || 'Pilih kontak di WhatsApp'}
+                    </span>
+                  </div>
+                  <pre className="text-[11px] font-mono text-slate-200 whitespace-pre-wrap leading-relaxed bg-black/30 p-3 rounded-lg border border-slate-800">
+                    {closingPreviewMessage}
+                  </pre>
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Card 2.3: Pengaturan Koneksi Printer (Bluetooth & USB) */}
           <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
@@ -4376,24 +4928,37 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
             </div>
           </div>
 
-          {/* Card 5: Cadangkan & Pulihkan Data (Backup & Restore) */}
+          {/* Card 5: Modul Backup & Restore Data */}
           <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
               <div className="flex items-center gap-2">
-                <Database className="w-4 h-4 text-emerald-600" />
+                <Database className="w-4 h-4 text-emerald-600 shrink-0" />
                 <h3 className="text-sm font-bold text-slate-900">
-                  Cadangkan & Pulihkan Data (Backup & Restore)
+                  Backup &amp; Restore Data
                 </h3>
               </div>
-              <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1">
-                <FileJson className="w-3.5 h-3.5" />
-                <span>Format JSON Standar</span>
-              </span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[11px] font-bold text-slate-700 bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 inline-flex items-center gap-1">
+                  <ShieldCheck className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Khusus Admin</span>
+                </span>
+                <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200 inline-flex items-center gap-1">
+                  <FileJson className="w-3.5 h-3.5" />
+                  <span>Arsip JSON</span>
+                </span>
+              </div>
             </div>
 
             <p className="text-xs text-slate-500">
-              Ekspor seluruh data toko (produk &amp; multi satuan, pelanggan &amp; poin, supplier, riwayat transaksi, dan profil toko) ke file JSON yang dapat diunduh, atau pulihkan kembali data dari file cadangan sebelumnya untuk menjaga integritas data Anda.
+              Unduh seluruh data aplikasi (produk, kategori, pelanggan, supplier, pembelian PO, riwayat transaksi, cashflow, absensi, opname, pesanan online, log aktivitas, pengguna, dan pengaturan toko) ke dalam file JSON untuk arsip offline, atau unggah kembali file backup JSON untuk pemulihan data penuh.
             </p>
+
+            {!isAdminUser && (
+              <div className="p-3 rounded-xl border border-amber-200 bg-amber-50 text-amber-900 text-xs flex items-center gap-2">
+                <Lock className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>Mode terkunci: Login sebagai Admin untuk mengunduh atau memulihkan file backup JSON.</span>
+              </div>
+            )}
 
             {/* Notification alert */}
             {backupNotice && (
@@ -4422,33 +4987,61 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
               </div>
             )}
 
-            {/* Live Data Summary Pills */}
+            {/* Live Data Summary Grid (Full Application Data) */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
               <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
-                <div className="text-[10px] uppercase font-bold text-slate-400">Total Produk</div>
-                <div className="text-sm md:text-base font-extrabold text-slate-800">
-                  {products.length} <span className="text-[10px] font-medium text-slate-500">item</span>
+                <div className="text-[10px] uppercase font-bold text-slate-400">Produk &amp; Jasa</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(products.length)} <span className="text-[10px] font-medium text-slate-500">item</span>
                 </div>
               </div>
 
               <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
-                <div className="text-[10px] uppercase font-bold text-slate-400">Total Pelanggan</div>
-                <div className="text-sm md:text-base font-extrabold text-slate-800">
-                  {customers.length} <span className="text-[10px] font-medium text-slate-500">kontak</span>
+                <div className="text-[10px] uppercase font-bold text-slate-400">Pelanggan</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(customers.length)} <span className="text-[10px] font-medium text-slate-500">kontak</span>
                 </div>
               </div>
 
               <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
-                <div className="text-[10px] uppercase font-bold text-slate-400">Total Supplier</div>
-                <div className="text-sm md:text-base font-extrabold text-slate-800">
-                  {suppliers.length} <span className="text-[10px] font-medium text-slate-500">vendor</span>
+                <div className="text-[10px] uppercase font-bold text-slate-400">Supplier</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(suppliers.length)} <span className="text-[10px] font-medium text-slate-500">vendor</span>
                 </div>
               </div>
 
               <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
-                <div className="text-[10px] uppercase font-bold text-slate-400">Riwayat Transaksi</div>
-                <div className="text-sm md:text-base font-extrabold text-slate-800">
-                  {transactions.length} <span className="text-[10px] font-medium text-slate-500">invoice</span>
+                <div className="text-[10px] uppercase font-bold text-slate-400">Pembelian (PO)</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(purchases.length)} <span className="text-[10px] font-medium text-slate-500">dok</span>
+                </div>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-400">Transaksi</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(transactions.length)} <span className="text-[10px] font-medium text-slate-500">nota</span>
+                </div>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-400">Cashflow</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(cashflows.length)} <span className="text-[10px] font-medium text-slate-500">catatan</span>
+                </div>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-400">Stock Opname</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(stockOpnames.length)} <span className="text-[10px] font-medium text-slate-500">sesi</span>
+                </div>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-400">Order Online</div>
+                <div className="text-sm md:text-base font-extrabold text-slate-800 tabular-nums">
+                  {formatNumber(onlineOrders.length)} <span className="text-[10px] font-medium text-slate-500">order</span>
                 </div>
               </div>
             </div>
@@ -4462,20 +5055,21 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
                     <div className="w-7 h-7 rounded-lg bg-emerald-600 text-white flex items-center justify-center">
                       <Download className="w-4 h-4" />
                     </div>
-                    <h4 className="text-xs font-bold text-slate-900">Ekspor Cadangan (Download JSON)</h4>
+                    <h4 className="text-xs font-bold text-slate-900">Backup Database (Ekspor JSON)</h4>
                   </div>
                   <p className="text-[11px] text-slate-600 leading-relaxed">
-                    Unduh file cadangan mandiri dalam format JSON yang dapat disimpan di Flashdisk, Google Drive, atau kartu memori tablet.
+                    Unduh cadangan penuh seluruh data aplikasi (produk, kategori, pelanggan, supplier, pembelian PO, transaksi, cashflow, absensi, opname, pesanan online, pengguna &amp; pengaturan) dalam satu file JSON.
                   </p>
                 </div>
 
                 <button
                   type="button"
+                  disabled={!isAdminUser}
                   onClick={handleExportBackup}
-                  className="w-full py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer"
+                  className="w-full py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Unduh File Cadangan (.json)</span>
+                  <Download className="w-3.5 h-3.5 shrink-0" />
+                  <span>Unduh Backup JSON</span>
                 </button>
               </div>
 
@@ -4486,10 +5080,10 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
                     <div className="w-7 h-7 rounded-lg bg-sky-600 text-white flex items-center justify-center">
                       <Upload className="w-4 h-4" />
                     </div>
-                    <h4 className="text-xs font-bold text-slate-900">Pulihkan Cadangan (Import JSON)</h4>
+                    <h4 className="text-xs font-bold text-slate-900">Pulihkan Data dari File JSON</h4>
                   </div>
                   <p className="text-[11px] text-slate-600 leading-relaxed">
-                    Pilih file JSON hasil ekspor sebelumnya. Anda dapat meninjau rincian item sebelum menimpa data yang sedang berjalan.
+                    Unggah file JSON arsip Backup Database sebelumnya. Setelah pratinjau &amp; konfirmasi, seluruh data lokal dan Cloud Firestore akan dipulihkan sesuai isi file backup.
                   </p>
                 </div>
 
@@ -4503,11 +5097,12 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
                   />
                   <button
                     type="button"
+                    disabled={!isAdminUser}
                     onClick={() => importFileInputRef.current?.click()}
-                    className="w-full py-2.5 px-3 rounded-xl bg-sky-600 hover:bg-sky-500 active:bg-sky-700 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer"
+                    className="w-full py-2.5 px-3 rounded-xl bg-sky-600 hover:bg-sky-500 active:bg-sky-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
-                    <FolderArchive className="w-3.5 h-3.5" />
-                    <span>Pilih File Cadangan untuk Dipulihkan</span>
+                    <FolderArchive className="w-3.5 h-3.5 shrink-0" />
+                    <span>Unggah &amp; Pulihkan (.json)</span>
                   </button>
                 </div>
               </div>
@@ -4911,32 +5506,60 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
             </div>
 
             {/* Item counts breakdown */}
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="p-3 bg-emerald-50/60 border border-emerald-100 rounded-xl">
-                <span className="text-[11px] font-bold text-emerald-800 block">Katalog Produk</span>
-                <span className="text-lg font-extrabold text-emerald-950">
-                  {importCandidate.data.products.length} <span className="text-xs font-semibold text-emerald-700">item</span>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div className="p-2.5 bg-emerald-50/60 border border-emerald-100 rounded-xl">
+                <span className="text-[10.5px] font-bold text-emerald-800 block">Produk</span>
+                <span className="text-base font-extrabold text-emerald-950 tabular-nums">
+                  {formatNumber(importCandidate.data.products.length)}
                 </span>
               </div>
 
-              <div className="p-3 bg-sky-50/60 border border-sky-100 rounded-xl">
-                <span className="text-[11px] font-bold text-sky-800 block">Daftar Pelanggan</span>
-                <span className="text-lg font-extrabold text-sky-950">
-                  {importCandidate.data.customers.length} <span className="text-xs font-semibold text-sky-700">kontak</span>
+              <div className="p-2.5 bg-sky-50/60 border border-sky-100 rounded-xl">
+                <span className="text-[10.5px] font-bold text-sky-800 block">Pelanggan</span>
+                <span className="text-base font-extrabold text-sky-950 tabular-nums">
+                  {formatNumber(importCandidate.data.customers.length)}
                 </span>
               </div>
 
-              <div className="p-3 bg-amber-50/60 border border-amber-100 rounded-xl">
-                <span className="text-[11px] font-bold text-amber-800 block">Daftar Supplier</span>
-                <span className="text-lg font-extrabold text-amber-950">
-                  {importCandidate.data.suppliers.length} <span className="text-xs font-semibold text-amber-700">vendor</span>
+              <div className="p-2.5 bg-amber-50/60 border border-amber-100 rounded-xl">
+                <span className="text-[10.5px] font-bold text-amber-800 block">Supplier</span>
+                <span className="text-base font-extrabold text-amber-950 tabular-nums">
+                  {formatNumber(importCandidate.data.suppliers.length)}
                 </span>
               </div>
 
-              <div className="p-3 bg-indigo-50/60 border border-indigo-100 rounded-xl">
-                <span className="text-[11px] font-bold text-indigo-800 block">Riwayat Transaksi</span>
-                <span className="text-lg font-extrabold text-indigo-950">
-                  {importCandidate.data.transactions.length} <span className="text-xs font-semibold text-indigo-700">invoice</span>
+              <div className="p-2.5 bg-indigo-50/60 border border-indigo-100 rounded-xl">
+                <span className="text-[10.5px] font-bold text-indigo-800 block">Transaksi</span>
+                <span className="text-base font-extrabold text-indigo-950 tabular-nums">
+                  {formatNumber(importCandidate.data.transactions.length)}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <span className="text-[10.5px] font-bold text-slate-600 block">PO Pembelian</span>
+                <span className="text-base font-extrabold text-slate-900 tabular-nums">
+                  {formatNumber(importCandidate.data.purchases?.length || 0)}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <span className="text-[10.5px] font-bold text-slate-600 block">Cashflow</span>
+                <span className="text-base font-extrabold text-slate-900 tabular-nums">
+                  {formatNumber(importCandidate.data.cashflows?.length || 0)}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <span className="text-[10.5px] font-bold text-slate-600 block">Stock Opname</span>
+                <span className="text-base font-extrabold text-slate-900 tabular-nums">
+                  {formatNumber(importCandidate.data.stockOpnames?.length || 0)}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <span className="text-[10.5px] font-bold text-slate-600 block">Order Online</span>
+                <span className="text-base font-extrabold text-slate-900 tabular-nums">
+                  {formatNumber(importCandidate.data.onlineOrders?.length || 0)}
                 </span>
               </div>
             </div>
@@ -4948,6 +5571,7 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
                   type="checkbox"
                   checked={restoreUsersOption}
                   onChange={(e) => setRestoreUsersOption(e.target.checked)}
+                  disabled={isRestoringBackup}
                   className="rounded text-sky-600 focus:ring-sky-500 w-4 h-4"
                 />
                 <span className="font-semibold text-slate-800">
@@ -4960,7 +5584,7 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
             <div className="p-3 bg-rose-50 rounded-xl border border-rose-200 flex items-start gap-2.5 text-xs text-rose-800">
               <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
               <p className="leading-relaxed">
-                <strong className="font-bold">Peringatan:</strong> Proses pemulihan ini akan menimpa data produk, pelanggan, supplier, dan transaksi yang sedang aktif di aplikasi kasir ini dengan isi file cadangan.
+                <strong className="font-bold">Peringatan:</strong> Proses Restore from Backup akan menghapus dan mengganti seluruh data aktif saat ini (lokal &amp; Cloud Firestore) dengan data dari file backup ini.
               </p>
             </div>
 
@@ -4968,19 +5592,30 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
                 type="button"
+                disabled={isRestoringBackup}
                 onClick={() => setImportCandidate(null)}
-                className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-100 transition-colors"
+                className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-100 transition-colors cursor-pointer disabled:opacity-50"
               >
                 Batal
               </button>
 
               <button
                 type="button"
+                disabled={isRestoringBackup}
                 onClick={handleConfirmRestore}
-                className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-600/20 transition-all cursor-pointer"
+                className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-600/20 transition-all cursor-pointer disabled:opacity-60"
               >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Ya, Terapkan &amp; Pulihkan Data</span>
+                {isRestoringBackup ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Mengganti Data...</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Ya, Ganti &amp; Pulihkan Data</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

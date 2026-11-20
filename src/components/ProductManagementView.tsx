@@ -42,20 +42,29 @@ import {
   Coins,
   ArrowUpDown,
   QrCode,
-  Printer
+  Printer,
+  History,
+  TrendingDown,
+  ArrowUpRight,
+  ArrowDownRight,
+  Minus,
+  Filter
 } from 'lucide-react';
 import QRCode from 'qrcode';
 import { 
   ResponsiveContainer, 
   BarChart, 
   Bar, 
+  AreaChart,
+  Area,
+  CartesianGrid,
   XAxis, 
   YAxis, 
   Tooltip, 
   Cell 
 } from 'recharts';
-import { Product, ProductUnit, ProductVariant, ProductCategory, UserRole, Transaction, CustomerSpecialPrice, CustomerCategoryItem } from '../types/pos';
-import { formatRupiah, formatNumber } from '../utils/formatters';
+import { Product, ProductUnit, ProductVariant, ProductCategory, UserRole, Transaction, CustomerSpecialPrice, CustomerCategoryItem, EmployeeActivityLog } from '../types/pos';
+import { formatRupiah, formatNumber, formatDateTime } from '../utils/formatters';
 import { getItemFifoCogs } from '../utils/fifoUtils';
 import { sound } from '../utils/audio';
 import { CATEGORY_COLOR_PRESETS, getCategoryColor, isDarkColor } from '../utils/categoryColors';
@@ -97,9 +106,10 @@ interface ProductManagementViewProps {
   customerCategories?: CustomerCategoryItem[];
   currentUserRole: UserRole;
   transactions?: Transaction[];
+  activityLogs?: EmployeeActivityLog[];
   onAddProduct: (product: Omit<Product, 'id'>) => void;
   onBatchAddProducts?: (products: Omit<Product, 'id'>[]) => void;
-  onUpdateProduct: (product: Product) => void;
+  onUpdateProduct: (product: Product, priceChangeReason?: string) => void;
   onDeleteProduct: (productId: string) => void;
   onAddCategory?: (category: Omit<ProductCategory, 'id'>) => ProductCategory;
   onBatchAddCategories?: (categories: Omit<ProductCategory, 'id'>[]) => void;
@@ -116,6 +126,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   customerCategories = [],
   currentUserRole,
   transactions = [],
+  activityLogs = [],
   onAddProduct,
   onBatchAddProducts,
   onUpdateProduct,
@@ -128,6 +139,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   onNavigateToSuppliers,
   onNavigateToServices,
 }) => {
+  const [activeTab, setActiveTab] = useState<'CATALOG' | 'PRICE_HISTORY'>('CATALOG');
   const [search, setSearch] = useState('');
   const deferredSearch = useDeferredValue(search);
   const [selectedCategory, setSelectedCategory] = useState('SEMUA');
@@ -137,8 +149,17 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const [pageSize, setPageSize] = useState<25 | 50 | 100>(50);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [isAddingNew, setIsAddingNew] = useState(false);
+  const [priceChangeReason, setPriceChangeReason] = useState('');
   const [skuQrProduct, setSkuQrProduct] = useState<Product | null>(null);
   const [skuQrDataUrl, setSkuQrDataUrl] = useState<string>('');
+
+  // Riwayat Harga & Margin tab states
+  const [priceHistorySearch, setPriceHistorySearch] = useState('');
+  const [priceHistoryProductFilter, setPriceHistoryProductFilter] = useState<string>('ALL');
+  const [priceHistoryDirectionFilter, setPriceHistoryDirectionFilter] = useState<
+    'ALL' | 'NAIK' | 'TURUN' | 'MODAL_BERUBAH' | 'HARGA_AWAL' | 'OVERRIDE_KASIR'
+  >('ALL');
+  const [priceHistoryRangeFilter, setPriceHistoryRangeFilter] = useState<'ALL' | '7_DAYS' | '30_DAYS' | 'THIS_MONTH'>('ALL');
 
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
@@ -164,6 +185,321 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     });
     return map;
   }, [customerCategories]);
+
+  interface NormalizedPriceHistoryEntry {
+    id: string;
+    timestamp: number;
+    actorName: string;
+    actorRole: UserRole;
+    productId: string;
+    productName: string;
+    sku: string;
+    category: string;
+    unitName: string;
+    variantName?: string;
+    stage: 'CATALOG' | 'PRE_PAYMENT';
+    changeDirection: 'NAIK' | 'TURUN' | 'MODAL_BERUBAH' | 'HARGA_AWAL' | 'OVERRIDE_KASIR';
+    oldSellingPrice: number;
+    newSellingPrice: number;
+    priceDelta: number;
+    priceDeltaPercent: number;
+    oldCostPrice: number;
+    newCostPrice: number;
+    oldMarginRupiah: number;
+    newMarginRupiah: number;
+    oldMarginPercent: number;
+    newMarginPercent: number;
+    marginDeltaPercent: number;
+    reason: string;
+  }
+
+  const allPriceHistoryEntries = useMemo<NormalizedPriceHistoryEntry[]>(() => {
+    const parseCurrencyString = (raw?: string): number => {
+      if (!raw) return 0;
+      const digits = raw.split('(')[0].replace(/[^0-9-]/g, '');
+      const parsed = parseInt(digits, 10);
+      return isNaN(parsed) ? 0 : parsed;
+    };
+
+    const entries: NormalizedPriceHistoryEntry[] = [];
+    (activityLogs || []).forEach((log) => {
+      if (log.actionType !== 'MANUAL_PRICE_EDIT') return;
+      const meta = (log.metadata || {}) as Record<string, any>;
+      const isCatalog = meta.stage === 'CATALOG_PRICE_UPDATE' || log.targetType === 'PRODUCT';
+      const resolvedProductId = String(log.productId || (log.targetType === 'PRODUCT' ? log.targetId : '') || '');
+      const prod = productMap.get(resolvedProductId);
+
+      const cleanLabelName = (log.targetLabel || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+      const productName = prod?.name || cleanLabelName || log.targetLabel || 'Produk';
+      const sku = String(meta.sku || prod?.sku || prod?.barcode || '-');
+      const cat = String(meta.category || prod?.category || 'Umum');
+      const unitName = String(meta.unitName || prod?.units?.[0]?.unitName || prod?.baseUnit || 'PCS');
+      const variantName = meta.variantName ? String(meta.variantName) : undefined;
+
+      const oldSell =
+        typeof meta.oldSellingPrice === 'number'
+          ? meta.oldSellingPrice
+          : typeof meta.originalPrice === 'number'
+          ? meta.originalPrice
+          : parseCurrencyString(log.oldValue);
+      const newSell =
+        typeof meta.newSellingPrice === 'number'
+          ? meta.newSellingPrice
+          : typeof meta.newPrice === 'number'
+          ? meta.newPrice
+          : parseCurrencyString(log.newValue);
+
+      const unitRef = prod?.units?.find((u) => u.unitName.toUpperCase() === unitName.toUpperCase()) || prod?.units?.[0];
+      const fallbackCost = Number(unitRef?.costPrice || prod?.costPrice || 0);
+      const oldCost = typeof meta.oldCostPrice === 'number' ? meta.oldCostPrice : fallbackCost;
+      const newCost = typeof meta.newCostPrice === 'number' ? meta.newCostPrice : fallbackCost;
+
+      const oldMarginRp =
+        typeof meta.oldMarginRupiah === 'number' ? meta.oldMarginRupiah : oldSell - oldCost;
+      const newMarginRp =
+        typeof meta.newMarginRupiah === 'number' ? meta.newMarginRupiah : newSell - newCost;
+
+      const oldMarginPct =
+        typeof meta.oldMarginPercent === 'number'
+          ? meta.oldMarginPercent
+          : oldSell > 0
+          ? Math.round((oldMarginRp / oldSell) * 1000) / 10
+          : 0;
+      const newMarginPct =
+        typeof meta.newMarginPercent === 'number'
+          ? meta.newMarginPercent
+          : newSell > 0
+          ? Math.round((newMarginRp / newSell) * 1000) / 10
+          : 0;
+
+      const priceDelta = newSell - oldSell;
+      const priceDeltaPct =
+        typeof meta.priceDeltaPercent === 'number'
+          ? meta.priceDeltaPercent
+          : oldSell > 0
+          ? Math.round((priceDelta / oldSell) * 1000) / 10
+          : 0;
+      const marginDeltaPct =
+        typeof meta.marginDeltaPercent === 'number'
+          ? meta.marginDeltaPercent
+          : Math.round((newMarginPct - oldMarginPct) * 10) / 10;
+
+      let changeDirection: NormalizedPriceHistoryEntry['changeDirection'] = 'NAIK';
+      if (!isCatalog) {
+        changeDirection = 'OVERRIDE_KASIR';
+      } else if (meta.changeDirection === 'HARGA_AWAL') {
+        changeDirection = 'HARGA_AWAL';
+      } else if (meta.changeDirection === 'MODAL_BERUBAH' || (priceDelta === 0 && oldCost !== newCost)) {
+        changeDirection = 'MODAL_BERUBAH';
+      } else if (priceDelta < 0 || meta.changeDirection === 'TURUN') {
+        changeDirection = 'TURUN';
+      } else {
+        changeDirection = 'NAIK';
+      }
+
+      entries.push({
+        id: log.id,
+        timestamp: log.timestamp,
+        actorName: log.actorName || 'System',
+        actorRole: log.actorRole,
+        productId: resolvedProductId,
+        productName,
+        sku,
+        category: cat,
+        unitName,
+        variantName,
+        stage: isCatalog ? 'CATALOG' : 'PRE_PAYMENT',
+        changeDirection,
+        oldSellingPrice: oldSell,
+        newSellingPrice: newSell,
+        priceDelta,
+        priceDeltaPercent: priceDeltaPct,
+        oldCostPrice: oldCost,
+        newCostPrice: newCost,
+        oldMarginRupiah: oldMarginRp,
+        newMarginRupiah: newMarginRp,
+        oldMarginPercent: oldMarginPct,
+        newMarginPercent: newMarginPct,
+        marginDeltaPercent: marginDeltaPct,
+        reason: log.reason || log.summary || '-',
+      });
+    });
+
+    return entries.sort((a, b) => b.timestamp - a.timestamp);
+  }, [activityLogs, productMap]);
+
+  const filteredPriceHistoryEntries = useMemo(() => {
+    const q = priceHistorySearch.trim().toLowerCase();
+    const now = Date.now();
+    const startOfMonthTs = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+
+    return allPriceHistoryEntries.filter((entry) => {
+      if (priceHistoryProductFilter !== 'ALL' && entry.productId !== priceHistoryProductFilter) {
+        return false;
+      }
+      if (priceHistoryDirectionFilter !== 'ALL' && entry.changeDirection !== priceHistoryDirectionFilter) {
+        return false;
+      }
+      if (priceHistoryRangeFilter === '7_DAYS' && now - entry.timestamp > 7 * 86400000) {
+        return false;
+      }
+      if (priceHistoryRangeFilter === '30_DAYS' && now - entry.timestamp > 30 * 86400000) {
+        return false;
+      }
+      if (priceHistoryRangeFilter === 'THIS_MONTH' && entry.timestamp < startOfMonthTs) {
+        return false;
+      }
+      if (q) {
+        const hay = `${entry.productName} ${entry.sku} ${entry.category} ${entry.unitName} ${entry.variantName || ''} ${entry.actorName} ${entry.reason}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [
+    allPriceHistoryEntries,
+    priceHistorySearch,
+    priceHistoryProductFilter,
+    priceHistoryDirectionFilter,
+    priceHistoryRangeFilter,
+  ]);
+
+  const priceHistoryStats = useMemo(() => {
+    const total = filteredPriceHistoryEntries.length;
+    const upCount = filteredPriceHistoryEntries.filter((e) => e.changeDirection === 'NAIK').length;
+    const downCount = filteredPriceHistoryEntries.filter(
+      (e) => e.changeDirection === 'TURUN' || (e.changeDirection === 'OVERRIDE_KASIR' && e.priceDelta < 0)
+    ).length;
+    const marginShifts = filteredPriceHistoryEntries.filter(
+      (e) => e.changeDirection !== 'HARGA_AWAL'
+    );
+    const avgMarginDelta =
+      marginShifts.length > 0
+        ? Math.round(
+            (marginShifts.reduce((sum, e) => sum + e.marginDeltaPercent, 0) / marginShifts.length) * 10
+          ) / 10
+        : 0;
+    const thinMarginProductsCount = products.filter((p) => {
+      const sell = p.units?.[0]?.sellingPrice || 0;
+      const cost = p.units?.[0]?.costPrice || p.costPrice || 0;
+      if (sell <= 0 || cost <= 0) return false;
+      const marginPct = ((sell - cost) / sell) * 100;
+      return marginPct < 10;
+    }).length;
+
+    return { total, upCount, downCount, avgMarginDelta, thinMarginProductsCount };
+  }, [filteredPriceHistoryEntries, products]);
+
+  const priceHistoryChartData = useMemo(() => {
+    if (priceHistoryProductFilter !== 'ALL') {
+      const chronological = [...filteredPriceHistoryEntries]
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(-20);
+      return chronological.map((e) => ({
+        label: new Date(e.timestamp).toLocaleDateString('id-ID', {
+          day: '2-digit',
+          month: 'short',
+        }),
+        fullDate: formatDateTime(e.timestamp),
+        hargaJual: e.newSellingPrice,
+        hppModal: e.newCostPrice,
+        marginPct: e.newMarginPercent,
+        marginRp: e.newMarginRupiah,
+        unitName: e.unitName,
+      }));
+    }
+
+    return [...filteredPriceHistoryEntries]
+      .filter((e) => e.stage === 'CATALOG')
+      .slice(0, 12)
+      .reverse()
+      .map((e) => ({
+        label: e.productName.length > 14 ? e.productName.slice(0, 13) + '…' : e.productName,
+        fullDate: formatDateTime(e.timestamp),
+        hargaJual: e.newSellingPrice,
+        hppModal: e.newCostPrice,
+        marginPct: e.newMarginPercent,
+        marginRp: e.newMarginRupiah,
+        unitName: e.unitName,
+      }));
+  }, [filteredPriceHistoryEntries, priceHistoryProductFilter]);
+
+  const priceHistoryProductOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    products.forEach((p) => map.set(p.id, p.name));
+    allPriceHistoryEntries.forEach((e) => {
+      if (e.productId && !map.has(e.productId)) {
+        map.set(e.productId, e.productName);
+      }
+    });
+    return Array.from(map.entries())
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [products, allPriceHistoryEntries]);
+
+  const handleExportPriceHistoryExcel = () => {
+    sound.playTap();
+    if (filteredPriceHistoryEntries.length === 0) {
+      alert('Belum ada data riwayat harga yang sesuai filter untuk diekspor.');
+      return;
+    }
+
+    const rows = filteredPriceHistoryEntries.map((entry) => ({
+      'Waktu Perubahan': formatDateTime(entry.timestamp),
+      'Pelaku / User': entry.actorName,
+      'Role': entry.actorRole,
+      'SKU': entry.sku,
+      'Nama Produk': entry.productName,
+      'Kategori': entry.category,
+      'Satuan': entry.unitName + (entry.variantName ? ` (${entry.variantName})` : ''),
+      'Jenis Perubahan':
+        entry.changeDirection === 'NAIK'
+          ? 'Harga Naik'
+          : entry.changeDirection === 'TURUN'
+          ? 'Harga Turun'
+          : entry.changeDirection === 'MODAL_BERUBAH'
+          ? 'HPP/Modal Berubah'
+          : entry.changeDirection === 'HARGA_AWAL'
+          ? 'Harga Awal'
+          : 'Override Kasir',
+      'Harga Jual Lama (Rp)': entry.oldSellingPrice,
+      'Harga Jual Baru (Rp)': entry.newSellingPrice,
+      'Selisih Harga (Rp)': entry.priceDelta,
+      'Selisih Harga (%)': entry.priceDeltaPercent,
+      'HPP Lama (Rp)': entry.oldCostPrice,
+      'HPP Baru (Rp)': entry.newCostPrice,
+      'Margin Lama (%)': entry.oldMarginPercent,
+      'Margin Baru (%)': entry.newMarginPercent,
+      'Fluktuasi Margin (%)': entry.marginDeltaPercent,
+      'Keterangan / Alasan': entry.reason,
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [
+      { wch: 20 },
+      { wch: 16 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 28 },
+      { wch: 16 },
+      { wch: 14 },
+      { wch: 18 },
+      { wch: 18 },
+      { wch: 18 },
+      { wch: 16 },
+      { wch: 14 },
+      { wch: 16 },
+      { wch: 16 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 16 },
+      { wch: 36 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Riwayat_Harga');
+    const dateStamp = new Date().toISOString().split('T')[0];
+    XLSX.writeFile(wb, `Riwayat_Harga_Produk_${dateStamp}.xlsx`);
+    sound.playSuccessChime();
+  };
 
   React.useEffect(() => {
     let cancelled = false;
@@ -954,6 +1290,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantInput('');
     setCustomerPrices([]);
     setShowInlineCatCreator(false);
+    setPriceChangeReason('');
     setIsAddingNew(true);
     setEditingProduct(null);
   };
@@ -982,6 +1319,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantInput('');
     setCustomerPrices([]);
     setShowInlineCatCreator(false);
+    setPriceChangeReason('');
     setIsAddingNew(true);
     setEditingProduct(null);
   };
@@ -1023,6 +1361,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantInput('');
     setCustomerPrices(prod.customerPrices ? [...prod.customerPrices] : []);
     setShowInlineCatCreator(false);
+    setPriceChangeReason('');
     setIsAddingNew(false);
   };
 
@@ -1251,14 +1590,19 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     };
 
     if (editingProduct) {
-      onUpdateProduct({
-        ...productPayload,
-        id: editingProduct.id,
-      });
+      onUpdateProduct(
+        {
+          ...productPayload,
+          id: editingProduct.id,
+        },
+        priceChangeReason.trim() || undefined
+      );
       setEditingProduct(null);
+      setPriceChangeReason('');
     } else {
       onAddProduct(productPayload);
       setIsAddingNew(false);
+      setPriceChangeReason('');
     }
   };
 
@@ -1322,6 +1666,48 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
     const todayStr = new Date().toISOString().split('T')[0];
     XLSX.writeFile(wb, `Data_Produk_Kasirku_${todayStr}.xlsx`);
+  };
+
+  // 1b. Ekspor Daftar Produk untuk Audit Stok Offline (.XLSX) dengan kolom SKU, Nama Barang, Stok, Harga Jual
+  const handleExportAuditExcel = () => {
+    sound.playTap();
+    const sourceProducts = filteredProducts.length > 0 ? filteredProducts : products;
+    if (sourceProducts.length === 0) {
+      alert('Belum ada produk untuk diekspor ke audit stok.');
+      return;
+    }
+
+    const auditRows = sourceProducts.map((p, idx) => {
+      const baseUnit = p.baseUnit || p.units[0]?.unitName || 'PCS';
+      const baseSellPrice = p.units[0]?.sellingPrice || 0;
+      return {
+        SKU: p.sku || p.barcode || `SKU-${idx + 1}`,
+        'Nama Barang': p.name,
+        Stok: Number(p.stockInBaseUnit || 0),
+        'Harga Jual': Number(baseSellPrice),
+        Satuan: baseUnit,
+        Kategori: p.category || 'Umum',
+        'Stok Fisik (Audit)': '',
+        'Catatan Audit': '',
+      };
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(auditRows);
+    ws['!cols'] = [
+      { wch: 16 }, // SKU
+      { wch: 36 }, // Nama Barang
+      { wch: 12 }, // Stok
+      { wch: 16 }, // Harga Jual
+      { wch: 12 }, // Satuan
+      { wch: 18 }, // Kategori
+      { wch: 18 }, // Stok Fisik (Audit)
+      { wch: 24 }, // Catatan Audit
+    ];
+    XLSX.utils.book_append_sheet(wb, ws, 'Audit Stok Produk');
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    XLSX.writeFile(wb, `Audit_Stok_Produk_${todayStr}.xlsx`);
   };
 
   // 2. Unduh Template Excel (.XLSX) dengan Contoh Pengisian Realistis & Petunjuk
@@ -1948,11 +2334,22 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               <span>Menu Jasa ({serviceProductsCount})</span>
             </button>
 
+            {/* Button Audit Stok Excel (.XLSX) */}
+            <button
+              type="button"
+              onClick={handleExportAuditExcel}
+              className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              title="Ekspor daftar produk untuk audit stok offline (SKU, Nama Barang, Stok, Harga Jual)"
+            >
+              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+              <span>Audit Stok (.XLSX)</span>
+            </button>
+
             {/* Button Ekspor Excel (.XLSX) */}
             <button
               type="button"
               onClick={handleExportExcel}
-              className="px-3.5 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+              className="px-3.5 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               title="Ekspor seluruh database produk ke format file Excel (.xlsx)"
             >
               <Download className="w-4 h-4" />
@@ -1985,6 +2382,61 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
           </div>
         </div>
 
+        {/* Navigation Tabs: Katalog Produk vs Riwayat Harga */}
+        <div className="bg-white p-1.5 rounded-2xl border border-slate-200 flex items-center gap-1.5 overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => {
+              sound.playTap();
+              setActiveTab('CATALOG');
+            }}
+            className={`px-4 py-2.5 rounded-xl text-xs md:text-sm font-bold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              activeTab === 'CATALOG'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+            }`}
+          >
+            <Package className="w-4 h-4" />
+            <span>Daftar Produk &amp; Jasa</span>
+            <span
+              className={`px-1.5 py-0.5 rounded-md text-[10px] font-mono tabular-nums ${
+                activeTab === 'CATALOG'
+                  ? 'bg-white/15 text-white'
+                  : 'bg-slate-100 text-slate-700'
+              }`}
+            >
+              {formatNumber(products.length)}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              sound.playTap();
+              setActiveTab('PRICE_HISTORY');
+            }}
+            className={`px-4 py-2.5 rounded-xl text-xs md:text-sm font-bold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              activeTab === 'PRICE_HISTORY'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+            }`}
+          >
+            <History className="w-4 h-4" />
+            <span>Riwayat Harga</span>
+            <span
+              className={`px-1.5 py-0.5 rounded-md text-[10px] font-mono tabular-nums ${
+                activeTab === 'PRICE_HISTORY'
+                  ? 'bg-sky-400/20 text-sky-200'
+                  : 'bg-sky-50 text-sky-700'
+              }`}
+            >
+              {formatNumber(allPriceHistoryEntries.length)}
+            </span>
+          </button>
+        </div>
+
+        {activeTab === 'CATALOG' ? (
+          <>
         {/* =================================================================== */}
         {/* TOP 5 PRODUK TERLARIS & PRIORITAS STOK CHART                       */}
         {/* =================================================================== */}
@@ -3154,6 +3606,21 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                               type="button"
                               onClick={() => {
                                 sound.playTap();
+                                setPriceHistoryProductFilter(prod.id);
+                                setPriceHistoryDirectionFilter('ALL');
+                                setPriceHistorySearch('');
+                                setActiveTab('PRICE_HISTORY');
+                              }}
+                              title="Lihat Riwayat Perubahan Harga & Margin Produk Ini"
+                              className="px-2 py-1.5 rounded-lg bg-slate-50 hover:bg-sky-50 text-slate-700 hover:text-sky-700 border border-slate-200 hover:border-sky-200 text-[10.5px] font-bold flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                            >
+                              <History className="w-3.5 h-3.5" />
+                              <span className="hidden xl:inline">Riwayat</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
                                 setSkuQrProduct(prod);
                               }}
                               title="Generate & Unduh QR Code Label SKU"
@@ -3250,6 +3717,465 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
             </div>
           )}
         </div>
+          </>
+        ) : (
+          <div className="space-y-5">
+            {/* 4-Card KPI Strip */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="bg-white p-4 rounded-2xl border border-slate-200">
+                <div className="text-[11px] font-semibold text-slate-500">Total Log Perubahan</div>
+                <div className="text-2xl font-bold text-slate-900 font-mono tabular-nums mt-1">
+                  {formatNumber(priceHistoryStats.total)}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
+                  Catatan perubahan katalog &amp; harga kasir
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200">
+                <div className="text-[11px] font-semibold text-slate-500">Harga Naik / Turun</div>
+                <div className="flex items-baseline gap-2.5 mt-1 font-mono tabular-nums">
+                  <span className="text-xl font-bold text-emerald-700 flex items-center gap-0.5">
+                    <ArrowUpRight className="w-4 h-4" />
+                    {formatNumber(priceHistoryStats.upCount)}
+                  </span>
+                  <span className="text-slate-300">/</span>
+                  <span className="text-xl font-bold text-rose-700 flex items-center gap-0.5">
+                    <ArrowDownRight className="w-4 h-4" />
+                    {formatNumber(priceHistoryStats.downCount)}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
+                  Frekuensi kenaikan vs penurunan harga
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200">
+                <div className="text-[11px] font-semibold text-slate-500">Rata-rata Fluktuasi Margin</div>
+                <div
+                  className={`text-2xl font-bold font-mono tabular-nums mt-1 ${
+                    priceHistoryStats.avgMarginDelta > 0
+                      ? 'text-emerald-700'
+                      : priceHistoryStats.avgMarginDelta < 0
+                      ? 'text-rose-700'
+                      : 'text-slate-900'
+                  }`}
+                >
+                  {priceHistoryStats.avgMarginDelta >= 0 ? '+' : ''}
+                  {priceHistoryStats.avgMarginDelta.toFixed(1)}%
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
+                  Rata-rata pergeseran persentase margin
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200">
+                <div className="text-[11px] font-semibold text-slate-500">Produk Margin Tipis (&lt;10%)</div>
+                <div
+                  className={`text-2xl font-bold font-mono tabular-nums mt-1 ${
+                    priceHistoryStats.thinMarginProductsCount > 0 ? 'text-amber-700' : 'text-slate-900'
+                  }`}
+                >
+                  {formatNumber(priceHistoryStats.thinMarginProductsCount)}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
+                  Produk aktif perlu evaluasi harga jual
+                </div>
+              </div>
+            </div>
+
+            {/* Filter & Export Bar */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 space-y-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2 flex-1">
+                  <div className="relative flex-1 min-w-[210px]">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={priceHistorySearch}
+                      onChange={(e) => setPriceHistorySearch(e.target.value)}
+                      placeholder="Cari nama produk, SKU, pelaku, atau alasan..."
+                      className="w-full pl-9 pr-3 py-2 text-xs md:text-sm border border-slate-200 rounded-xl bg-slate-50 focus:bg-white focus:border-sky-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <select
+                    value={priceHistoryProductFilter}
+                    onChange={(e) => setPriceHistoryProductFilter(e.target.value)}
+                    className="px-3 py-2 text-xs md:text-sm border border-slate-200 rounded-xl bg-white font-semibold text-slate-700 focus:border-sky-500 focus:outline-none max-w-[230px]"
+                  >
+                    <option value="ALL">Semua Produk ({priceHistoryProductOptions.length})</option>
+                    {priceHistoryProductOptions.map((opt) => (
+                      <option key={opt.id} value={opt.id}>
+                        {opt.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    value={priceHistoryDirectionFilter}
+                    onChange={(e) => setPriceHistoryDirectionFilter(e.target.value as any)}
+                    className="px-3 py-2 text-xs md:text-sm border border-slate-200 rounded-xl bg-white font-semibold text-slate-700 focus:border-sky-500 focus:outline-none"
+                  >
+                    <option value="ALL">Semua Jenis Perubahan</option>
+                    <option value="NAIK">Harga Naik</option>
+                    <option value="TURUN">Harga Turun</option>
+                    <option value="MODAL_BERUBAH">HPP / Modal Berubah</option>
+                    <option value="HARGA_AWAL">Harga Awal Produk</option>
+                    <option value="OVERRIDE_KASIR">Override Harga di Kasir</option>
+                  </select>
+
+                  <select
+                    value={priceHistoryRangeFilter}
+                    onChange={(e) => setPriceHistoryRangeFilter(e.target.value as any)}
+                    className="px-3 py-2 text-xs md:text-sm border border-slate-200 rounded-xl bg-white font-semibold text-slate-700 focus:border-sky-500 focus:outline-none"
+                  >
+                    <option value="ALL">Semua Periode</option>
+                    <option value="7_DAYS">7 Hari Terakhir</option>
+                    <option value="30_DAYS">30 Hari Terakhir</option>
+                    <option value="THIS_MONTH">Bulan Ini</option>
+                  </select>
+
+                  {(priceHistorySearch ||
+                    priceHistoryProductFilter !== 'ALL' ||
+                    priceHistoryDirectionFilter !== 'ALL' ||
+                    priceHistoryRangeFilter !== 'ALL') && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setPriceHistorySearch('');
+                        setPriceHistoryProductFilter('ALL');
+                        setPriceHistoryDirectionFilter('ALL');
+                        setPriceHistoryRangeFilter('ALL');
+                      }}
+                      className="px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs font-bold text-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Reset</span>
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleExportPriceHistoryExcel}
+                  className="px-3.5 py-2 rounded-xl bg-teal-700 hover:bg-teal-600 text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer self-start lg:self-auto"
+                >
+                  <FileSpreadsheet className="w-4 h-4" />
+                  <span>Ekspor Excel (.XLSX)</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Trend Chart Card */}
+            {priceHistoryChartData.length > 0 && (
+              <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm md:text-base font-bold text-slate-900 flex items-center gap-2">
+                      <TrendingUp className="w-4 h-4 text-sky-600" />
+                      <span>
+                        {priceHistoryProductFilter !== 'ALL'
+                          ? `Tren Harga Jual & Margin: ${
+                              productMap.get(priceHistoryProductFilter)?.name || 'Produk Terpilih'
+                            }`
+                          : 'Ringkasan Fluktuasi Harga & Margin Katalog Terbaru'}
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {priceHistoryProductFilter !== 'ALL'
+                        ? 'Menampilkan pergerakan harga jual terhadap HPP modal secara kronologis.'
+                        : 'Pilih salah satu produk pada filter di atas untuk melihat tren historis khusus per produk.'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 text-[11px] font-semibold text-slate-600">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-xs bg-sky-600 inline-block" />
+                      Harga Jual (Rp)
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-xs bg-slate-400 inline-block" />
+                      HPP Modal (Rp)
+                    </span>
+                  </div>
+                </div>
+
+                <div className="h-60 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={priceHistoryChartData} margin={{ top: 10, right: 16, left: 4, bottom: 4 }}>
+                      <defs>
+                        <linearGradient id="priceHistorySellFill" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#0284c7" stopOpacity={0.2} />
+                          <stop offset="95%" stopColor="#0284c7" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                      <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#64748b' }} axisLine={false} tickLine={false} />
+                      <YAxis
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        axisLine={false}
+                        tickLine={false}
+                        tickFormatter={(val) => `${Math.round(Number(val) / 1000)}rb`}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          borderRadius: '12px',
+                          border: '1px solid #e2e8f0',
+                          fontSize: '12px',
+                          boxShadow: '0 4px 12px rgba(15, 23, 42, 0.08)',
+                        }}
+                        formatter={(value: any, name: any) => [
+                          formatRupiah(Number(value || 0)),
+                          name === 'hargaJual' ? 'Harga Jual' : 'HPP Modal',
+                        ]}
+                        labelFormatter={(lbl, payload: any) => {
+                          const p = payload?.[0]?.payload;
+                          if (!p) return String(lbl);
+                          return `${p.fullDate} · Margin ${p.marginPct.toFixed(1)}% (${formatRupiah(p.marginRp)})`;
+                        }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="hargaJual"
+                        stroke="#0284c7"
+                        strokeWidth={2.2}
+                        fill="url(#priceHistorySellFill)"
+                        dot={{ r: 3.5, fill: '#0284c7' }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="hppModal"
+                        stroke="#94a3b8"
+                        strokeWidth={1.8}
+                        fill="transparent"
+                        strokeDasharray="4 4"
+                        dot={{ r: 3, fill: '#64748b' }}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* Price History Audit Table */}
+            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+              {filteredPriceHistoryEntries.length === 0 ? (
+                <div className="p-10 text-center space-y-3">
+                  <div className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto">
+                    <History className="w-6 h-6" />
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-sm font-bold text-slate-900">
+                      {allPriceHistoryEntries.length === 0
+                        ? 'Belum Ada Log Perubahan Harga Produk'
+                        : 'Tidak Ada Log yang Cocok dengan Filter'}
+                    </h4>
+                    <p className="text-xs text-slate-500 max-w-md mx-auto">
+                      {allPriceHistoryEntries.length === 0
+                        ? 'Setiap perubahan harga jual, HPP modal, atau penambahan produk baru akan otomatis tercatat di sini lengkap dengan fluktuasi marginnya.'
+                        : 'Coba ubah kata kunci pencarian, periode, atau reset filter produk di atas.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setActiveTab('CATALOG');
+                    }}
+                    className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Package className="w-3.5 h-3.5" />
+                    <span>Kembali ke Daftar Produk</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-bold text-slate-600 uppercase tracking-wider">
+                        <th className="py-3 px-4">Waktu &amp; Pelaku</th>
+                        <th className="py-3 px-4">Produk / Satuan</th>
+                        <th className="py-3 px-4">Perubahan Harga Jual</th>
+                        <th className="py-3 px-4">HPP / Modal</th>
+                        <th className="py-3 px-4">Fluktuasi Margin</th>
+                        <th className="py-3 px-4">Keterangan / Alasan</th>
+                        <th className="py-3 px-4 text-right">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs">
+                      {filteredPriceHistoryEntries.map((entry) => {
+                        const dirBadge =
+                          entry.changeDirection === 'NAIK'
+                            ? { label: 'Harga Naik', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' }
+                            : entry.changeDirection === 'TURUN'
+                            ? { label: 'Harga Turun', cls: 'bg-rose-50 text-rose-700 border-rose-200' }
+                            : entry.changeDirection === 'MODAL_BERUBAH'
+                            ? { label: 'HPP Berubah', cls: 'bg-amber-50 text-amber-800 border-amber-200' }
+                            : entry.changeDirection === 'HARGA_AWAL'
+                            ? { label: 'Harga Awal', cls: 'bg-sky-50 text-sky-700 border-sky-200' }
+                            : { label: 'Override Kasir', cls: 'bg-purple-50 text-purple-700 border-purple-200' };
+
+                        return (
+                          <tr key={entry.id} className="hover:bg-slate-50/70 transition-colors">
+                            <td className="py-3 px-4 whitespace-nowrap align-top">
+                              <div className="font-mono tabular-nums font-semibold text-slate-900">
+                                {formatDateTime(entry.timestamp)}
+                              </div>
+                              <div className="text-[11px] text-slate-500 mt-0.5">
+                                {entry.actorName} · <span className="font-semibold">{entry.actorRole}</span>
+                              </div>
+                            </td>
+
+                            <td className="py-3 px-4 align-top">
+                              <div className="font-bold text-slate-900">{entry.productName}</div>
+                              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap text-[11px] text-slate-500">
+                                <span className="font-mono">{entry.sku}</span>
+                                <span>·</span>
+                                <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-700 font-bold">
+                                  {entry.unitName}
+                                </span>
+                                {entry.variantName && (
+                                  <span className="px-1.5 py-0.2 rounded bg-indigo-50 text-indigo-700 font-semibold">
+                                    {entry.variantName}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+
+                            <td className="py-3 px-4 whitespace-nowrap align-top font-mono tabular-nums">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-slate-400 line-through">
+                                  {formatRupiah(entry.oldSellingPrice)}
+                                </span>
+                                <span className="text-slate-400">→</span>
+                                <span className="font-bold text-slate-900">
+                                  {formatRupiah(entry.newSellingPrice)}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-1">
+                                <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold border ${dirBadge.cls}`}>
+                                  {dirBadge.label}
+                                </span>
+                                {entry.priceDelta !== 0 && entry.changeDirection !== 'HARGA_AWAL' && (
+                                  <span
+                                    className={`text-[11px] font-bold ${
+                                      entry.priceDelta > 0 ? 'text-emerald-700' : 'text-rose-700'
+                                    }`}
+                                  >
+                                    {entry.priceDelta > 0 ? '+' : ''}
+                                    {formatRupiah(entry.priceDelta)} ({entry.priceDeltaPercent >= 0 ? '+' : ''}
+                                    {entry.priceDeltaPercent.toFixed(1)}%)
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+
+                            <td className="py-3 px-4 whitespace-nowrap align-top font-mono tabular-nums">
+                              {entry.oldCostPrice !== entry.newCostPrice ? (
+                                <div>
+                                  <div className="text-slate-400 line-through text-[11px]">
+                                    {formatRupiah(entry.oldCostPrice)}
+                                  </div>
+                                  <div className="font-semibold text-slate-800">
+                                    {formatRupiah(entry.newCostPrice)}
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-slate-700 font-semibold">
+                                  {formatRupiah(entry.newCostPrice)}
+                                </span>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-4 whitespace-nowrap align-top font-mono tabular-nums">
+                              <div className="flex items-center gap-1 font-bold">
+                                {entry.changeDirection === 'HARGA_AWAL' ? (
+                                  <span className="text-sky-700">
+                                    {entry.newMarginPercent.toFixed(1)}% ({formatRupiah(entry.newMarginRupiah)})
+                                  </span>
+                                ) : (
+                                  <>
+                                    <span className="text-slate-500 font-normal">
+                                      {entry.oldMarginPercent.toFixed(1)}%
+                                    </span>
+                                    <span className="text-slate-400">→</span>
+                                    <span
+                                      className={
+                                        entry.newMarginPercent < 10
+                                          ? 'text-amber-700'
+                                          : entry.marginDeltaPercent >= 0
+                                          ? 'text-emerald-700'
+                                          : 'text-rose-700'
+                                      }
+                                    >
+                                      {entry.newMarginPercent.toFixed(1)}%
+                                    </span>
+                                  </>
+                                )}
+                              </div>
+                              {entry.changeDirection !== 'HARGA_AWAL' && (
+                                <div
+                                  className={`text-[11px] font-bold flex items-center gap-0.5 mt-0.5 ${
+                                    entry.marginDeltaPercent > 0
+                                      ? 'text-emerald-700'
+                                      : entry.marginDeltaPercent < 0
+                                      ? 'text-rose-700'
+                                      : 'text-slate-500'
+                                  }`}
+                                >
+                                  {entry.marginDeltaPercent > 0 ? (
+                                    <TrendingUp className="w-3 h-3" />
+                                  ) : entry.marginDeltaPercent < 0 ? (
+                                    <TrendingDown className="w-3 h-3" />
+                                  ) : (
+                                    <Minus className="w-3 h-3" />
+                                  )}
+                                  <span>
+                                    {entry.marginDeltaPercent >= 0 ? '+' : ''}
+                                    {entry.marginDeltaPercent.toFixed(1)}% · {formatRupiah(entry.newMarginRupiah)}
+                                  </span>
+                                </div>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-4 align-top max-w-[260px]">
+                              <p className="text-slate-700 leading-snug break-words">{entry.reason}</p>
+                            </td>
+
+                            <td className="py-3 px-4 text-right whitespace-nowrap align-top">
+                              {entry.productId && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    sound.playTap();
+                                    setPriceHistoryProductFilter(
+                                      priceHistoryProductFilter === entry.productId ? 'ALL' : entry.productId
+                                    );
+                                  }}
+                                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                                    priceHistoryProductFilter === entry.productId
+                                      ? 'bg-sky-600 text-white border-sky-600'
+                                      : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+                                  }`}
+                                >
+                                  <Filter className="w-3 h-3" />
+                                  <span>
+                                    {priceHistoryProductFilter === entry.productId ? 'Semua' : 'Tren Produk'}
+                                  </span>
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ========================================================================= */}
@@ -4393,6 +5319,60 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Live Price & Margin Impact Preview + Optional Reason (only when editing existing product with price/HPP change) */}
+              {editingProduct && (() => {
+                const prevBaseSell = editingProduct.units?.[0]?.sellingPrice || 0;
+                const prevBaseCost = editingProduct.costPrice ?? editingProduct.units?.[0]?.costPrice ?? 0;
+                const nextBaseSell = Math.max(0, parseFloat(units[0]?.sellingPrice?.toString() || '0') || 0);
+                const nextBaseCost = Math.max(0, parseFloat(units[0]?.costPrice?.toString() || costPrice || '0') || 0);
+                const hasAnyUnitPriceDiff = units.some((u, idx) => {
+                  const orig = editingProduct.units?.[idx];
+                  if (!orig) return false;
+                  return (
+                    Number(orig.sellingPrice || 0) !== Number(u.sellingPrice || 0) ||
+                    Number(orig.costPrice || prevBaseCost) !== Number(u.costPrice || nextBaseCost)
+                  );
+                });
+                const hasBaseDiff = prevBaseSell !== nextBaseSell || prevBaseCost !== nextBaseCost;
+                if (!hasAnyUnitPriceDiff && !hasBaseDiff) return null;
+
+                const oldMarginPct = prevBaseSell > 0 ? ((prevBaseSell - prevBaseCost) / prevBaseSell) * 100 : 0;
+                const newMarginPct = nextBaseSell > 0 ? ((nextBaseSell - nextBaseCost) / nextBaseSell) * 100 : 0;
+                const marginDelta = newMarginPct - oldMarginPct;
+
+                return (
+                  <div className="p-3.5 rounded-2xl bg-sky-50/70 border border-sky-200 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+                        <History className="w-4 h-4 text-sky-600" />
+                        <span>Perubahan Harga &amp; Margin Akan Dicatat ke Riwayat Harga</span>
+                      </span>
+                      <span
+                        className={`text-xs font-mono tabular-nums font-bold ${
+                          marginDelta > 0 ? 'text-emerald-700' : marginDelta < 0 ? 'text-rose-700' : 'text-slate-700'
+                        }`}
+                      >
+                        Margin Dasar: {oldMarginPct.toFixed(1)}% → {newMarginPct.toFixed(1)}% (
+                        {marginDelta >= 0 ? '+' : ''}
+                        {marginDelta.toFixed(1)}%)
+                      </span>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Catatan / Alasan Perubahan Harga (Opsional)
+                      </label>
+                      <input
+                        type="text"
+                        value={priceChangeReason}
+                        onChange={(e) => setPriceChangeReason(e.target.value)}
+                        placeholder="Misal: Kenaikan harga supplier, penyesuaian margin, atau promo..."
+                        className="w-full px-3 py-2 text-xs border border-sky-200 rounded-xl bg-white focus:border-sky-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Action Buttons */}
               <div className="pt-3 border-t border-slate-100 flex items-center justify-between">

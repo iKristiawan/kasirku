@@ -41,14 +41,25 @@ import {
   Calculator,
   CalendarDays,
   ShieldCheck,
-  Flame
+  Flame,
+  Trash2
 } from 'lucide-react';
-import { Product, Supplier, User, UserRole, StockOpnameRecord, StockOpnameItem, StoreSettings, Transaction } from '../types/pos';
+import { Product, Supplier, User, UserRole, StockOpnameRecord, StockOpnameItem, StoreSettings, Transaction, RestockOrder } from '../types/pos';
 import { formatRupiah, formatNumber, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { TouchKeypadModal } from './TouchKeypadModal';
 import { InventoryHealthWidget } from './InventoryHealthWidget';
 import { StockTurnoverHeatmap } from './StockTurnoverHeatmap';
+import { StockTurnRateModule } from './StockTurnRateModule';
+import { TopBottomMovingProductsChart } from './TopBottomMovingProductsChart';
+import { ExpiringClearanceModule } from './ExpiringClearanceModule';
+import { analyzeStockTurnRate, TurnoverSpeedCategory } from '../utils/stockTurnRate';
+import {
+  computeMonthlyStockMovementData,
+  generateMonthlyStockMovementPdf,
+  getCurrentMonthKey,
+  shiftMonthKey,
+} from '../utils/monthlyStockMovementPdf';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
 
@@ -57,13 +68,22 @@ interface StockReportViewProps {
   suppliers: Supplier[];
   currentUser: User;
   currentUserRole: UserRole;
+  users?: User[];
   stockOpnames: StockOpnameRecord[];
   storeSettings?: StoreSettings;
   transactions?: Transaction[];
-  onUpdateStock: (productId: string, newStock: number) => void;
+  purchases?: RestockOrder[];
+  onUpdateStock: (productId: string, newStock: number, reason?: string) => void;
+  onUpdateProduct?: (updatedProduct: Product) => void;
   onBulkUpdateStock: (
     adjustments: { productId: string; newStock: number }[],
     sessionRecord: StockOpnameRecord
+  ) => void;
+  onDeleteStockOpname?: (
+    record: StockOpnameRecord,
+    deletionReason: string,
+    responsibleUser: { id: string; name: string; role: UserRole },
+    revertStockChanges: boolean
   ) => void;
   onOpenThresholdSettings: () => void;
   onNavigateToSuppliers: () => void;
@@ -98,17 +118,32 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   suppliers,
   currentUser,
   currentUserRole,
+  users = [],
   stockOpnames,
   storeSettings,
   transactions = [],
+  purchases = [],
   onUpdateStock,
+  onUpdateProduct,
   onBulkUpdateStock,
+  onDeleteStockOpname,
   onOpenThresholdSettings,
   onNavigateToSuppliers,
   onInitiateRestockForProduct,
 }) => {
-  // Navigation Tabs: 'MONITORING' | 'STOCK_HEATMAP' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'
-  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'STOCK_HEATMAP' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'>('MONITORING');
+  // Navigation Tabs: 'MONITORING' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'
+  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'>('MONITORING');
+
+  // Stock Turn Rate & Liquidation states
+  const [turnoverLookbackDays, setTurnoverLookbackDays] = useState<30 | 60 | 90>(90);
+  const [turnoverSpeedFilter, setTurnoverSpeedFilter] = useState<'ALL' | TurnoverSpeedCategory>('ALL');
+  const [dismissedSlowAlert, setDismissedSlowAlert] = useState<boolean>(false);
+
+  // Monthly Stock Movement Audit states
+  const [auditMonthKey, setAuditMonthKey] = useState<string>(() => getCurrentMonthKey());
+  const [auditCategoryFilter, setAuditCategoryFilter] = useState<string>('SEMUA');
+  const [auditOnlyWithMovement, setAuditOnlyWithMovement] = useState<boolean>(false);
+  const [auditSearch, setAuditSearch] = useState<string>('');
 
   // Verify Stock utility states
   const [showVerifyStockPanel, setShowVerifyStockPanel] = useState<boolean>(false);
@@ -191,6 +226,41 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   const categories = useMemo(() => {
     return ['SEMUA', ...Array.from(new Set(physicalProducts.map((p) => p.category)))];
   }, [physicalProducts]);
+
+  // Stock Turn Rate Analysis (>90 days slow-moving detection & liquidation)
+  const stockTurnoverAnalysis = useMemo(() => {
+    return analyzeStockTurnRate({
+      products,
+      transactions,
+      purchases,
+      lookbackDays: turnoverLookbackDays,
+    });
+  }, [products, transactions, purchases, turnoverLookbackDays]);
+
+  // Monthly Stock Movement Audit Calculation
+  const monthlyAuditData = useMemo(() => {
+    return computeMonthlyStockMovementData({
+      monthKey: auditMonthKey,
+      products,
+      purchases,
+      transactions,
+      stockOpnames,
+      categoryFilter: auditCategoryFilter,
+    });
+  }, [auditMonthKey, products, purchases, transactions, stockOpnames, auditCategoryFilter]);
+
+  const filteredMonthlyAuditRows = useMemo(() => {
+    const q = auditSearch.trim().toLowerCase();
+    return monthlyAuditData.rows.filter((row) => {
+      if (auditOnlyWithMovement && !row.hasMovement) return false;
+      if (!q) return true;
+      return (
+        row.productName.toLowerCase().includes(q) ||
+        row.barcode.toLowerCase().includes(q) ||
+        row.category.toLowerCase().includes(q)
+      );
+    });
+  }, [monthlyAuditData.rows, auditOnlyWithMovement, auditSearch]);
 
   // Calculations for Monitoring
   const totalValuation = useMemo(() => {
@@ -959,6 +1029,14 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       });
 
       doc.save(`laporan-optimal-reorder-${new Date().toISOString().slice(0, 10)}.pdf`);
+    } else if (activeSubTab === 'MONTHLY_AUDIT') {
+      generateMonthlyStockMovementPdf({
+        data: monthlyAuditData,
+        storeSettings,
+        auditorName: currentUser.name,
+        categoryFilter: auditCategoryFilter,
+        onlyWithMovement: auditOnlyWithMovement,
+      });
     } else {
       // 2. Export Standard Stock Inventory & Valuation Report
       doc.setFontSize(16);
@@ -1073,9 +1151,30 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   const [opnameCategory, setOpnameCategory] = useState<string>('SEMUA');
   const [opnameStatusFilter, setOpnameStatusFilter] = useState<'ALL' | 'DISCREPANT' | 'COUNTED' | 'UNCOUNTED'>('ALL');
   const [isConfirmModalOpen, setIsConfirmModalOpen] = useState<boolean>(false);
+  const [opnameResponsibleUserId, setOpnameResponsibleUserId] = useState<string>(currentUser.id);
 
-  // Tab 3: Detailed Berita Acara Modal state
+  // Tab 3: Detailed Berita Acara & Delete Modal state
   const [selectedHistoricalOpname, setSelectedHistoricalOpname] = useState<StockOpnameRecord | null>(null);
+  const [deletingOpname, setDeletingOpname] = useState<StockOpnameRecord | null>(null);
+  const [deleteOpnameReason, setDeleteOpnameReason] = useState<string>('');
+  const [deleteOpnameResponsibleId, setDeleteOpnameResponsibleId] = useState<string>(currentUser.id);
+  const [revertStockOnOpnameDelete, setRevertStockOnOpnameDelete] = useState<boolean>(true);
+  const [deleteOpnameError, setDeleteOpnameError] = useState<string>('');
+
+  const availableResponsibleUsers = useMemo(() => {
+    const base = users.length > 0 ? users : [currentUser];
+    const hasCurrent = base.some((u) => u.id === currentUser.id);
+    return hasCurrent ? base : [currentUser, ...base];
+  }, [users, currentUser]);
+
+  useEffect(() => {
+    setOpnameResponsibleUserId((prev) =>
+      availableResponsibleUsers.some((u) => u.id === prev) ? prev : currentUser.id
+    );
+    setDeleteOpnameResponsibleId((prev) =>
+      availableResponsibleUsers.some((u) => u.id === prev) ? prev : currentUser.id
+    );
+  }, [currentUser.id, availableResponsibleUsers]);
 
   // Role validation
   const canExecuteAdjustment = currentUserRole === 'ADMIN' || currentUserRole === 'STORE_MANAGER';
@@ -1267,14 +1366,17 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       return;
     }
 
-    // 2. Build full StockOpnameRecord
+    // 2. Build full StockOpnameRecord with selected User Penanggung Jawab
+    const chosenResponsible =
+      availableResponsibleUsers.find((u) => u.id === opnameResponsibleUserId) || currentUser;
+
     const newSessionRecord: StockOpnameRecord = {
       id: 'so_' + Date.now(),
       sessionNumber: sessionDocNumber,
       date: sessionDate,
       timestamp: Date.now(),
-      auditorName: currentUser.name,
-      auditorRole: currentUser.role,
+      auditorName: chosenResponsible.name,
+      auditorRole: chosenResponsible.role,
       totalItemsAudited: auditedItemsRecord.length,
       totalDiscrepancies: discrepantItems.length,
       totalDifferenceValue: totalFinancialVariance,
@@ -1343,7 +1445,11 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       finalStock = Math.max(0, adjustingProduct.stockInBaseUnit - inputNum);
     }
 
-    onUpdateStock(adjustingProduct.id, finalStock);
+    onUpdateStock(
+      adjustingProduct.id,
+      finalStock,
+      adjustmentReason.trim() || 'Koreksi Cepat Stok Manual'
+    );
     setAdjustingProduct(null);
   };
 
@@ -1395,6 +1501,46 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             >
               <Flame className={`w-3.5 h-3.5 ${activeSubTab === 'STOCK_HEATMAP' ? 'text-amber-300' : 'text-emerald-600'}`} />
               <span>Heatmap Stok</span>
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playTap();
+                setTurnoverSpeedFilter('ALL');
+                setActiveSubTab('TURNOVER');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                activeSubTab === 'TURNOVER'
+                  ? 'bg-rose-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <TrendingUp className={`w-3.5 h-3.5 ${activeSubTab === 'TURNOVER' ? 'text-white' : 'text-rose-600'}`} />
+              <span>Perputaran Stok</span>
+              {stockTurnoverAnalysis.summary.verySlowCount > 0 && (
+                <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-black font-mono tabular-nums ${
+                  activeSubTab === 'TURNOVER'
+                    ? 'bg-white/20 text-white'
+                    : 'bg-rose-100 text-rose-700'
+                }`}>
+                  {stockTurnoverAnalysis.summary.verySlowCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playTap();
+                setActiveSubTab('MONTHLY_AUDIT');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                activeSubTab === 'MONTHLY_AUDIT'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <FileDown className={`w-3.5 h-3.5 ${activeSubTab === 'MONTHLY_AUDIT' ? 'text-sky-400' : 'text-indigo-600'}`} />
+              <span>Audit Bulanan (PDF)</span>
             </button>
 
             <button
@@ -1495,6 +1641,59 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Slow-Moving Stock (>90 Days) Liquidation Alert Notification */}
+        {stockTurnoverAnalysis.summary.verySlowCount > 0 &&
+          !dismissedSlowAlert &&
+          !(activeSubTab === 'TURNOVER' && turnoverSpeedFilter === 'VERY_SLOW') && (
+            <div className="bg-rose-50 border border-rose-200 rounded-2xl p-3.5 md:px-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="p-2 rounded-xl bg-rose-600 text-white shrink-0">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs md:text-sm font-bold text-rose-950">
+                    Notifikasi Likuidasi: {stockTurnoverAnalysis.summary.verySlowCount} Produk Berputar Sangat Lambat (&gt;90 Hari)
+                  </div>
+                  <p className="text-xs text-rose-800 mt-0.5 tabular-nums">
+                    Total modal tertahan sebesar{' '}
+                    <strong>{formatRupiah(stockTurnoverAnalysis.summary.verySlowCapitalValue)}</strong> pada stok yang minim pergerakan dalam {turnoverLookbackDays} hari terakhir (contoh:{' '}
+                    {stockTurnoverAnalysis.verySlowItems
+                      .slice(0, 3)
+                      .map((item) => item.product.name)
+                      .join(', ')}
+                    {stockTurnoverAnalysis.summary.verySlowCount > 3
+                      ? `, +${stockTurnoverAnalysis.summary.verySlowCount - 3} lainnya`
+                      : ''}
+                    ). Pertimbangkan diskon likuidasi untuk mencairkan kas.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setTurnoverSpeedFilter('VERY_SLOW');
+                    setActiveSubTab('TURNOVER');
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <span>Buka Daftar Likuidasi</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDismissedSlowAlert(true)}
+                  title="Tutup notifikasi sementara"
+                  className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-100 hover:text-rose-800 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
 
         {/* =================================================================== */}
         {/* SUBTAB 1: MONITORING & RINGKASAN STOK                              */}
@@ -1769,7 +1968,11 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                                       type="button"
                                       onClick={() => {
                                         sound.playSuccessChime();
-                                        onUpdateStock(r.product.id, r.batchSum);
+                                        onUpdateStock(
+                                          r.product.id,
+                                          r.batchSum,
+                                          'Sinkronisasi otomatis Verify Stock ke total batch FIFO'
+                                        );
                                         setVerifyFeedbackMsg(
                                           `Stok "${r.product.name}" disinkronkan ke total batch (${formatNumber(r.batchSum)} ${r.product.baseUnit}).`
                                         );
@@ -1813,6 +2016,38 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 if (prod) setSearch(prod.name);
               }}
               onOpenThresholdSettings={onOpenThresholdSettings}
+            />
+
+            {/* Top & Bottom Moving Products Bar Chart (Fastest vs Slowest Stock Turnover) */}
+            <TopBottomMovingProductsChart
+              analysis={stockTurnoverAnalysis}
+              lookbackDays={turnoverLookbackDays}
+              onChangeLookbackDays={setTurnoverLookbackDays}
+              onSelectProduct={(productId, speedCategory) => {
+                const prod = products.find((p) => p.id === productId);
+                if (prod) setSearch(prod.name);
+                if (speedCategory === 'VERY_SLOW' || speedCategory === 'SLOW') {
+                  setTurnoverSpeedFilter(speedCategory);
+                }
+              }}
+              onOpenTurnoverTab={() => {
+                setTurnoverSpeedFilter('VERY_SLOW');
+                setActiveSubTab('TURNOVER');
+              }}
+            />
+
+            {/* 30-Day Expiring Products Clearance & Promo Module */}
+            <ExpiringClearanceModule
+              products={products}
+              storeSettings={storeSettings}
+              currentUserRole={currentUserRole}
+              onUpdateProduct={onUpdateProduct}
+              onAdjustStockForProduct={(p, reason) => {
+                setAdjustingProduct(p);
+                setStockAdjustmentVal(p.stockInBaseUnit.toString());
+                setAdjustmentType('SET');
+                setAdjustmentReason(reason);
+              }}
             />
 
             {/* 4 KPI Summary Cards */}
@@ -2981,11 +3216,30 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                             sound.playTap();
                             setSelectedHistoricalOpname(record);
                           }}
-                          className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs rounded-xl transition-colors flex items-center gap-1.5 shadow-2xs"
+                          className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs rounded-xl transition-colors flex items-center gap-1.5 shadow-2xs whitespace-nowrap"
                         >
                           <FileText className="w-3.5 h-3.5 text-slate-600" />
                           <span>Berita Acara & Detail</span>
                         </button>
+
+                        {onDeleteStockOpname && canExecuteAdjustment && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              sound.playTap();
+                              setDeletingOpname(record);
+                              setDeleteOpnameReason('');
+                              setDeleteOpnameResponsibleId(currentUser.id);
+                              setRevertStockOnOpnameDelete(true);
+                              setDeleteOpnameError('');
+                            }}
+                            className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-bold text-xs rounded-xl transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                            title="Hapus sesi Stock Opname dengan catatan audit"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Hapus</span>
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -3292,6 +3546,20 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         {/* =================================================================== */}
         {activeSubTab === 'EXPIRY_TRACKER' && (
           <div className="space-y-5 animate-in fade-in duration-150">
+            {/* 30-Day Expiring Clearance & Discount Module */}
+            <ExpiringClearanceModule
+              products={products}
+              storeSettings={storeSettings}
+              currentUserRole={currentUserRole}
+              onUpdateProduct={onUpdateProduct}
+              onAdjustStockForProduct={(p, reason) => {
+                setAdjustingProduct(p);
+                setStockAdjustmentVal(p.stockInBaseUnit.toString());
+                setAdjustmentType('SET');
+                setAdjustmentReason(reason);
+              }}
+            />
+
             {/* KPI Overview for Expiry Tracking */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
@@ -3872,6 +4140,364 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
           />
         )}
 
+        {/* =================================================================== */}
+        {/* SUBTAB: RINGKASAN PERGERAKAN STOK BULANAN & AUDIT PDF               */}
+        {/* =================================================================== */}
+        {activeSubTab === 'MONTHLY_AUDIT' && (
+          <div className="space-y-5 animate-in fade-in duration-150">
+            {/* Control & PDF Action Header Card */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-slate-100">
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                    <FileDown className="w-5 h-5 text-indigo-600 shrink-0" />
+                    <span>Ringkasan Pergerakan Stok Bulanan &amp; Generator PDF Audit</span>
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Konsolidasi otomatis total stok masuk (Purchase Order selesai), stok keluar (penjualan POS), dan selisih penyesuaian Stock Opname per bulan untuk audit gudang resmi.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playSuccessChime();
+                    generateMonthlyStockMovementPdf({
+                      data: monthlyAuditData,
+                      storeSettings,
+                      auditorName: currentUser.name,
+                      categoryFilter: auditCategoryFilter,
+                      onlyWithMovement: auditOnlyWithMovement,
+                    });
+                  }}
+                  className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center gap-2 shadow-sm whitespace-nowrap shrink-0 cursor-pointer transition-colors self-start lg:self-auto"
+                >
+                  <FileDown className="w-4 h-4 text-sky-400" />
+                  <span>Generate PDF Audit ({monthlyAuditData.monthLabel})</span>
+                </button>
+              </div>
+
+              {/* Filter Toolbar */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                <div className="md:col-span-4 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Periode Bulan Audit
+                  </label>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <input
+                      type="month"
+                      value={auditMonthKey}
+                      onChange={(e) => {
+                        if (e.target.value) setAuditMonthKey(e.target.value);
+                      }}
+                      className="p-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono font-bold text-slate-900 focus:border-indigo-500 focus:outline-none"
+                    />
+                    {[
+                      { label: 'Bulan Ini', key: getCurrentMonthKey() },
+                      { label: 'Bulan Lalu', key: shiftMonthKey(getCurrentMonthKey(), -1) },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setAuditMonthKey(preset.key);
+                        }}
+                        className={`px-2.5 py-2 rounded-xl text-[11px] font-bold border whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                          auditMonthKey === preset.key
+                            ? 'bg-indigo-600 text-white border-indigo-600'
+                            : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="md:col-span-3 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Filter Kategori Produk
+                  </label>
+                  <select
+                    value={auditCategoryFilter}
+                    onChange={(e) => setAuditCategoryFilter(e.target.value)}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-semibold text-slate-900 focus:border-indigo-500 focus:outline-none"
+                  >
+                    {categories.map((cat) => (
+                      <option key={cat} value={cat}>
+                        {cat === 'SEMUA' ? 'Semua Kategori' : cat}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="md:col-span-3 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Cari Produk / SKU
+                  </label>
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={auditSearch}
+                      onChange={(e) => setAuditSearch(e.target.value)}
+                      placeholder="Nama produk atau SKU..."
+                      className="w-full pl-8 pr-3 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="md:col-span-2 flex items-center pb-1">
+                  <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={auditOnlyWithMovement}
+                      onChange={(e) => {
+                        sound.playTap();
+                        setAuditOnlyWithMovement(e.target.checked);
+                      }}
+                      className="w-4 h-4 accent-indigo-600 rounded cursor-pointer"
+                    />
+                    <span>Hanya yg bergerak</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {/* 4 Monthly Audit KPI Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-1">
+                <div className="text-[10.5px] font-bold uppercase tracking-wide text-emerald-700 flex items-center justify-between">
+                  <span>Total Stok Masuk (PO)</span>
+                  <span className="font-mono">{formatNumber(monthlyAuditData.totalCompletedPoCount)} PO</span>
+                </div>
+                <div className="text-2xl font-black font-mono text-emerald-700 tabular-nums">
+                  +{formatNumber(monthlyAuditData.totalStockInUnits)} unit
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                  Nilai Belanja: {formatRupiah(monthlyAuditData.totalStockInValue)}
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-1">
+                <div className="text-[10.5px] font-bold uppercase tracking-wide text-sky-700 flex items-center justify-between">
+                  <span>Total Stok Keluar (Jual)</span>
+                  <span className="font-mono">{formatNumber(monthlyAuditData.totalSalesTxCount)} Nota</span>
+                </div>
+                <div className="text-2xl font-black font-mono text-sky-700 tabular-nums">
+                  -{formatNumber(monthlyAuditData.totalStockOutUnits)} unit
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                  HPP FIFO: {formatRupiah(monthlyAuditData.totalStockOutCogs)}
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-1">
+                <div className="text-[10.5px] font-bold uppercase tracking-wide text-amber-700 flex items-center justify-between">
+                  <span>Penyesuaian Opname</span>
+                  <span className="font-mono">{formatNumber(monthlyAuditData.totalOpnameSessionCount)} Sesi</span>
+                </div>
+                <div
+                  className={`text-2xl font-black font-mono tabular-nums ${
+                    monthlyAuditData.totalOpnameNetUnits < 0
+                      ? 'text-rose-700'
+                      : monthlyAuditData.totalOpnameNetUnits > 0
+                      ? 'text-emerald-700'
+                      : 'text-slate-800'
+                  }`}
+                >
+                  {monthlyAuditData.totalOpnameNetUnits > 0 ? '+' : ''}
+                  {formatNumber(monthlyAuditData.totalOpnameNetUnits)} unit
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                  Selisih Nilai: {monthlyAuditData.totalOpnameNetValue > 0 ? '+' : ''}
+                  {formatRupiah(monthlyAuditData.totalOpnameNetValue)} (+{formatNumber(monthlyAuditData.totalOpnamePositiveUnits)} / -{formatNumber(monthlyAuditData.totalOpnameNegativeUnits)})
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-1">
+                <div className="text-[10.5px] font-bold uppercase tracking-wide text-slate-600 flex items-center justify-between">
+                  <span>Netto &amp; Valuasi Kini</span>
+                  <span className="font-mono">{formatNumber(monthlyAuditData.activeMovedSkuCount)}/{formatNumber(monthlyAuditData.totalSkuCount)} SKU</span>
+                </div>
+                <div className="text-2xl font-black font-mono text-slate-900 tabular-nums">
+                  {monthlyAuditData.totalNetMovementUnits > 0 ? '+' : ''}
+                  {formatNumber(monthlyAuditData.totalNetMovementUnits)} unit
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                  Aset Stok: {formatRupiah(monthlyAuditData.totalEndingValuation)}
+                </div>
+              </div>
+            </div>
+
+            {/* Interactive Preview Table of Monthly Stock Movement */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
+              <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="text-xs font-bold text-slate-900">
+                  Pratinjau Pergerakan Stok Bulan {monthlyAuditData.monthLabel} ({formatNumber(filteredMonthlyAuditRows.length)} SKU)
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  Formula Netto = Stok Masuk (+) − Stok Keluar (−) + Penyesuaian Opname (±)
+                </div>
+              </div>
+
+              <div className="overflow-x-auto max-h-[460px] overflow-y-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-100 text-slate-600 uppercase text-[10px] font-bold sticky top-0 z-10">
+                    <tr>
+                      <th className="py-2.5 px-3">Produk &amp; SKU</th>
+                      <th className="py-2.5 px-3">Kategori</th>
+                      <th className="py-2.5 px-3 text-right text-emerald-700">Masuk (+)</th>
+                      <th className="py-2.5 px-3 text-right text-sky-700">Keluar (−)</th>
+                      <th className="py-2.5 px-3 text-right text-amber-700">Opname (±)</th>
+                      <th className="py-2.5 px-3 text-right">Netto Bln</th>
+                      <th className="py-2.5 px-3 text-right">Stok Saat Ini</th>
+                      <th className="py-2.5 px-3 text-right">Valuasi Modal</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredMonthlyAuditRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
+                          Tidak ada data pergerakan stok yang sesuai filter untuk bulan {monthlyAuditData.monthLabel}.
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredMonthlyAuditRows.map((row) => (
+                        <tr key={row.productId} className="hover:bg-slate-50/90">
+                          <td className="py-2.5 px-3">
+                            <div className="font-bold text-slate-900">{row.productName}</div>
+                            <div className="text-[10px] font-mono text-slate-500">{row.barcode}</div>
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-600">{row.category}</td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-emerald-700">
+                            {row.stockInUnits > 0 ? `+${formatNumber(row.stockInUnits)}` : '0'}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-sky-700">
+                            {row.stockOutUnits > 0 ? `-${formatNumber(row.stockOutUnits)}` : '0'}
+                          </td>
+                          <td
+                            className={`py-2.5 px-3 text-right font-mono font-bold tabular-nums ${
+                              row.opnameAdjustmentUnits < 0
+                                ? 'text-rose-700'
+                                : row.opnameAdjustmentUnits > 0
+                                ? 'text-emerald-700'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            {row.opnameAdjustmentUnits > 0 ? '+' : ''}
+                            {formatNumber(row.opnameAdjustmentUnits)}
+                          </td>
+                          <td
+                            className={`py-2.5 px-3 text-right font-mono font-black tabular-nums ${
+                              row.netMovementUnits > 0
+                                ? 'text-emerald-800'
+                                : row.netMovementUnits < 0
+                                ? 'text-rose-700'
+                                : 'text-slate-600'
+                            }`}
+                          >
+                            {row.netMovementUnits > 0 ? '+' : ''}
+                            {formatNumber(row.netMovementUnits)}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900 tabular-nums">
+                            {formatNumber(row.currentEndingStock)} {row.baseUnit}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono text-slate-700 tabular-nums">
+                            {formatRupiah(row.endingStockValuation)}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Opname Audit Sessions inside Selected Month */}
+            {monthlyAuditData.monthOpnames.length > 0 && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
+                    <ClipboardCheck className="w-4 h-4 text-emerald-600" />
+                    <span>Log Sesi Stock Opname Bulan {monthlyAuditData.monthLabel} ({monthlyAuditData.monthOpnames.length} Sesi)</span>
+                  </h4>
+                  <span className="text-[11px] text-slate-500">
+                    Turut disertakan otomatis di halaman PDF Audit Bulanan
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600 text-[10px] uppercase font-bold">
+                      <tr>
+                        <th className="py-2 px-3">No. Sesi</th>
+                        <th className="py-2 px-3">Tanggal</th>
+                        <th className="py-2 px-3">Auditor</th>
+                        <th className="py-2 px-3">Jenis / Alasan</th>
+                        <th className="py-2 px-3 text-right">SKU / Selisih</th>
+                        <th className="py-2 px-3 text-right">Nilai Selisih</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {monthlyAuditData.monthOpnames.map((op) => (
+                        <tr key={op.id}>
+                          <td className="py-2 px-3 font-mono font-bold text-slate-900">{op.sessionNumber}</td>
+                          <td className="py-2 px-3 font-mono text-slate-600">{op.date}</td>
+                          <td className="py-2 px-3 text-slate-700">{op.auditorName}</td>
+                          <td className="py-2 px-3 text-slate-600">{op.generalReason}</td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums">
+                            {formatNumber(op.totalItemsAudited)} SKU ({formatNumber(op.totalDiscrepancies)} selisih)
+                          </td>
+                          <td
+                            className={`py-2 px-3 text-right font-mono font-bold tabular-nums ${
+                              op.totalDifferenceValue < 0
+                                ? 'text-rose-700'
+                                : op.totalDifferenceValue > 0
+                                ? 'text-emerald-700'
+                                : 'text-slate-600'
+                            }`}
+                          >
+                            {op.totalDifferenceValue > 0 ? '+' : ''}
+                            {formatRupiah(op.totalDifferenceValue)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* SUBTAB: STOCK TURN RATE & LIKUIDASI (>90 HARI)                      */}
+        {/* =================================================================== */}
+        {activeSubTab === 'TURNOVER' && (
+          <div className="space-y-4">
+            <TopBottomMovingProductsChart
+              analysis={stockTurnoverAnalysis}
+              lookbackDays={turnoverLookbackDays}
+              onChangeLookbackDays={setTurnoverLookbackDays}
+              onSelectProduct={(_productId, speedCategory) => {
+                if (speedCategory !== 'OUT_OF_STOCK') {
+                  setTurnoverSpeedFilter(speedCategory);
+                }
+              }}
+            />
+            <StockTurnRateModule
+              analysis={stockTurnoverAnalysis}
+              lookbackDays={turnoverLookbackDays}
+              onChangeLookbackDays={setTurnoverLookbackDays}
+              currentUserRole={currentUserRole}
+              initialSpeedFilter={turnoverSpeedFilter}
+              onUpdateProduct={onUpdateProduct}
+              onNavigateToSuppliers={onNavigateToSuppliers}
+            />
+          </div>
+        )}
+
       </div>
 
       {/* =================================================================== */}
@@ -3917,13 +4543,37 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   <strong className="text-slate-800">{sessionDate}</strong>
                 </div>
                 <div>
-                  <span className="text-slate-500">Auditor:</span>{' '}
-                  <strong className="text-slate-800">{currentUser.name}</strong>
+                  <span className="text-slate-500">User Penanggung Jawab:</span>{' '}
+                  <strong className="text-slate-800">
+                    {(availableResponsibleUsers.find((u) => u.id === opnameResponsibleUserId) || currentUser).name}
+                  </strong>
                 </div>
                 <div>
                   <span className="text-slate-500">Alasan:</span>{' '}
                   <strong className="text-slate-800">{sessionGeneralReason}</strong>
                 </div>
+              </div>
+
+              {/* User Penanggung Jawab Selector */}
+              <div className="bg-white p-3 rounded-2xl border border-slate-200">
+                <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5 mb-1.5">
+                  <UserCheck className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>User Penanggung Jawab Audit Stock Opname</span>
+                </label>
+                <select
+                  value={opnameResponsibleUserId}
+                  onChange={(e) => setOpnameResponsibleUserId(e.target.value)}
+                  className="w-full p-2.5 rounded-xl border border-slate-300 bg-slate-50 text-xs font-bold text-slate-800 focus:outline-none focus:border-emerald-500"
+                >
+                  {availableResponsibleUsers.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name} ({u.role})
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Nama penanggung jawab tercatat pada Berita Acara & Log Aktivitas Stock Opname.
+                </p>
               </div>
 
               {/* Items with Discrepancy Preview */}
@@ -4590,6 +5240,163 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   Tutup
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* MODAL 5: HAPUS SESI STOCK OPNAME DENGAN KETERANGAN & PENANGGUNG JAWAB*/}
+      {/* =================================================================== */}
+      {deletingOpname && onDeleteStockOpname && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-3 select-none">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Hapus Sesi Stock Opname</h3>
+                  <p className="text-xs text-slate-500 font-mono">
+                    {deletingOpname.sessionNumber} · {deletingOpname.date}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeletingOpname(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-600"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="py-4 space-y-4">
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-900 space-y-1">
+                <div className="font-bold flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>Pencatatan Audit Penghapusan Permanen</span>
+                </div>
+                <p>
+                  Penghapusan sesi opname ({deletingOpname.totalItemsAudited} SKU) akan langsung dicatat ke Log Aktivitas Stock Opname beserta{' '}
+                  <strong>Keterangan Penghapusan</strong> dan <strong>User Penanggung Jawab</strong>.
+                </p>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-800 block mb-1.5">
+                  User Penanggung Jawab <span className="text-rose-600">*</span>
+                </label>
+                <select
+                  value={deleteOpnameResponsibleId}
+                  onChange={(e) => setDeleteOpnameResponsibleId(e.target.value)}
+                  className="w-full p-2.5 rounded-xl border border-slate-300 bg-slate-50 text-xs font-bold text-slate-800 focus:outline-none focus:border-rose-500"
+                >
+                  {availableResponsibleUsers.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name} ({u.role})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-800 block mb-1.5">
+                  Keterangan Penghapusan <span className="text-rose-600">*</span>
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {[
+                    'Salah input hitung fisik',
+                    'Sesi opname duplikat',
+                    'Batal koreksi audit',
+                    'Retur / koreksi transaksi salah',
+                  ].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setDeleteOpnameReason(preset);
+                        setDeleteOpnameError('');
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors ${
+                        deleteOpnameReason === preset
+                          ? 'bg-rose-600 text-white border-rose-600'
+                          : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+                <textarea
+                  rows={2}
+                  value={deleteOpnameReason}
+                  onChange={(e) => {
+                    setDeleteOpnameReason(e.target.value);
+                    if (deleteOpnameError) setDeleteOpnameError('');
+                  }}
+                  placeholder="Tuliskan alasan penghapusan sesi stock opname ini..."
+                  className="w-full p-2.5 rounded-xl border border-slate-300 text-xs text-slate-900 focus:border-rose-500 focus:outline-none"
+                />
+                {deleteOpnameError && (
+                  <p className="text-[11px] font-bold text-rose-600 mt-1">{deleteOpnameError}</p>
+                )}
+              </div>
+
+              <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-50 border border-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={revertStockOnOpnameDelete}
+                  onChange={(e) => setRevertStockOnOpnameDelete(e.target.checked)}
+                  className="mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500"
+                />
+                <div className="text-xs text-slate-700">
+                  <span className="font-bold text-slate-900 block">
+                    Kembalikan stok produk ke kondisi sebelum opname ini
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    Jika dicentang, selisih stok dari sesi {deletingOpname.sessionNumber} akan dibalikkan pada stok sistem saat ini.
+                  </span>
+                </div>
+              </label>
+            </div>
+
+            <div className="pt-3 border-t border-slate-100 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeletingOpname(null)}
+                className="py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 text-xs font-bold hover:bg-slate-100"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const trimmed = deleteOpnameReason.trim();
+                  if (!trimmed) {
+                    sound.playError();
+                    setDeleteOpnameError('Keterangan penghapusan wajib diisi untuk audit trail.');
+                    return;
+                  }
+                  const chosen =
+                    availableResponsibleUsers.find((u) => u.id === deleteOpnameResponsibleId) ||
+                    currentUser;
+                  sound.playTap();
+                  onDeleteStockOpname(
+                    deletingOpname,
+                    trimmed,
+                    { id: chosen.id, name: chosen.name, role: chosen.role },
+                    revertStockOnOpnameDelete
+                  );
+                  setDeletingOpname(null);
+                  setDeleteOpnameReason('');
+                }}
+                className="py-2.5 px-5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-md shadow-rose-600/20 active:scale-95"
+              >
+                Hapus & Catat Log Audit
+              </button>
             </div>
           </div>
         </div>

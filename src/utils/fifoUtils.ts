@@ -1,4 +1,4 @@
-import { Product, ProductBatch, Transaction, TransactionItem, BatchDeduction } from '../types/pos';
+import { Product, ProductBatch, Transaction, TransactionItem, BatchDeduction, BatchReturnRestoration } from '../types/pos';
 
 /**
  * Calculates the exact FIFO Cost of Goods Sold (HPP / COGS) for a sold item.
@@ -12,6 +12,16 @@ import { Product, ProductBatch, Transaction, TransactionItem, BatchDeduction } f
  *    baseUnits * (prod.costPrice || 0)
  */
 export function getItemFifoCogs(item: TransactionItem, prod?: Product): number {
+  const isTarikTunai =
+    Boolean(item.isCashWithdrawal) ||
+    (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+  if (isTarikTunai) {
+    const principalPerUnit =
+      item.principalAmount !== undefined
+        ? Math.max(0, item.principalAmount)
+        : Math.max(0, item.costPrice || 0);
+    return Math.round((item.quantity || 0) * principalPerUnit);
+  }
   if (item.isService || item.isQuickSale) {
     return 0;
   }
@@ -1011,5 +1021,180 @@ export function recalculateChronologicalFifoForNewTransaction(
     recalculatedItemCount,
   };
 }
+
+/**
+ * Restores returned base units back into the exact source FIFO batches tracked on
+ * `item.batchDeductions` (walking in reverse / LIFO order of deductions while skipping
+ * any units already returned in prior partial return operations).
+ */
+export function restoreProductBatchesForReturn(params: {
+  product: Product;
+  item: TransactionItem;
+  returnBaseUnits: number;
+  alreadyReturnedBaseUnits?: number;
+  invoiceNumber: string;
+}): {
+  updatedProduct: Product;
+  restoredBatches: BatchReturnRestoration[];
+} {
+  const { product, item, returnBaseUnits, alreadyReturnedBaseUnits = 0, invoiceNumber } = params;
+  if (returnBaseUnits <= 0 || product.productType === 'JASA' || item.isService) {
+    return {
+      updatedProduct: product,
+      restoredBatches: [],
+    };
+  }
+
+  const now = Date.now();
+  const todayStr = new Date(now).toISOString().split('T')[0];
+  const batches: ProductBatch[] = (product.batches || []).map((b) => ({ ...b }));
+  const restoredBatches: BatchReturnRestoration[] = [];
+
+  const deductions = Array.isArray(item.batchDeductions) ? item.batchDeductions : [];
+  let remainingToRestore = returnBaseUnits;
+  let skipAlreadyReturned = Math.max(0, alreadyReturnedBaseUnits);
+
+  const applyToTargetBatch = (
+    ded: { batchId: string; batchNumber?: string; costPrice: number; expiryDate?: string },
+    qtyToAdd: number
+  ) => {
+    if (qtyToAdd <= 0) return;
+
+    const existingBatch =
+      ded.batchId !== 'batch_deficit'
+        ? batches.find((b) => b.id === ded.batchId) ||
+          (ded.batchNumber ? batches.find((b) => b.batchNumber === ded.batchNumber) : undefined)
+        : undefined;
+
+    if (existingBatch) {
+      existingBatch.remainingQuantity = (existingBatch.remainingQuantity || 0) + qtyToAdd;
+      if (existingBatch.initialQuantity < existingBatch.remainingQuantity) {
+        existingBatch.initialQuantity = existingBatch.remainingQuantity;
+      }
+      restoredBatches.push({
+        batchId: existingBatch.id,
+        batchNumber: existingBatch.batchNumber,
+        restoredBaseUnits: qtyToAdd,
+        costPrice: existingBatch.costPrice ?? ded.costPrice ?? product.costPrice ?? 0,
+        expiryDate: existingBatch.expiryDate || ded.expiryDate,
+        createdFallbackBatch: false,
+      });
+    } else {
+      const targetCost = ded.costPrice ?? item.costPrice ?? product.costPrice ?? 0;
+      const fallbackBatchNum =
+        ded.batchNumber && ded.batchId !== 'batch_deficit'
+          ? ded.batchNumber
+          : `RETUR-${invoiceNumber}`;
+
+      const existingFallback = batches.find(
+        (b) => b.batchNumber === fallbackBatchNum && b.costPrice === targetCost
+      );
+      if (existingFallback) {
+        existingFallback.remainingQuantity = (existingFallback.remainingQuantity || 0) + qtyToAdd;
+        existingFallback.initialQuantity = Math.max(
+          existingFallback.initialQuantity || 0,
+          existingFallback.remainingQuantity
+        );
+        restoredBatches.push({
+          batchId: existingFallback.id,
+          batchNumber: existingFallback.batchNumber,
+          restoredBaseUnits: qtyToAdd,
+          costPrice: existingFallback.costPrice,
+          expiryDate: existingFallback.expiryDate,
+          createdFallbackBatch: true,
+        });
+      } else {
+        const newBatchId = `batch_ret_${now}_${Math.random().toString(36).substring(2, 7)}`;
+        const createdBatch: ProductBatch = {
+          id: newBatchId,
+          batchNumber: fallbackBatchNum,
+          receivedAt: now,
+          receivedDate: todayStr,
+          expiryDate: ded.expiryDate,
+          initialQuantity: qtyToAdd,
+          remainingQuantity: qtyToAdd,
+          costPrice: targetCost,
+          supplierName: `Retur ${invoiceNumber}`,
+        };
+        batches.push(createdBatch);
+        restoredBatches.push({
+          batchId: createdBatch.id,
+          batchNumber: createdBatch.batchNumber,
+          restoredBaseUnits: qtyToAdd,
+          costPrice: createdBatch.costPrice,
+          expiryDate: createdBatch.expiryDate,
+          createdFallbackBatch: true,
+        });
+      }
+    }
+  };
+
+  // Walk recorded batchDeductions from newest consumed (LIFO) back to oldest
+  if (deductions.length > 0) {
+    const reversedDeductions = [...deductions].reverse();
+    for (const ded of reversedDeductions) {
+      if (remainingToRestore <= 0) break;
+      const dedQty = Math.max(0, ded.quantity || 0);
+      if (dedQty <= 0) continue;
+
+      if (skipAlreadyReturned >= dedQty) {
+        skipAlreadyReturned -= dedQty;
+        continue;
+      }
+
+      const eligibleFromSlot = dedQty - skipAlreadyReturned;
+      skipAlreadyReturned = 0;
+
+      const allocate = Math.min(eligibleFromSlot, remainingToRestore);
+      remainingToRestore -= allocate;
+      applyToTargetBatch(ded, allocate);
+    }
+  }
+
+  // If still remaining (e.g. legacy transaction without batchDeductions), restore to newest active batch or create return batch
+  if (remainingToRestore > 0) {
+    const activeBatch = sortBatchesFifoFefo(batches).find((b) => (b.remainingQuantity || 0) >= 0);
+    if (activeBatch) {
+      applyToTargetBatch(
+        {
+          batchId: activeBatch.id,
+          batchNumber: activeBatch.batchNumber,
+          costPrice: activeBatch.costPrice,
+          expiryDate: activeBatch.expiryDate,
+        },
+        remainingToRestore
+      );
+    } else {
+      applyToTargetBatch(
+        {
+          batchId: 'batch_retur_fallback',
+          batchNumber: `RETUR-${invoiceNumber}`,
+          costPrice: item.costPrice ?? product.costPrice ?? 0,
+        },
+        remainingToRestore
+      );
+    }
+  }
+
+  const sortedBatches = sortBatchesFifoFefo(batches);
+  const nextActiveBatch = sortedBatches.find((b) => (b.remainingQuantity || 0) > 0);
+  const nextStock = Math.max(0, (product.stockInBaseUnit || 0) + returnBaseUnits);
+
+  const updatedProduct: Product = {
+    ...product,
+    stockInBaseUnit: nextStock,
+    batches: sortedBatches,
+    costPrice:
+      nextActiveBatch && nextActiveBatch.costPrice !== undefined
+        ? nextActiveBatch.costPrice
+        : product.costPrice,
+  };
+
+  return {
+    updatedProduct,
+    restoredBatches,
+  };
+}
+
 
 

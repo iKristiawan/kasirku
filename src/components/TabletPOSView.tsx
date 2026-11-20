@@ -47,7 +47,11 @@ import {
   Edit3,
   Zap,
   QrCode,
-  PackageSearch
+  PackageSearch,
+  History,
+  User,
+  ArrowUpRight,
+  ArrowDownRight
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -60,7 +64,7 @@ import {
 } from 'recharts';
 import { motion, AnimatePresence } from 'motion/react';
 import { Product, ProductUnit, ProductCategory, Customer, CartItem, StoreSettings, StockAlertNotification, Transaction } from '../types/pos';
-import { formatRupiah, formatNumber } from '../utils/formatters';
+import { formatRupiah, formatNumber, formatDateTime } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { getCategoryColor } from '../utils/categoryColors';
 import {
@@ -91,9 +95,16 @@ interface TabletPOSViewProps {
   pointsToUse: number;
   storeSettings: StoreSettings;
   onAddToCart: (product: Product, unit: ProductUnit, qty?: number, selectedVariant?: string) => void;
-  onAddQuickSaleItem?: (item: { description: string; amount: number; quantity: number; unitName?: string }) => void;
+  onAddQuickSaleItem?: (item: {
+    description: string;
+    amount: number;
+    adminFee?: number;
+    quantity: number;
+    unitName?: string;
+    isCashWithdrawal?: boolean;
+  }) => { ok: boolean; error?: string; availableCashBalance?: number; blocked?: boolean } | void;
   onUpdateCartItemQty: (cartItemId: string, newQty: number) => void;
-  onUpdateCartItemPrice?: (cartItemId: string, newUnitPrice: number) => void;
+  onUpdateCartItemPrice?: (cartItemId: string, newUnitPrice: number, reason?: string) => void;
   onChangeCartItemUnit: (cartItemId: string, newUnit: ProductUnit) => void;
   onRemoveCartItem: (cartItemId: string) => void;
   onClearCart: () => void;
@@ -109,6 +120,7 @@ interface TabletPOSViewProps {
   onOpenThresholdSettings: () => void;
   onNavigateToSuppliers?: () => void;
   transactions?: Transaction[];
+  availableStoreCashBalance?: number;
   specialPriceNotice?: {
     customerName: string;
     category: string;
@@ -122,11 +134,40 @@ interface TabletPOSViewProps {
 
 const POS_VISIBLE_BATCH = 48;
 
+const escapeSearchRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const HighlightMatchText: React.FC<{ text: string; query?: string; highlightClassName?: string }> = ({
+  text,
+  query,
+  highlightClassName = 'bg-amber-200 text-slate-950 font-bold rounded-[3px] px-0.5',
+}) => {
+  const trimmed = (query || '').trim();
+  if (!trimmed || !text) return <>{text}</>;
+  const regex = new RegExp(`(${escapeSearchRegex(trimmed)})`, 'gi');
+  const parts = text.split(regex);
+  const lowerQuery = trimmed.toLowerCase();
+
+  return (
+    <>
+      {parts.map((part, idx) =>
+        part.toLowerCase() === lowerQuery ? (
+          <mark key={idx} className={highlightClassName}>
+            {part}
+          </mark>
+        ) : (
+          <React.Fragment key={idx}>{part}</React.Fragment>
+        )
+      )}
+    </>
+  );
+};
+
 interface POSProductCardProps {
   product: Product;
   catColor: string;
   customerCategory?: string;
   isHighlighted: boolean;
+  searchQuery?: string;
   onSelect: (product: Product) => void;
   onNavigateToSuppliers?: () => void;
 }
@@ -136,6 +177,7 @@ const POSProductCard = memo<POSProductCardProps>(({
   catColor,
   customerCategory,
   isHighlighted,
+  searchQuery,
   onSelect,
   onNavigateToSuppliers,
 }) => {
@@ -144,6 +186,25 @@ const POSProductCard = memo<POSProductCardProps>(({
   const isLowStock = !isService && product.stockInBaseUnit > 0 && product.stockInBaseUnit <= product.minStockAlert;
   const defaultUnit = product.units[0];
   const stockRatio = product.minStockAlert > 0 ? (product.stockInBaseUnit / product.minStockAlert) * 100 : 0;
+
+  const trimmedQuery = (searchQuery || '').trim();
+  const normalizedQuery = trimmedQuery.toLowerCase();
+  const matchedCode = normalizedQuery
+    ? (product.sku && product.sku.toLowerCase().includes(normalizedQuery)
+        ? `SKU: ${product.sku}`
+        : product.barcode && product.barcode.toLowerCase().includes(normalizedQuery)
+        ? `Barcode: ${product.barcode}`
+        : product.units.find((u) => u.barcode && u.barcode.toLowerCase().includes(normalizedQuery))?.barcode
+        ? `Barcode: ${product.units.find((u) => u.barcode && u.barcode.toLowerCase().includes(normalizedQuery))?.barcode}`
+        : null)
+    : null;
+  const matchedVariant = normalizedQuery
+    ? product.variants?.find(
+        (v) =>
+          v.name.toLowerCase().includes(normalizedQuery) ||
+          (v.barcode && v.barcode.toLowerCase().includes(normalizedQuery))
+      )
+    : undefined;
 
   const activeSpecial = customerCategory
     ? findCustomerSpecialPrice(product, customerCategory, defaultUnit, 1)
@@ -279,7 +340,9 @@ const POSProductCard = memo<POSProductCardProps>(({
               className="w-1.5 h-1.5 rounded-full shrink-0"
               style={{ backgroundColor: catColor }}
             />
-            <span className="truncate">{product.category}</span>
+            <span className="truncate">
+              <HighlightMatchText text={product.category} query={trimmedQuery} />
+            </span>
           </span>
 
           {isService && (
@@ -290,8 +353,22 @@ const POSProductCard = memo<POSProductCardProps>(({
         </div>
 
         <h3 className="text-xs md:text-sm font-semibold text-slate-900 line-clamp-2 leading-snug">
-          {product.name}
+          <HighlightMatchText text={product.name} query={trimmedQuery} />
         </h3>
+
+        {(matchedCode || matchedVariant) && (
+          <div className="mt-1 text-[10px] font-mono text-slate-600 truncate">
+            {matchedCode && (
+              <HighlightMatchText text={matchedCode} query={trimmedQuery} />
+            )}
+            {matchedCode && matchedVariant ? ' · ' : ''}
+            {matchedVariant && (
+              <span>
+                Varian: <HighlightMatchText text={matchedVariant.name} query={trimmedQuery} />
+              </span>
+            )}
+          </div>
+        )}
 
         {isService && product.technicianName && (
           <div className="mt-1 flex items-center gap-1 text-[10.5px] text-purple-700 font-semibold truncate">
@@ -305,7 +382,10 @@ const POSProductCard = memo<POSProductCardProps>(({
       <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
         <div className="min-w-0 pr-1">
           <div className="text-[10px] text-slate-400 font-semibold uppercase flex items-center gap-1 flex-wrap">
-            <span>{isService ? `Tarif / ${defaultUnit.unitName}` : defaultUnit.unitName}</span>
+            <span>
+              {isService ? 'Tarif / ' : ''}
+              <HighlightMatchText text={defaultUnit.unitName} query={trimmedQuery} />
+            </span>
             {activeSpecial && (
               <span className="px-1 py-0.2 rounded bg-purple-100 text-purple-800 border border-purple-200 text-[8.5px] font-black">
                 🏷️ {customerCategory}
@@ -406,6 +486,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
   pointsToUse,
   storeSettings,
   transactions = [],
+  availableStoreCashBalance,
   specialPriceNotice = null,
   onDismissSpecialPriceNotice,
   onAddToCart,
@@ -440,6 +521,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
   const [isQuickSaleModalOpen, setIsQuickSaleModalOpen] = useState(false);
   const [quickSaleDescription, setQuickSaleDescription] = useState('');
   const [quickSaleAmount, setQuickSaleAmount] = useState('');
+  const [quickSaleAdminFee, setQuickSaleAdminFee] = useState('');
   const [quickSaleQty, setQuickSaleQty] = useState(1);
   const [quickSaleUnit, setQuickSaleUnit] = useState('ITEM');
   const [quickSaleError, setQuickSaleError] = useState<string | null>(null);
@@ -474,6 +556,86 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
     quantity: number;
   } | null>(null);
 
+  // Customer Product Selling Price History Modal state
+  const [priceHistoryTarget, setPriceHistoryTarget] = useState<CartItem | null>(null);
+  const [priceHistoryCustomerQuery, setPriceHistoryCustomerQuery] = useState<string>('');
+  const [priceHistoryShowAllCustomers, setPriceHistoryShowAllCustomers] = useState<boolean>(false);
+
+  interface CustomerProductPriceRecord {
+    id: string;
+    txId: string;
+    invoiceNumber: string;
+    timestamp: number;
+    cashierName: string;
+    customerId?: string;
+    customerName: string;
+    productId: string;
+    productName: string;
+    unitName: string;
+    selectedVariant?: string;
+    quantity: number;
+    unitPrice: number;
+    totalAmount: number;
+    isCustomerSpecialPrice?: boolean;
+  }
+
+  const allProductCustomerSales = useMemo<CustomerProductPriceRecord[]>(() => {
+    const records: CustomerProductPriceRecord[] = [];
+    (transactions || []).forEach((tx) => {
+      const custName = (tx.customerName || 'Pelanggan Umum').trim();
+      (tx.items || []).forEach((it, idx) => {
+        records.push({
+          id: `${tx.id}_${idx}`,
+          txId: tx.id,
+          invoiceNumber: tx.invoiceNumber,
+          timestamp: tx.timestamp,
+          cashierName: tx.cashierName || '-',
+          customerId: tx.customerId,
+          customerName: custName,
+          productId: it.productId,
+          productName: it.productName,
+          unitName: it.unitName,
+          selectedVariant: it.selectedVariant,
+          quantity: it.quantity,
+          unitPrice: it.unitPrice,
+          totalAmount: it.totalAmount,
+          isCustomerSpecialPrice: it.isCustomerSpecialPrice,
+        });
+      });
+    });
+    return records.sort((a, b) => b.timestamp - a.timestamp);
+  }, [transactions]);
+
+  const getProductSalesHistory = useCallback(
+    (cartItem: CartItem, customer?: Customer | null): CustomerProductPriceRecord[] => {
+      const normItemName = (cartItem.productName || '').trim().toLowerCase();
+      const normCustName = (customer?.name || '').trim().toLowerCase();
+
+      return allProductCustomerSales.filter((rec) => {
+        const sameProduct =
+          (rec.productId && cartItem.productId && rec.productId === cartItem.productId) ||
+          (normItemName !== '' && rec.productName.trim().toLowerCase() === normItemName);
+        if (!sameProduct) return false;
+
+        if (!customer) return true;
+        const matchId = Boolean(customer.id && rec.customerId && rec.customerId === customer.id);
+        const matchName =
+          normCustName !== '' && rec.customerName.trim().toLowerCase() === normCustName;
+        return matchId || matchName;
+      });
+    },
+    [allProductCustomerSales]
+  );
+
+  const openCartPriceHistory = useCallback(
+    (item: CartItem) => {
+      setPriceHistoryTarget(item);
+      setPriceHistoryCustomerQuery('');
+      setPriceHistoryShowAllCustomers(!selectedCustomer);
+    },
+    [selectedCustomer]
+  );
+
   // Portrait Tablet Mode & Tabbed Layout State
   const [isPortrait, setIsPortrait] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -481,11 +643,11 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         if (typeof window.matchMedia === 'function') {
           const mql = window.matchMedia('(orientation: portrait)');
           if (mql && typeof mql.matches === 'boolean') {
-            return mql.matches || window.innerWidth < 1024;
+            return mql.matches || window.innerWidth < 768;
           }
         }
       } catch {}
-      return window.innerWidth < 1024;
+      return window.innerWidth < 768;
     }
     return false;
   });
@@ -510,7 +672,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           }
         }
       } catch {}
-      setIsPortrait(isPort || window.innerWidth < 1024);
+      setIsPortrait(isPort || window.innerWidth < 768);
     };
 
     window.addEventListener('resize', handleCheckOrientation);
@@ -1438,7 +1600,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
   ]);
 
   return (
-    <div className={`flex-1 min-h-0 flex ${isPortrait ? 'flex-col' : 'flex-row'} overflow-hidden bg-slate-100 relative`}>
+    <div className={`pos-tablet-shell flex-1 min-h-0 flex ${isPortrait ? 'flex-col' : 'flex-row'} overflow-hidden bg-slate-100 relative`}>
       {/* Automated Floating Push Notification Toast */}
       <StockNotificationToast
         alert={activePushToast}
@@ -1450,15 +1612,15 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
 
       {/* Portrait Tablet Tab Switcher Bar */}
       {isPortrait && (
-        <div className="bg-slate-900 text-white px-3 py-2 flex items-center justify-between border-b border-slate-800 shrink-0 z-20">
-          <div className="flex items-center gap-1.5 w-full">
+        <div className="pos-portrait-switcher bg-slate-900 text-white px-3 py-2 flex flex-col gap-2 border-b border-slate-800 shrink-0 z-20">
+          <div className="flex items-center gap-2 w-full">
             <button
               type="button"
               onClick={() => {
                 sound.playTap();
                 setPortraitTab('CATALOG');
               }}
-              className={`flex-1 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+              className={`pos-touch-target flex-1 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
                 portraitTab === 'CATALOG'
                   ? 'bg-sky-600 text-white shadow-xs'
                   : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
@@ -1474,7 +1636,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 sound.playTap();
                 setPortraitTab('CART');
               }}
-              className={`flex-1 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all relative cursor-pointer ${
+              className={`pos-touch-target flex-1 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all relative cursor-pointer ${
                 portraitTab === 'CART'
                   ? 'bg-emerald-600 text-white shadow-xs'
                   : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
@@ -1492,7 +1654,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
 
           {/* Selected Customer & Points Quick Bar in Portrait Mode */}
           {selectedCustomer && (
-            <div className="mt-2 px-3 py-2 rounded-xl bg-slate-800/90 border border-slate-700 flex items-center justify-between gap-2 text-xs">
+            <div className="px-3 py-2 rounded-xl bg-slate-800/90 border border-slate-700 flex items-center justify-between gap-2 text-xs">
               <div className="flex items-center gap-2 min-w-0">
                 <span className="font-bold text-white truncate">{selectedCustomer.name}</span>
                 {isSelectedMember ? (
@@ -1522,14 +1684,14 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
       {/* ============================================================== */}
       {/* LEFT PANEL: PRODUCT CATALOG (65% width on tablet landscape)     */}
       {/* ============================================================== */}
-      <section className={`flex flex-col min-h-0 h-full bg-slate-50 overflow-hidden ${
+      <section className={`pos-catalog-panel flex flex-col min-h-0 h-full bg-slate-50 overflow-hidden ${
         isPortrait 
           ? (portraitTab === 'CATALOG' ? 'flex-1' : 'hidden') 
           : 'w-[65%] shrink-0 border-r border-slate-200/80'
       }`}>
         {/* Top Control Bar: Search, Shortcuts, Notification Center, & Barcode Scan */}
-        <div className="p-3 md:p-4 bg-white border-b border-slate-200 shadow-xs flex items-center gap-2 shrink-0">
-          <div className="relative flex-1 min-w-0">
+        <div className="pos-catalog-toolbar p-3 md:p-4 bg-white border-b border-slate-200 shadow-xs flex items-center gap-2 shrink-0">
+          <div className="pos-catalog-search-wrap relative flex-1 min-w-0">
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
             <input
               ref={searchInputRef}
@@ -1572,7 +1734,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               setIsQuickSaleModalOpen(true);
               setTimeout(() => quickSaleDescInputRef.current?.focus(), 60);
             }}
-            className="flex items-center justify-center w-10 h-10 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow-sm shadow-emerald-600/20 transition-colors shrink-0 cursor-pointer"
+            className="pos-toolbar-action-btn flex items-center justify-center w-10 h-10 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow-sm shadow-emerald-600/20 transition-colors shrink-0 cursor-pointer"
             title="Quick Sale — Input nominal & deskripsi item langsung tanpa katalog (F6)"
             aria-label="Quick Sale (F6)"
           >
@@ -1586,7 +1748,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               sound.playTap();
               setIsQuickReportsOpen(true);
             }}
-            className={`flex items-center justify-center w-10 h-10 rounded-xl border transition-colors shrink-0 shadow-2xs cursor-pointer ${
+            className={`pos-toolbar-action-btn flex items-center justify-center w-10 h-10 rounded-xl border transition-colors shrink-0 shadow-2xs cursor-pointer ${
               isQuickReportsOpen
                 ? 'bg-indigo-600 text-white border-indigo-600'
                 : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border-indigo-200'
@@ -1604,7 +1766,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               sound.playTap();
               setIsKeyboardHelpOpen(true);
             }}
-            className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold border border-slate-200 transition-colors shrink-0 shadow-2xs"
+            className="pos-toolbar-action-btn flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold border border-slate-200 transition-colors shrink-0 shadow-2xs"
             title="Daftar Pintasan Keyboard Fisik Kasir (F12 atau ?)"
           >
             <Keyboard className="w-4 h-4 text-slate-600" />
@@ -1622,7 +1784,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 sound.playTap();
                 setIsNotificationCenterOpen(!isNotificationCenterOpen);
               }}
-              className={`relative flex items-center justify-center w-10 h-10 rounded-xl border transition-all cursor-pointer ${
+              className={`pos-toolbar-action-btn relative flex items-center justify-center w-10 h-10 rounded-xl border transition-all cursor-pointer ${
                 lowStockProducts.length > 0
                   ? 'bg-amber-50 hover:bg-amber-100 text-amber-950 border-amber-300 shadow-xs ring-2 ring-amber-400/30'
                   : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200'
@@ -1836,7 +1998,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               sound.playTap();
               onOpenScannerModal('STOCK_LOOKUP');
             }}
-            className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold shadow-2xs transition-colors shrink-0 cursor-pointer"
+            className="pos-toolbar-action-btn flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold shadow-2xs transition-colors shrink-0 cursor-pointer"
             title="Cek Stok & Harga Produk via Scan QR SKU / Barcode"
           >
             <PackageSearch className="w-4 h-4 text-emerald-600" />
@@ -1849,7 +2011,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               sound.playTap();
               onOpenScannerModal('SCAN');
             }}
-            className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold shadow-sm transition-colors shrink-0 cursor-pointer"
+            className="pos-toolbar-action-btn flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold shadow-sm transition-colors shrink-0 cursor-pointer"
             title="Scan Barcode / QR Produk & Member (F3)"
           >
             <Barcode className="w-4 h-4 text-sky-400" />
@@ -1890,7 +2052,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         )}
 
         {/* Category Filter Horizontal Scroll with Color Badges + Low Stock Critical Filter */}
-        <div className="px-3 md:px-4 py-2.5 bg-white border-b border-slate-200 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
+        <div className="pos-category-strip px-3 md:px-4 py-2.5 bg-white border-b border-slate-200 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
           {/* Dedicated Low Stock Alert Filter Tab */}
           <button
             type="button"
@@ -1898,7 +2060,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
               sound.playTap();
               setSelectedCategory(selectedCategory === '__LOW_STOCK__' ? 'SEMUA' : '__LOW_STOCK__');
             }}
-            className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all flex items-center gap-1.5 border shrink-0 ${
+            className={`pos-category-chip px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all flex items-center gap-1.5 border shrink-0 ${
               selectedCategory === '__LOW_STOCK__'
                 ? 'bg-amber-600 text-white border-amber-600 shadow-sm'
                 : lowStockProducts.length > 0
@@ -1959,7 +2121,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     : undefined
                 }
                 title={isDraggable ? `Tarik & Lepas (Drag & Drop) untuk menggeser kategori "${cat}" ke urutan pertama` : undefined}
-                className={`group px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-all flex items-center gap-1.5 border select-none ${
+                className={`pos-category-chip group px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-all flex items-center gap-1.5 border select-none ${
                   isDraggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'
                 } ${
                   isBeingDragged
@@ -2163,7 +2325,29 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
+              {deferredSearchQuery.trim() && (
+                <div className="mb-2.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <Search className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                    <span className="truncate">
+                      Menampilkan <strong className="tabular-nums">{filteredProducts.length}</strong> produk cocok untuk{' '}
+                      <span className="font-semibold">"{deferredSearchQuery.trim()}"</span>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setSearchQuery('');
+                    }}
+                    className="px-2 py-0.5 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 font-semibold text-[11px] whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                </div>
+              )}
+
+              <div className="pos-catalog-grid grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
                 {displayedProducts.map((product) => (
                   <POSProductCard
                     key={product.id}
@@ -2171,6 +2355,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     catColor={getCategoryColor(product.category, categories, product)}
                     customerCategory={selectedCustomer?.customerCategory}
                     isHighlighted={highlightedProductId === product.id}
+                    searchQuery={deferredSearchQuery.trim()}
                     onSelect={handleProductCardClick}
                     onNavigateToSuppliers={onNavigateToSuppliers}
                   />
@@ -2197,7 +2382,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
 
         {/* Floating Quick Cart Switcher in Portrait Catalog Mode */}
         {isPortrait && portraitTab === 'CATALOG' && cartItemCount > 0 && (
-          <div className="p-3 bg-white border-t border-slate-200 shadow-lg shrink-0">
+          <div className="pos-portrait-sticky-cta p-3 bg-white border-t border-slate-200 shadow-lg shrink-0">
             <button
               type="button"
               onClick={() => {
@@ -2227,7 +2412,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
       {/* ============================================================== */}
       {/* RIGHT PANEL: CART & CHECKOUT (35% width on tablet landscape)   */}
       {/* ============================================================== */}
-      <section className={`flex flex-col min-h-0 h-full bg-white overflow-hidden ${
+      <section className={`pos-cart-panel flex flex-col min-h-0 h-full bg-white overflow-hidden ${
         isPortrait 
           ? (portraitTab === 'CART' ? 'flex-1' : 'hidden') 
           : 'w-[35%] shrink-0 border-l border-slate-200 shadow-sm'
@@ -2241,7 +2426,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 sound.playTap();
                 setPortraitTab('CATALOG');
               }}
-              className="px-3 py-1.5 bg-white text-slate-800 hover:bg-slate-50 rounded-xl text-xs font-bold flex items-center gap-1.5 border border-slate-300 shadow-2xs cursor-pointer"
+              className="pos-touch-target px-3 py-2 bg-white text-slate-800 hover:bg-slate-50 rounded-xl text-xs font-bold flex items-center gap-1.5 border border-slate-300 shadow-2xs cursor-pointer"
             >
               <span>&larr; Tambah Produk Lain</span>
             </button>
@@ -2252,7 +2437,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         )}
 
         {/* Customer & Loyalty Header Card */}
-        <div className="p-3 bg-slate-50 border-b border-slate-200 shrink-0">
+        <div className="pos-cart-customer-bar p-3 bg-slate-50 border-b border-slate-200 shrink-0">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 truncate">
               <div className="w-8 h-8 rounded-lg bg-sky-100 text-sky-700 flex items-center justify-center font-bold text-xs shrink-0">
@@ -2576,7 +2761,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         )}
 
         {/* Cart Items List */}
-        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain p-3 space-y-2">
+        <div className="pos-cart-scroll flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain p-3 space-y-2">
           {cart.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400">
               <div className="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center mb-3">
@@ -2602,7 +2787,13 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
             </div>
           )}
           <AnimatePresence initial={false}>
-            {cart.map((item) => (
+            {cart.map((item) => {
+              const selectedCustomerItemHistory = selectedCustomer
+                ? getProductSalesHistory(item, selectedCustomer)
+                : [];
+              const latestCustomerSale = selectedCustomerItemHistory[0] || null;
+
+              return (
               <motion.div
                 key={item.cartItemId}
                 layout="position"
@@ -2633,8 +2824,14 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                       <span className="truncate">{item.productName}</span>
                       <Edit3 className="w-3 h-3 text-slate-400 group-hover/title:text-sky-600 transition-colors shrink-0" />
                       {item.isQuickSale && (
-                        <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 text-[9px] font-black shrink-0 border border-emerald-200">
-                          QUICK SALE
+                        <span
+                          className={`px-1.5 py-0.2 rounded text-[9px] font-black shrink-0 border ${
+                            item.isCashWithdrawal
+                              ? 'bg-amber-100 text-amber-900 border-amber-300'
+                              : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                          }`}
+                        >
+                          {item.isCashWithdrawal ? 'TARIK TUNAI' : 'QUICK SALE'}
                         </span>
                       )}
                       {item.isService && (
@@ -2726,6 +2923,43 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                       })()}
                     </div>
 
+                    {selectedCustomer && latestCustomerSale && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          sound.playTap();
+                          openCartPriceHistory(item);
+                        }}
+                        title={`Lihat seluruh riwayat harga ${item.productName} untuk ${selectedCustomer.name}`}
+                        className="mt-1 inline-flex items-center gap-1 text-[10.5px] text-sky-700 hover:text-sky-900 font-semibold max-w-full truncate cursor-pointer"
+                      >
+                        <History className="w-3 h-3 shrink-0" />
+                        <span className="truncate font-mono tabular-nums">
+                          Terakhir {selectedCustomer.name}: {formatRupiah(latestCustomerSale.unitPrice)}/{latestCustomerSale.unitName} ·{' '}
+                          {new Date(latestCustomerSale.timestamp).toLocaleDateString('id-ID', {
+                            day: '2-digit',
+                            month: 'short',
+                          })}
+                        </span>
+                      </button>
+                    )}
+
+                    {((item.adminFee || 0) > 0 || item.isCashWithdrawal) && item.principalAmount !== undefined && (
+                      <div className="mt-1 text-[10px] font-mono text-slate-600 flex items-center gap-1.5 flex-wrap">
+                        <span>Nominal: {formatRupiah(item.principalAmount)}</span>
+                        <span>•</span>
+                        <span className="text-emerald-700 font-bold">
+                          Admin: +{formatRupiah(item.adminFee || 0)}
+                        </span>
+                        {item.isCashWithdrawal && (
+                          <span className="px-1 py-0.2 rounded bg-rose-50 text-rose-700 border border-rose-200 font-sans font-bold text-[9px]">
+                            Kas -{formatRupiah(item.principalAmount * item.quantity)}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
                     {item.serviceNotes && (
                       <div className="text-[10px] text-purple-600 truncate mt-0.5 italic">
                         SOP: {item.serviceNotes}
@@ -2733,18 +2967,46 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     )}
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      sound.playTap();
-                      onRemoveCartItem(item.cartItemId);
-                    }}
-                    title="Batalkan item ini dari keranjang (Void)"
-                    className="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 active:bg-rose-200 text-rose-700 border border-rose-200 text-[10.5px] font-bold flex items-center gap-1 transition-colors shrink-0 cursor-pointer"
-                  >
-                    <Trash2 className="w-3 h-3 text-rose-600 shrink-0" />
-                    <span>Batalkan</span>
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        sound.playTap();
+                        openCartPriceHistory(item);
+                      }}
+                      title={
+                        selectedCustomer
+                          ? `Riwayat harga ${item.productName} untuk ${selectedCustomer.name}`
+                          : `Lihat riwayat harga jual ${item.productName} per pelanggan`
+                      }
+                      className={`px-2 py-1 min-h-[28px] rounded-lg border text-[10.5px] font-bold flex items-center gap-1 transition-colors shrink-0 whitespace-nowrap cursor-pointer ${
+                        selectedCustomerItemHistory.length > 0
+                          ? 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200'
+                          : 'bg-slate-50 hover:bg-slate-100 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      <History className="w-3 h-3 shrink-0" />
+                      {selectedCustomerItemHistory.length > 0 && (
+                        <span className="font-mono tabular-nums font-extrabold text-[10px]">
+                          {selectedCustomerItemHistory.length}x
+                        </span>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        onRemoveCartItem(item.cartItemId);
+                      }}
+                      title="Batalkan item ini dari keranjang (Void)"
+                      className="px-2 py-1 min-h-[28px] rounded-lg bg-rose-50 hover:bg-rose-100 active:bg-rose-200 text-rose-700 border border-rose-200 text-[10.5px] font-bold flex items-center gap-1 transition-colors shrink-0 cursor-pointer"
+                    >
+                      <Trash2 className="w-3 h-3 text-rose-600 shrink-0" />
+                      <span>Batalkan</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Stepper & Subtotal */}
@@ -2755,7 +3017,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                         sound.playTap();
                         onUpdateCartItemQty(item.cartItemId, item.quantity - 1);
                       }}
-                      className="w-7 h-7 rounded-md bg-white hover:bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-xs shadow-2xs transition-colors"
+                      className="pos-stepper-btn w-7 h-7 rounded-md bg-white hover:bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-xs shadow-2xs transition-colors"
                     >
                       <Minus className="w-3.5 h-3.5" />
                     </button>
@@ -2771,7 +3033,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                           currentQty: item.quantity,
                         });
                       }}
-                      className="px-2 py-0.5 min-w-[32px] text-center text-xs font-black text-slate-900 font-mono bg-white hover:bg-sky-50 hover:text-sky-700 rounded border border-slate-200 transition-colors shadow-2xs cursor-pointer active:scale-95"
+                      className="pos-stepper-btn px-2 py-0.5 min-w-[32px] text-center text-xs font-black text-slate-900 font-mono bg-white hover:bg-sky-50 hover:text-sky-700 rounded border border-slate-200 transition-colors shadow-2xs cursor-pointer active:scale-95"
                       title="Klik untuk ubah jumlah via Numpad Layar Sentuh Tablet"
                     >
                       {item.quantity}
@@ -2782,7 +3044,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                         sound.playTap();
                         onUpdateCartItemQty(item.cartItemId, item.quantity + 1);
                       }}
-                      className="w-7 h-7 rounded-md bg-white hover:bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-xs shadow-2xs transition-colors"
+                      className="pos-stepper-btn w-7 h-7 rounded-md bg-white hover:bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-xs shadow-2xs transition-colors"
                     >
                       <Plus className="w-3.5 h-3.5" />
                     </button>
@@ -2795,12 +3057,13 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                   </div>
                 </div>
                 </motion.div>
-              ))}
+              );
+            })}
           </AnimatePresence>
         </div>
 
         {/* Footer Checkout Summary */}
-        <div className="p-3 bg-slate-50 border-t border-slate-200 space-y-2 shrink-0 max-h-[65%] overflow-y-auto overscroll-contain">
+        <div className="pos-cart-footer p-3 bg-slate-50 border-t border-slate-200 space-y-2 shrink-0 max-h-[65%] overflow-y-auto overscroll-contain">
           {/* Subtotal & Discount rows */}
           <div className="space-y-1 text-xs">
             <div className="flex justify-between text-slate-600">
@@ -2861,7 +3124,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           </div>
 
           {/* Action Buttons */}
-          <div className="grid grid-cols-4 gap-2 pt-1">
+          <div className="pos-checkout-actions grid grid-cols-4 gap-2 pt-1">
             <button
               onClick={() => {
                 sound.playTap();
@@ -2870,7 +3133,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 }
               }}
               disabled={cart.length === 0}
-              className="col-span-1 py-3 px-2 rounded-xl bg-slate-200 hover:bg-slate-300 disabled:opacity-40 disabled:hover:bg-slate-200 text-slate-700 font-bold text-xs transition-colors flex items-center justify-center gap-1.5"
+              className="pos-cta-primary col-span-1 py-3 px-2 rounded-xl bg-slate-200 hover:bg-slate-300 disabled:opacity-40 disabled:hover:bg-slate-200 text-slate-700 font-bold text-xs transition-colors flex items-center justify-center gap-1.5"
               title="Kosongkan Keranjang (F8)"
             >
               <Trash2 className="w-4 h-4" />
@@ -2886,7 +3149,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 onOpenPaymentModal();
               }}
               disabled={cart.length === 0}
-              className="col-span-3 py-3 px-4 rounded-xl bg-sky-600 hover:bg-sky-500 active:bg-sky-700 disabled:opacity-40 disabled:hover:bg-sky-600 text-white font-extrabold text-sm md:text-base shadow-md shadow-sky-600/30 transition-all flex items-center justify-center gap-2"
+              className="pos-cta-primary col-span-3 py-3 px-4 rounded-xl bg-sky-600 hover:bg-sky-500 active:bg-sky-700 disabled:opacity-40 disabled:hover:bg-sky-600 text-white font-extrabold text-sm md:text-base shadow-md shadow-sky-600/30 transition-all flex items-center justify-center gap-2"
               title="Selesaikan & Buka Pembayaran (F2)"
             >
               <CreditCard className="w-5 h-5 stroke-[2.5]" />
@@ -3578,8 +3841,8 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         <TouchKeypadModal
           isOpen={!!priceEditTarget}
           onClose={() => setPriceEditTarget(null)}
-          title="Ubah Harga Jual per Item"
-          subtitle={`${priceEditTarget.productName} (${priceEditTarget.unitName}) • Harga Normal: ${formatRupiah(priceEditTarget.originalPrice)}`}
+          title="Manual Override / Edit Harga Item"
+          subtitle={`${priceEditTarget.productName} (${priceEditTarget.unitName}) • ${priceEditTarget.quantity} ${priceEditTarget.unitName}`}
           initialValue={priceEditTarget.currentPrice}
           unitName="Rupiah"
           isCurrency={true}
@@ -3592,19 +3855,381 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
             Math.round(priceEditTarget.originalPrice * 0.85),
             Math.round(priceEditTarget.originalPrice * 0.8),
           ]}
-          onConfirm={(newPrice) => {
+          manualOverrideContext={{
+            originalPrice: priceEditTarget.originalPrice,
+            quantity: priceEditTarget.quantity,
+          }}
+          onConfirm={(newPrice, reason) => {
             if (onUpdateCartItemPrice) {
-              onUpdateCartItemPrice(priceEditTarget.cartItemId, newPrice);
+              onUpdateCartItemPrice(priceEditTarget.cartItemId, newPrice, reason);
             }
             setPriceEditTarget(null);
           }}
         />
       )}
+
+      {/* Customer Product Selling Price History Modal */}
+      {priceHistoryTarget && (() => {
+        const allForProduct = getProductSalesHistory(priceHistoryTarget, null);
+        const customerOnlyRecords = selectedCustomer
+          ? getProductSalesHistory(priceHistoryTarget, selectedCustomer)
+          : [];
+        const baseList =
+          priceHistoryShowAllCustomers || !selectedCustomer ? allForProduct : customerOnlyRecords;
+
+        const qCust = priceHistoryCustomerQuery.trim().toLowerCase();
+        const visibleRecords = qCust
+          ? baseList.filter((r) => r.customerName.toLowerCase().includes(qCust))
+          : baseList;
+
+        const distinctCustomerNames = Array.from(
+          new Set(allForProduct.map((r) => r.customerName).filter(Boolean))
+        ).slice(0, 8);
+
+        const prices = visibleRecords.map((r) => r.unitPrice);
+        const latestRec = visibleRecords[0] || null;
+        const minPrice = prices.length > 0 ? Math.min(...prices) : 0;
+        const maxPrice = prices.length > 0 ? Math.max(...prices) : 0;
+        const totalQtyBought = visibleRecords.reduce((sum, r) => sum + (r.quantity || 0), 0);
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 md:p-4 animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-150">
+              {/* Header */}
+              <div className="px-5 py-4 bg-slate-900 text-white flex items-start justify-between gap-3 shrink-0">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="w-10 h-10 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-300 flex items-center justify-center shrink-0">
+                    <History className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-base font-bold leading-tight truncate">
+                      Riwayat Harga Jual Pelanggan
+                    </h3>
+                    <p className="text-xs text-slate-300 mt-0.5 truncate">
+                      {priceHistoryTarget.productName} · Harga keranjang saat ini{' '}
+                      <span className="font-mono tabular-nums font-bold text-sky-300">
+                        {formatRupiah(priceHistoryTarget.unitPrice)}/{priceHistoryTarget.selectedUnit.unitName}
+                      </span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPriceHistoryTarget(null)}
+                  className="p-1.5 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Customer Filter Controls */}
+              <div className="p-4 bg-slate-50 border-b border-slate-200 space-y-2.5 shrink-0">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                  {selectedCustomer ? (
+                    <div className="flex items-center bg-white p-1 rounded-xl border border-slate-200 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setPriceHistoryShowAllCustomers(false);
+                        }}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          !priceHistoryShowAllCustomers
+                            ? 'bg-slate-900 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Pelanggan: {selectedCustomer.name} ({customerOnlyRecords.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setPriceHistoryShowAllCustomers(true);
+                        }}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          priceHistoryShowAllCustomers
+                            ? 'bg-slate-900 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Semua Pelanggan ({allForProduct.length})
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setPriceHistoryTarget(null);
+                        onOpenCustomerModal();
+                      }}
+                      className="px-3 py-2 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <User className="w-3.5 h-3.5" />
+                      <span>Pilih Pelanggan di Kasir</span>
+                    </button>
+                  )}
+
+                  <div className="relative flex-1 min-w-[180px]">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={priceHistoryCustomerQuery}
+                      onChange={(e) => {
+                        setPriceHistoryCustomerQuery(e.target.value);
+                        if (selectedCustomer && e.target.value.trim() && !priceHistoryShowAllCustomers) {
+                          setPriceHistoryShowAllCustomers(true);
+                        }
+                      }}
+                      placeholder="Filter berdasarkan nama pelanggan..."
+                      className="w-full pl-8 pr-3 py-2 text-xs border border-slate-200 rounded-xl bg-white focus:border-sky-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                {distinctCustomerNames.length > 0 && (
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+                    <span className="text-[10.5px] font-semibold text-slate-500 shrink-0">
+                      Pernah membeli:
+                    </span>
+                    {distinctCustomerNames.map((custName) => {
+                      const active =
+                        priceHistoryCustomerQuery.trim().toLowerCase() === custName.toLowerCase();
+                      return (
+                        <button
+                          key={custName}
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setPriceHistoryShowAllCustomers(true);
+                            setPriceHistoryCustomerQuery(active ? '' : custName);
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[10.5px] font-bold border whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                            active
+                              ? 'bg-sky-600 text-white border-sky-600'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {custName}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Summary Strip */}
+              <div className="px-4 py-3 border-b border-slate-100 grid grid-cols-3 gap-2.5 bg-white shrink-0">
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[10px] font-semibold text-slate-500">Harga Terakhir</div>
+                  <div className="text-sm font-bold text-slate-900 font-mono tabular-nums mt-0.5">
+                    {latestRec ? formatRupiah(latestRec.unitPrice) : '-'}
+                  </div>
+                  <div className="text-[10px] text-slate-500 truncate">
+                    {latestRec ? `${latestRec.customerName} (${latestRec.unitName})` : 'Belum ada data'}
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[10px] font-semibold text-slate-500">Rentang Harga</div>
+                  <div className="text-xs md:text-sm font-bold text-slate-900 font-mono tabular-nums mt-0.5">
+                    {prices.length > 0
+                      ? minPrice === maxPrice
+                        ? formatRupiah(minPrice)
+                        : `${formatRupiah(minPrice)} – ${formatRupiah(maxPrice)}`
+                      : '-'}
+                  </div>
+                  <div className="text-[10px] text-slate-500">Terendah s/d tertinggi</div>
+                </div>
+
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[10px] font-semibold text-slate-500">Frekuensi Transaksi</div>
+                  <div className="text-sm font-bold text-slate-900 font-mono tabular-nums mt-0.5">
+                    {formatNumber(visibleRecords.length)}x · {formatNumber(totalQtyBought)} item
+                  </div>
+                  <div className="text-[10px] text-slate-500">Riwayat tercatat</div>
+                </div>
+              </div>
+
+              {/* Scrollable List of Customer Transactions */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-slate-50/40">
+                {visibleRecords.length === 0 ? (
+                  <div className="py-10 text-center space-y-2.5">
+                    <div className="w-11 h-11 rounded-2xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto">
+                      <History className="w-5 h-5" />
+                    </div>
+                    <p className="text-sm font-bold text-slate-800">
+                      Belum Ada Riwayat Harga untuk Filter Ini
+                    </p>
+                    <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                      {selectedCustomer && !priceHistoryShowAllCustomers
+                        ? `${selectedCustomer.name} belum pernah tercatat membeli ${priceHistoryTarget.productName}.`
+                        : `Belum ada transaksi tersimpan untuk produk ${priceHistoryTarget.productName}.`}
+                    </p>
+                    {selectedCustomer && !priceHistoryShowAllCustomers && allForProduct.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setPriceHistoryShowAllCustomers(true);
+                        }}
+                        className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <span>Lihat Semua Pelanggan ({allForProduct.length})</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  visibleRecords.map((rec) => {
+                    const priceDiff = rec.unitPrice - priceHistoryTarget.unitPrice;
+                    return (
+                      <div
+                        key={rec.id}
+                        className="bg-white p-3 rounded-2xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-slate-900 flex items-center gap-1">
+                              <User className="w-3.5 h-3.5 text-slate-500" />
+                              <span>{rec.customerName}</span>
+                            </span>
+                            <span className="font-mono text-[10.5px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                              {rec.invoiceNumber}
+                            </span>
+                            {rec.isCustomerSpecialPrice && (
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200">
+                                Harga Khusus
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap font-mono tabular-nums">
+                            <span>{formatDateTime(rec.timestamp)}</span>
+                            <span>·</span>
+                            <span>
+                              {formatNumber(rec.quantity)} {rec.unitName}
+                              {rec.selectedVariant ? ` (${rec.selectedVariant})` : ''}
+                            </span>
+                            <span>·</span>
+                            <span className="font-sans">Kasir: {rec.cashierName}</span>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0">
+                          <div className="text-left sm:text-right font-mono tabular-nums">
+                            <div className="text-sm font-bold text-slate-900">
+                              {formatRupiah(rec.unitPrice)}
+                              <span className="text-[11px] font-normal text-slate-500">/{rec.unitName}</span>
+                            </div>
+                            <div className="text-[10.5px] font-semibold flex items-center sm:justify-end gap-0.5">
+                              {priceDiff === 0 ? (
+                                <span className="text-slate-500">Sama dgn keranjang</span>
+                              ) : priceDiff < 0 ? (
+                                <span className="text-emerald-700 flex items-center gap-0.5">
+                                  <ArrowDownRight className="w-3 h-3" />
+                                  {formatRupiah(Math.abs(priceDiff))} lebih murah
+                                </span>
+                              ) : (
+                                <span className="text-amber-700 flex items-center gap-0.5">
+                                  <ArrowUpRight className="w-3 h-3" />+{formatRupiah(priceDiff)} lebih tinggi
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {onUpdateCartItemPrice && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sound.playSuccessChime();
+                                onUpdateCartItemPrice(
+                                  priceHistoryTarget.cartItemId,
+                                  rec.unitPrice,
+                                  `Mengikuti riwayat harga ${rec.customerName} (${rec.invoiceNumber})`
+                                );
+                                setPriceHistoryTarget(null);
+                              }}
+                              disabled={priceDiff === 0}
+                              className="px-3 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:bg-slate-100 disabled:text-slate-400 text-white text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer disabled:cursor-default transition-colors"
+                            >
+                              {priceDiff === 0 ? 'Aktif' : 'Terapkan'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="px-4 py-3 bg-white border-t border-slate-200 flex items-center justify-between gap-2 shrink-0">
+                <span className="text-[11px] text-slate-500">
+                  Menerapkan harga historis otomatis menyesuaikan total item di keranjang.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setPriceHistoryTarget(null);
+                  }}
+                  className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Tutup
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       {/* Quick Sale Ad-Hoc Item Entry Modal */}
-      {isQuickSaleModalOpen && (
+      {isQuickSaleModalOpen && (() => {
+        const parsedNominal = Math.max(0, Number(String(quickSaleAmount).replace(/[^0-9]/g, '')) || 0);
+        const parsedAdminFee = Math.max(0, Number(String(quickSaleAdminFee).replace(/[^0-9]/g, '')) || 0);
+        const safeQty = Math.max(1, quickSaleQty);
+        const unitTotal = parsedNominal + parsedAdminFee;
+        const subtotalQuickSale = unitTotal * safeQty;
+        const isTarikTunaiDesc = /tarik\s*tunai/i.test(quickSaleDescription.trim());
+
+        const fallbackCashBalance = transactions.reduce((sum, tx) => {
+          const isCash = tx.paymentMethod === 'CASH' || tx.settledPaymentMethod === 'CASH';
+          const cashIn = isCash ? Math.max(0, (tx.finalAmount || 0) - (tx.returnedAmount || 0)) : 0;
+          const wdOut = (tx.items || []).reduce((iSum, it) => {
+            const isWd =
+              Boolean(it.isCashWithdrawal) ||
+              (Boolean(it.isQuickSale) && /tarik\s*tunai/i.test(it.productName || ''));
+            if (!isWd) return iSum;
+            const p = it.principalAmount !== undefined ? Math.max(0, it.principalAmount) : Math.max(0, it.costPrice || 0);
+            return iSum + Math.max(1, it.quantity || 1) * p;
+          }, 0);
+          return sum + cashIn - wdOut;
+        }, 0);
+        const effectiveStoreCashBalance = Math.max(
+          0,
+          availableStoreCashBalance !== undefined ? availableStoreCashBalance : fallbackCashBalance
+        );
+
+        const cartWithdrawalCashTotal = cart.reduce((sum, item) => {
+          const itemIsWd =
+            Boolean(item.isCashWithdrawal) ||
+            (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+          if (!itemIsWd) return sum;
+          const principal =
+            item.principalAmount !== undefined ? Math.max(0, item.principalAmount) : Math.max(0, item.unitPrice || 0);
+          return sum + principal * Math.max(1, item.quantity || 1);
+        }, 0);
+
+        const remainingCashForWithdrawal = Math.max(0, effectiveStoreCashBalance - cartWithdrawalCashTotal);
+        const requestedWithdrawalTotal = isTarikTunaiDesc ? parsedNominal * safeQty : 0;
+        const exceedsStoreCashBalance =
+          isTarikTunaiDesc && parsedNominal > 0 && requestedWithdrawalTotal > remainingCashForWithdrawal;
+        const cashBalanceShortfall = Math.max(0, requestedWithdrawalTotal - remainingCashForWithdrawal);
+
+        return (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
-          <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-150">
-            <div className="px-5 py-4 bg-gradient-to-r from-emerald-600 to-teal-600 text-white flex items-center justify-between">
+          <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-150 max-h-[94vh] flex flex-col">
+            <div className="px-5 py-4 bg-gradient-to-r from-emerald-600 to-teal-600 text-white flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2.5">
                 <div className="w-9 h-9 rounded-xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
                   <Zap className="w-5 h-5 text-amber-300" />
@@ -3628,27 +4253,39 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                const parsedAmount = Number(String(quickSaleAmount).replace(/[^0-9]/g, ''));
                 if (!quickSaleDescription.trim()) {
                   sound.playError();
                   setQuickSaleError('Masukkan nama atau deskripsi barang / item terlebih dahulu.');
                   return;
                 }
-                if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+                if (!Number.isFinite(parsedNominal) || parsedNominal <= 0) {
                   sound.playError();
                   setQuickSaleError('Masukkan nominal harga satuan yang valid (> Rp 0).');
                   return;
                 }
                 if (onAddQuickSaleItem) {
-                  onAddQuickSaleItem({
+                  const res = onAddQuickSaleItem({
                     description: quickSaleDescription.trim(),
-                    amount: parsedAmount,
-                    quantity: Math.max(1, quickSaleQty),
+                    amount: parsedNominal,
+                    adminFee: parsedAdminFee,
+                    quantity: safeQty,
                     unitName: quickSaleUnit || 'ITEM',
+                    isCashWithdrawal: isTarikTunaiDesc,
                   });
+                  if (res && (res.ok === false || res.blocked)) {
+                    setQuickSaleError(res.error || 'Nominal Tarik Tunai melebihi batas saldo kas toko.');
+                    return;
+                  }
+                } else if (exceedsStoreCashBalance) {
+                  sound.playError();
+                  setQuickSaleError(
+                    `Nominal Tarik Tunai (${formatRupiah(requestedWithdrawalTotal)}) melebihi saldo kas toko tersedia (${formatRupiah(remainingCashForWithdrawal)}). Kurangi nominal atau tambah modal kas di menu Keuangan.`
+                  );
+                  return;
                 }
                 setQuickSaleDescription('');
                 setQuickSaleAmount('');
+                setQuickSaleAdminFee('');
                 setQuickSaleQty(1);
                 setQuickSaleUnit('ITEM');
                 setQuickSaleError(null);
@@ -3657,7 +4294,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                   setPortraitTab('CART');
                 }
               }}
-              className="p-5 space-y-4"
+              className="p-5 space-y-3.5 overflow-y-auto flex-1"
             >
               {quickSaleError && (
                 <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold flex items-center gap-2">
@@ -3678,26 +4315,65 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     setQuickSaleDescription(e.target.value);
                     if (quickSaleError) setQuickSaleError(null);
                   }}
-                  placeholder="Misal: Barang Titipan, Jasa Bungkus Kado, Item Lain-lain..."
+                  placeholder="Misal: Tarik Tunai, Jasa Bungkus Kado, Item Lain-lain..."
                   className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-emerald-500 focus:outline-none text-sm font-medium text-slate-900"
                 />
                 <div className="flex flex-wrap gap-1.5 mt-2">
-                  {['Item Lain-lain', 'Jasa Bungkus Kado', 'Biaya Kirim / Antar', 'Barang Khusus'].map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => {
-                        sound.playTap();
-                        setQuickSaleDescription(preset);
-                        if (quickSaleError) setQuickSaleError(null);
-                      }}
-                      className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 border border-slate-200 text-[10.5px] font-semibold text-slate-600 transition-colors cursor-pointer"
-                    >
-                      + {preset}
-                    </button>
-                  ))}
+                  {['Tarik Tunai', 'Item Lain-lain', 'Jasa Bungkus Kado', 'Biaya Kirim / Antar', 'Barang Khusus'].map((preset) => {
+                    const isSelectedPreset = quickSaleDescription.trim().toLowerCase() === preset.toLowerCase();
+                    const isWithdrawalPreset = preset === 'Tarik Tunai';
+                    return (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setQuickSaleDescription(preset);
+                          if (isWithdrawalPreset) {
+                            setQuickSaleUnit('JASA');
+                          }
+                          if (quickSaleError) setQuickSaleError(null);
+                        }}
+                        className={`px-2 py-1 rounded-lg border text-[10.5px] font-semibold transition-colors cursor-pointer ${
+                          isSelectedPreset
+                            ? isWithdrawalPreset
+                              ? 'bg-amber-600 text-white border-amber-600 shadow-2xs'
+                              : 'bg-emerald-600 text-white border-emerald-600 shadow-2xs'
+                            : isWithdrawalPreset
+                            ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
+                            : 'bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 text-slate-600 border-slate-200'
+                        }`}
+                      >
+                        + {preset}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
+
+              {isTarikTunaiDesc && (
+                <div
+                  className={`p-2.5 rounded-xl border flex items-center justify-between gap-2 text-xs ${
+                    exceedsStoreCashBalance || remainingCashForWithdrawal <= 0
+                      ? 'bg-rose-50 border-rose-300 text-rose-900'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="text-[10.5px] font-bold uppercase tracking-wide opacity-80">
+                      Batas Saldo Kas Toko Tersedia
+                    </div>
+                    {cartWithdrawalCashTotal > 0 && (
+                      <div className="text-[10px] text-slate-600">
+                        Total Kas: {formatRupiah(effectiveStoreCashBalance)} − Keranjang: {formatRupiah(cartWithdrawalCashTotal)}
+                      </div>
+                    )}
+                  </div>
+                  <div className="font-mono font-black text-sm tabular-nums shrink-0">
+                    {formatRupiah(remainingCashForWithdrawal)}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
@@ -3709,15 +4385,20 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                   </span>
                   <input
                     type="number"
+                    inputMode="numeric"
                     min="1"
-                    step="100"
+                    step="1"
                     value={quickSaleAmount}
                     onChange={(e) => {
                       setQuickSaleAmount(e.target.value);
                       if (quickSaleError) setQuickSaleError(null);
                     }}
                     placeholder="0"
-                    className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-300 focus:border-emerald-500 focus:outline-none text-base font-extrabold font-mono text-slate-900"
+                    className={`w-full pl-10 pr-4 py-2.5 rounded-xl border focus:outline-none text-base font-extrabold font-mono text-slate-900 transition-colors ${
+                      exceedsStoreCashBalance
+                        ? 'border-rose-500 bg-rose-50/50 focus:border-rose-600 ring-2 ring-rose-500/20'
+                        : 'border-slate-300 focus:border-emerald-500'
+                    }`}
                   />
                 </div>
                 <div className="flex flex-wrap gap-1.5 mt-2">
@@ -3737,6 +4418,74 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                       }`}
                     >
                       {formatRupiah(amt)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {exceedsStoreCashBalance && (
+                <div
+                  role="alert"
+                  className="p-3 rounded-2xl bg-rose-50 border-2 border-rose-400 text-rose-900 shadow-xs space-y-1 animate-in fade-in duration-150"
+                >
+                  <div className="flex items-center gap-2 text-xs font-extrabold text-rose-700">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600 animate-pulse" />
+                    <span>Peringatan: Melebihi Saldo Kas Toko!</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-rose-800">
+                    Nominal penarikan tunai{' '}
+                    <strong className="font-mono">{formatRupiah(requestedWithdrawalTotal)}</strong> melebihi sisa
+                    saldo kas toko tersedia{' '}
+                    <strong className="font-mono">{formatRupiah(remainingCashForWithdrawal)}</strong> (kurang{' '}
+                    <strong className="font-mono text-rose-700">{formatRupiah(cashBalanceShortfall)}</strong>).
+                  </p>
+                  <p className="text-[10.5px] text-rose-700/90 font-medium">
+                    Sesuaikan nominal/jumlah tarik tunai atau catat suntikan modal kas di menu Keuangan terlebih dahulu.
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  Biaya Admin (Rp)
+                  <span className="ml-1.5 text-[10.5px] font-normal text-slate-400">
+                    {isTarikTunaiDesc ? '(Tercatat sebagai keuntungan)' : '(Opsional, ditambahkan ke subtotal)'}
+                  </span>
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
+                    Rp
+                  </span>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min="0"
+                    step="1"
+                    value={quickSaleAdminFee}
+                    onChange={(e) => {
+                      setQuickSaleAdminFee(e.target.value);
+                      if (quickSaleError) setQuickSaleError(null);
+                    }}
+                    placeholder="0"
+                    className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-300 focus:border-emerald-500 focus:outline-none text-base font-extrabold font-mono text-slate-900"
+                  />
+                </div>
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {[0, 2000, 2500, 3000, 5000, 10000].map((fee) => (
+                    <button
+                      key={fee}
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setQuickSaleAdminFee(fee === 0 ? '' : String(fee));
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-bold border transition-colors cursor-pointer ${
+                        parsedAdminFee === fee
+                          ? 'bg-sky-600 text-white border-sky-600'
+                          : 'bg-slate-50 hover:bg-sky-50 text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      {formatRupiah(fee)}
                     </button>
                   ))}
                 </div>
@@ -3795,14 +4544,40 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 </div>
               </div>
 
-              <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-between">
-                <span className="text-xs font-bold text-emerald-900">Subtotal Item Quick Sale:</span>
-                <span className="text-lg font-black font-mono text-emerald-700 tabular-nums">
-                  {formatRupiah(
-                    Math.max(0, Number(String(quickSaleAmount).replace(/[^0-9]/g, '')) || 0) * Math.max(1, quickSaleQty)
-                  )}
-                </span>
+              <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px] text-emerald-800">
+                  <span>Harga Satuan + Biaya Admin{safeQty > 1 ? ` (${safeQty}x)` : ''}:</span>
+                  <span className="font-mono font-bold tabular-nums">
+                    {formatRupiah(parsedNominal)} + {formatRupiah(parsedAdminFee)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-1 border-t border-emerald-200/70">
+                  <span className="text-xs font-bold text-emerald-900">Subtotal Item Quick Sale:</span>
+                  <span className="text-lg font-black font-mono text-emerald-700 tabular-nums">
+                    {formatRupiah(subtotalQuickSale)}
+                  </span>
+                </div>
               </div>
+
+              {isTarikTunaiDesc && (
+                <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 text-[11px] text-amber-950 space-y-1">
+                  <div className="font-extrabold text-amber-900">
+                    Pencatatan Otomatis Mode Tarik Tunai:
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Pengurangan Uang Cash (Nominal):</span>
+                    <span className="font-mono font-bold text-rose-700 tabular-nums">
+                      -{formatRupiah(parsedNominal * safeQty)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Tercatat sebagai Keuntungan (Biaya Admin):</span>
+                    <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                      +{formatRupiah(parsedAdminFee * safeQty)}
+                    </span>
+                  </div>
+                </div>
+              )}
 
               <div className="flex items-center gap-2 pt-1">
                 <button
@@ -3814,16 +4589,30 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="flex-[2] py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs shadow-md shadow-emerald-600/20 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                  className={`flex-[2] py-2.5 px-4 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                    exceedsStoreCashBalance
+                      ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border-2 border-rose-400'
+                      : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-md shadow-emerald-600/20'
+                  }`}
                 >
-                  <Plus className="w-4 h-4" />
-                  <span>Tambahkan ke Keranjang</span>
+                  {exceedsStoreCashBalance ? (
+                    <>
+                      <AlertTriangle className="w-4 h-4 text-rose-600" />
+                      <span>Saldo Kas Tidak Cukup (Diblokir)</span>
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="w-4 h-4" />
+                      <span>Tambahkan ke Keranjang</span>
+                    </>
+                  )}
                 </button>
               </div>
             </form>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* ===================================================================== */}
       {/* QUICK REPORTS SIDE-PANEL (Today's Revenue, Transactions & Top 3)      */}
@@ -3845,6 +4634,23 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         const cashRevenueToday = todayStats.todayTxs
           .filter((tx) => tx.paymentMethod === 'CASH')
           .reduce((sum, tx) => sum + (tx.finalAmount || 0), 0);
+        const cashWithdrawalOutToday = todayStats.todayTxs.reduce((sum, tx) => {
+          return (
+            sum +
+            (tx.items || []).reduce((itemSum, it) => {
+              const isTarikTunai =
+                Boolean(it.isCashWithdrawal) ||
+                (Boolean(it.isQuickSale) && /tarik\s*tunai/i.test(it.productName || ''));
+              if (!isTarikTunai) return itemSum;
+              const principal =
+                it.principalAmount !== undefined
+                  ? Math.max(0, it.principalAmount)
+                  : Math.max(0, it.costPrice || 0);
+              return itemSum + (it.quantity || 0) * principal;
+            }, 0)
+          );
+        }, 0);
+        const netCashToday = cashRevenueToday - cashWithdrawalOutToday;
         const nonCashRevenueToday = Math.max(0, todayStats.totalRevenue - cashRevenueToday);
 
         return (
@@ -3918,7 +4724,17 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                       <span className="text-xs font-sans font-bold text-slate-500 ml-1.5">Nota</span>
                     </div>
                     <div className="text-[11px] text-slate-500 flex items-center justify-between pt-0.5">
-                      <span>Tunai: <strong className="font-mono text-slate-700">{formatRupiah(cashRevenueToday)}</strong></span>
+                      <span>
+                        Tunai:{' '}
+                        <strong className="font-mono text-slate-700">
+                          {formatRupiah(netCashToday)}
+                        </strong>
+                      </span>
+                      {cashWithdrawalOutToday > 0 && (
+                        <span className="text-[10px] font-mono font-bold text-rose-600">
+                          (Tarik Tunai -{formatRupiah(cashWithdrawalOutToday)})
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>

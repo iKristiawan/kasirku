@@ -29,7 +29,10 @@ import {
   Edit3,
   History,
   ShieldCheck,
-  Save
+  Save,
+  Trash2,
+  ShieldAlert,
+  RotateCcw
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import {
@@ -43,11 +46,14 @@ import {
   PaymentMethodType,
   TransactionAuditChange,
   TransactionAuditLogEntry,
+  EmployeeActivityLog,
+  TransactionReturnRecord,
 } from '../types/pos';
+import { EmployeeActivityAuditPanel } from './EmployeeActivityAuditPanel';
 import { DEFAULT_PAYMENT_METHODS } from '../utils/mockData';
 import { formatRupiah, formatDateTime, formatWhatsAppUrl, formatNumber } from '../utils/formatters';
 import { sound } from '../utils/audio';
-import { getItemFifoCogs } from '../utils/fifoUtils';
+import { getItemFifoCogs, restoreProductBatchesForReturn } from '../utils/fifoUtils';
 import { getCustomerCategoryBadge } from '../utils/customerUtils';
 import {
   getLocalDateKey,
@@ -67,7 +73,15 @@ interface TransactionHistoryViewProps {
   products?: Product[];
   customers?: Customer[];
   currentUser?: PosUser;
+  activityLogs?: EmployeeActivityLog[];
   onUpdateTransaction?: (updatedTx: Transaction, prevTx?: Transaction) => void;
+  onDeleteTransaction?: (tx: Transaction, reason: string, restoreStock: boolean) => void;
+  onProcessReturn?: (payload: {
+    transaction: Transaction;
+    returnItems: Array<{ itemIndex: number; returnedQuantity: number }>;
+    reason: string;
+    restoreStock: boolean;
+  }) => Promise<{ updatedTx: Transaction; returnRecord: TransactionReturnRecord }> | { updatedTx: Transaction; returnRecord: TransactionReturnRecord } | void;
   onViewReceipt: (tx: Transaction) => void;
   onOpenFifoReconcile?: () => void;
   onStartBackdatedTransaction?: () => void;
@@ -80,12 +94,31 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
   products = [],
   customers = [],
   currentUser,
+  activityLogs = [],
   onUpdateTransaction,
+  onDeleteTransaction,
+  onProcessReturn,
   onViewReceipt,
   onOpenFifoReconcile,
   onStartBackdatedTransaction,
 }) => {
   const isAdmin = currentUser?.role === 'ADMIN';
+  const canDeleteTransaction =
+    currentUser?.role === 'ADMIN' || currentUser?.role === 'STORE_MANAGER';
+
+  const [activeSection, setActiveSection] = useState<'HISTORY' | 'EMPLOYEE_ACTIVITY' | 'STOCK_OPNAME_LOGS'>('HISTORY');
+  const [deletingTx, setDeletingTx] = useState<Transaction | null>(null);
+  const [deleteReason, setDeleteReason] = useState('');
+  const [restoreStockOnDelete, setRestoreStockOnDelete] = useState(true);
+  const [deleteError, setDeleteError] = useState('');
+
+  // Item Return (Retur Barang) Modal state
+  const [returningTx, setReturningTx] = useState<Transaction | null>(null);
+  const [returnQtyByIndex, setReturnQtyByIndex] = useState<Record<number, number>>({});
+  const [returnReason, setReturnReason] = useState('');
+  const [restoreStockOnReturn, setRestoreStockOnReturn] = useState(true);
+  const [returnError, setReturnError] = useState('');
+  const [isSubmittingReturn, setIsSubmittingReturn] = useState(false);
 
   const [search, setSearch] = useState('');
   const [methodFilter, setMethodFilter] = useState<string>('ALL');
@@ -401,6 +434,213 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
       type: 'success',
       text: `Invoice ${updatedTx.invoiceNumber} berhasil diperbarui (${changes.length} perubahan dicatat dalam Audit Log).`,
     });
+  };
+
+  // Compute previously returned qty per item index on any transaction
+  const getReturnedQtyMap = (tx: Transaction): Map<number, number> => {
+    const map = new Map<number, number>();
+    (tx.returns || []).forEach((ret) => {
+      (ret.items || []).forEach((ri) => {
+        map.set(ri.itemIndex, (map.get(ri.itemIndex) || 0) + (ri.returnedQuantity || 0));
+      });
+    });
+    return map;
+  };
+
+  const handleOpenReturnModal = (tx: Transaction) => {
+    if (!isAdmin || !onProcessReturn) return;
+    sound.playTap();
+    setReturningTx(tx);
+    const initialMap: Record<number, number> = {};
+    tx.items.forEach((_, idx) => {
+      initialMap[idx] = 0;
+    });
+    setReturnQtyByIndex(initialMap);
+    setReturnReason('');
+    setRestoreStockOnReturn(true);
+    setReturnError('');
+    setIsSubmittingReturn(false);
+  };
+
+  // Live Return Calculation Preview inside Return Modal
+  const returnPreview = useMemo(() => {
+    if (!returningTx) return null;
+    const prevMap = getReturnedQtyMap(returningTx);
+    const prodMap = new Map(products.map((p) => [p.id, p]));
+    const workingProdMap = new Map(products.map((p) => [p.id, p]));
+
+    const netFactor =
+      returningTx.subtotal > 0 ? Math.min(1, returningTx.finalAmount / returningTx.subtotal) : 1;
+    const remainingTxAmount = Math.max(
+      0,
+      returningTx.finalAmount - (returningTx.returnedAmount || 0)
+    );
+    const remainingTxPoints = Math.max(
+      0,
+      (returningTx.pointsEarned || 0) - (returningTx.returnedPoints || 0)
+    );
+
+    const willBeFull = returningTx.items.every((item, idx) => {
+      const prevQty = prevMap.get(idx) || 0;
+      const nowQty = returnQtyByIndex[idx] || 0;
+      return prevQty + nowQty >= item.quantity;
+    });
+
+    const itemPreviews: Array<{
+      itemIndex: number;
+      item: Transaction['items'][number];
+      alreadyReturnedQty: number;
+      maxReturnableQty: number;
+      selectedQty: number;
+      rawRefund: number;
+      targetBatches: Array<{ batchLabel: string; units: number; isFallback: boolean }>;
+    }> = [];
+
+    let rawRefundSum = 0;
+
+    returningTx.items.forEach((item, idx) => {
+      const alreadyReturnedQty = prevMap.get(idx) || 0;
+      const maxReturnableQty = Math.max(0, item.quantity - alreadyReturnedQty);
+      const selectedQty = Math.min(maxReturnableQty, Math.max(0, returnQtyByIndex[idx] || 0));
+      const perUnit = item.totalAmount / Math.max(1, item.quantity);
+      const rawRefund = Math.round(perUnit * selectedQty * netFactor);
+      rawRefundSum += rawRefund;
+
+      const targetBatches: Array<{ batchLabel: string; units: number; isFallback: boolean }> = [];
+      if (
+        selectedQty > 0 &&
+        restoreStockOnReturn &&
+        !item.isService &&
+        !item.isQuickSale
+      ) {
+        const conv = item.conversionFactor || 1;
+        const prod = workingProdMap.get(item.productId) || prodMap.get(item.productId);
+        if (prod && prod.productType !== 'JASA') {
+          const { updatedProduct, restoredBatches } = restoreProductBatchesForReturn({
+            product: prod,
+            item,
+            returnBaseUnits: selectedQty * conv,
+            alreadyReturnedBaseUnits: alreadyReturnedQty * conv,
+            invoiceNumber: returningTx.invoiceNumber,
+          });
+          workingProdMap.set(prod.id, updatedProduct);
+          restoredBatches.forEach((b) => {
+            targetBatches.push({
+              batchLabel: `${b.batchNumber || b.batchId}`,
+              units: b.restoredBaseUnits,
+              isFallback: Boolean(b.createdFallbackBatch),
+            });
+          });
+        }
+      }
+
+      itemPreviews.push({
+        itemIndex: idx,
+        item,
+        alreadyReturnedQty,
+        maxReturnableQty,
+        selectedQty,
+        rawRefund,
+        targetBatches,
+      });
+    });
+
+    const selectedItemsCount = itemPreviews.filter((p) => p.selectedQty > 0).length;
+    const totalReturnQty = itemPreviews.reduce((s, p) => s + p.selectedQty, 0);
+    const totalRefundAmount =
+      totalReturnQty === 0
+        ? 0
+        : willBeFull
+        ? remainingTxAmount
+        : Math.min(remainingTxAmount, rawRefundSum);
+
+    const pointsToCancel =
+      totalReturnQty === 0
+        ? 0
+        : willBeFull
+        ? remainingTxPoints
+        : Math.min(
+            remainingTxPoints,
+            Math.round(
+              (returningTx.pointsEarned || 0) *
+                (totalRefundAmount / Math.max(1, returningTx.finalAmount))
+            )
+          );
+
+    const customerProfile = returningTx.customerId
+      ? customers.find((c) => c.id === returningTx.customerId) || null
+      : null;
+
+    return {
+      itemPreviews,
+      selectedItemsCount,
+      totalReturnQty,
+      totalRefundAmount,
+      pointsToCancel,
+      remainingTxPoints,
+      willBeFull,
+      customerProfile,
+    };
+  }, [returningTx, returnQtyByIndex, restoreStockOnReturn, products, customers]);
+
+  const handleConfirmProcessReturn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!returningTx || !onProcessReturn || !returnPreview) return;
+
+    const selectedReturnItems = returnPreview.itemPreviews
+      .filter((p) => p.selectedQty > 0)
+      .map((p) => ({
+        itemIndex: p.itemIndex,
+        returnedQuantity: p.selectedQty,
+      }));
+
+    if (selectedReturnItems.length === 0) {
+      setReturnError('Pilih minimal 1 item untuk dikembalikan.');
+      return;
+    }
+
+    if (!returnReason.trim()) {
+      setReturnError('Masukkan alasan retur barang terlebih dahulu.');
+      return;
+    }
+
+    setIsSubmittingReturn(true);
+    setReturnError('');
+
+    try {
+      const result = await onProcessReturn({
+        transaction: returningTx,
+        returnItems: selectedReturnItems,
+        reason: returnReason.trim(),
+        restoreStock: restoreStockOnReturn,
+      });
+
+      sound.playSuccessChime();
+      const updatedTx = result && 'updatedTx' in result ? result.updatedTx : null;
+      const returnRecord = result && 'returnRecord' in result ? result.returnRecord : null;
+
+      if (updatedTx && selectedDetailTx && selectedDetailTx.id === updatedTx.id) {
+        setSelectedDetailTx(updatedTx);
+      }
+
+      setReturningTx(null);
+      setActionBanner({
+        type: 'success',
+        text: `Retur ${returnRecord?.returnNumber || ''} berhasil diproses untuk ${returningTx.invoiceNumber}: dana ${formatRupiah(
+          returnPreview.totalRefundAmount
+        )}${
+          returnPreview.pointsToCancel > 0
+            ? `, pembatalan poin -${formatNumber(returnPreview.pointsToCancel)} Pts`
+            : ''
+        }${restoreStockOnReturn ? ', stok & batch FIFO telah dikembalikan' : ''}.`,
+      });
+    } catch (err) {
+      setReturnError(
+        err instanceof Error ? err.message : 'Gagal memproses retur barang. Silakan coba lagi.'
+      );
+    } finally {
+      setIsSubmittingReturn(false);
+    }
   };
 
   // Helper to find customer profile from customers prop
@@ -1084,9 +1324,123 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
     setWaNotice(`PDF "${filename}" telah diunduh. Lampirkan file PDF tersebut setelah WhatsApp terbuka.`);
   };
 
+  const staffSensitiveActionCount = useMemo(() => {
+    return activityLogs.filter(
+      (l) => l.actorRole === 'KARYAWAN' || l.actorRole === 'STORE_MANAGER'
+    ).length;
+  }, [activityLogs]);
+
+  const handleOpenDeleteTxModal = (tx: Transaction) => {
+    sound.playTap();
+    setDeletingTx(tx);
+    setDeleteReason('');
+    setRestoreStockOnDelete(true);
+    setDeleteError('');
+  };
+
+  const handleConfirmDeleteTx = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!deletingTx || !onDeleteTransaction) return;
+    const cleanReason = deleteReason.trim();
+    if (cleanReason.length < 3) {
+      setDeleteError('Alasan penghapusan wajib diisi minimal 3 karakter untuk jejak audit.');
+      return;
+    }
+
+    sound.playSuccessChime();
+    onDeleteTransaction(deletingTx, cleanReason, restoreStockOnDelete);
+    setActionBanner({
+      type: 'warning',
+      text: `Invoice ${deletingTx.invoiceNumber} telah dihapus & dicatat di log Aktivitas Karyawan (${currentUser?.name || 'Staff'}).`,
+    });
+    if (selectedDetailTx?.id === deletingTx.id) {
+      setSelectedDetailTx(null);
+    }
+    setDeletingTx(null);
+  };
+
   return (
     <div className="flex-1 p-4 md:p-6 bg-slate-100 overflow-y-auto">
       <div className="max-w-6xl mx-auto space-y-5">
+        {/* Section Header & Switcher: Riwayat Transaksi vs Aktivitas Karyawan */}
+        <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base md:text-lg font-bold text-slate-900 flex items-center gap-2">
+              <Receipt className="w-5 h-5 text-sky-600" />
+              <span>Riwayat Transaksi &amp; Audit Aktivitas Karyawan</span>
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Pantau seluruh struk penjualan, edit/hapus invoice, dan tinjau akuntabilitas tindakan sensitif staf.
+            </p>
+          </div>
+
+          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 gap-1 shrink-0 overflow-x-auto no-scrollbar">
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveSection('HISTORY');
+              }}
+              className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeSection === 'HISTORY'
+                  ? 'bg-white text-slate-900 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Receipt className="w-3.5 h-3.5 text-sky-600" />
+              <span>Riwayat Transaksi ({transactions.length})</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveSection('EMPLOYEE_ACTIVITY');
+              }}
+              className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeSection === 'EMPLOYEE_ACTIVITY'
+                  ? 'bg-slate-900 text-white shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ShieldAlert className={`w-3.5 h-3.5 ${activeSection === 'EMPLOYEE_ACTIVITY' ? 'text-rose-400' : 'text-rose-600'}`} />
+              <span>Aktivitas Karyawan</span>
+              {staffSensitiveActionCount > 0 && (
+                <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-black font-mono tabular-nums ${
+                  activeSection === 'EMPLOYEE_ACTIVITY'
+                    ? 'bg-rose-500 text-white'
+                    : 'bg-rose-100 text-rose-700'
+                }`}>
+                  {staffSensitiveActionCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveSection('STOCK_OPNAME_LOGS');
+              }}
+              className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeSection === 'STOCK_OPNAME_LOGS'
+                  ? 'bg-sky-600 text-white shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Layers className={`w-3.5 h-3.5 ${activeSection === 'STOCK_OPNAME_LOGS' ? 'text-white' : 'text-sky-600'}`} />
+              <span>Log Stock Opname</span>
+            </button>
+          </div>
+        </div>
+
+        {activeSection === 'EMPLOYEE_ACTIVITY' || activeSection === 'STOCK_OPNAME_LOGS' ? (
+          <EmployeeActivityAuditPanel
+            logs={activityLogs}
+            initialScope={activeSection === 'STOCK_OPNAME_LOGS' ? 'STOCK_OPNAME' : 'ALL'}
+          />
+        ) : (
+          <>
         {/* KPI Strip */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
@@ -1561,15 +1915,26 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                         </td>
                         <td className="py-3.5 px-4 font-mono font-black text-slate-900 group-hover:text-sky-700">
                           <div>{tx.invoiceNumber}</div>
-                          {tx.auditLogs && tx.auditLogs.length > 0 && (
-                            <span
-                              title={`Invoice ini telah diubah ${tx.auditLogs.length}× oleh Admin`}
-                              className="inline-flex items-center gap-1 mt-0.5 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[9.5px] font-sans font-bold"
-                            >
-                              <History className="w-2.5 h-2.5" />
-                              Diubah ×{tx.auditLogs.length}
-                            </span>
-                          )}
+                          <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                            {tx.auditLogs && tx.auditLogs.length > 0 && (
+                              <span
+                                title={`Invoice ini telah diubah ${tx.auditLogs.length}× oleh Admin`}
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[9.5px] font-sans font-bold"
+                              >
+                                <History className="w-2.5 h-2.5" />
+                                Diubah ×{tx.auditLogs.length}
+                              </span>
+                            )}
+                            {((tx.returns && tx.returns.length > 0) || (tx.returnedAmount || 0) > 0) && (
+                              <span
+                                title={`Retur barang senilai ${formatRupiah(tx.returnedAmount || 0)}`}
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[9.5px] font-sans font-bold"
+                              >
+                                <RotateCcw className="w-2.5 h-2.5" />
+                                {tx.returnStatus === 'FULL' ? 'Retur Penuh' : 'Ada Retur'}
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         <td className="py-3.5 px-4 text-slate-500 text-xs">
@@ -1637,18 +2002,41 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                         </td>
 
                         <td className="py-3.5 px-4 font-mono font-black text-sky-700 text-sm tabular-nums">
-                          {formatRupiah(tx.finalAmount)}
+                          <div>{formatRupiah(tx.finalAmount)}</div>
+                          {(tx.returnedAmount || 0) > 0 && (
+                            <div className="text-[10px] font-bold text-rose-600 mt-0.5">
+                              Retur: -{formatRupiah(tx.returnedAmount || 0)}
+                            </div>
+                          )}
                         </td>
 
                         <td className="py-3.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
                           <div className="flex items-center justify-end gap-1.5">
+                            {/* Tombol Retur Barang (Khusus Admin) */}
+                            {isAdmin && onProcessReturn && (
+                              <button
+                                type="button"
+                                disabled={tx.returnStatus === 'FULL'}
+                                onClick={() => handleOpenReturnModal(tx)}
+                                title={
+                                  tx.returnStatus === 'FULL'
+                                    ? 'Seluruh item transaksi ini sudah diretur'
+                                    : 'Proses Retur Barang, Kembalikan Stok Batch FIFO & Batalkan Poin — Khusus Admin'
+                                }
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200 text-rose-700 text-xs font-bold transition-colors inline-flex items-center gap-1 shadow-2xs border border-rose-200 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                <span>{tx.returnStatus === 'FULL' ? 'Sudah Retur' : 'Retur'}</span>
+                              </button>
+                            )}
+
                             {/* Tombol Edit Invoice (Khusus Admin) */}
                             {isAdmin && (
                               <button
                                 type="button"
                                 onClick={() => handleOpenEditInvoiceModal(tx)}
                                 title="Edit Invoice (Catatan / Detail Pembayaran) — Khusus Admin"
-                                className="px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs font-bold transition-colors inline-flex items-center gap-1 shadow-2xs border border-amber-200 cursor-pointer"
+                                className="px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs font-bold transition-colors inline-flex items-center gap-1 shadow-2xs border border-amber-200 cursor-pointer whitespace-nowrap shrink-0"
                               >
                                 <Edit3 className="w-3.5 h-3.5 text-amber-600" />
                                 <span>Edit Invoice</span>
@@ -1690,6 +2078,19 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                               <Printer className="w-3.5 h-3.5" />
                               <span className="hidden md:inline">Struk</span>
                             </button>
+
+                            {/* Tombol Hapus Transaksi (Admin / Manager + Dicatat Audit) */}
+                            {canDeleteTransaction && onDeleteTransaction && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenDeleteTxModal(tx)}
+                                title="Hapus Transaksi & Catat di Aktivitas Karyawan"
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold transition-colors inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                                <span className="hidden lg:inline">Hapus</span>
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -1831,6 +2232,20 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                                   <div className="font-bold text-slate-900">
                                     {item.productName}
                                   </div>
+                                  {((item.adminFee || 0) > 0 || item.isCashWithdrawal) && item.principalAmount !== undefined && (
+                                    <div className="text-[10px] font-mono text-slate-600 mt-0.5 flex flex-wrap items-center gap-1.5">
+                                      <span>Nominal: {formatRupiah(item.principalAmount)}</span>
+                                      <span>•</span>
+                                      <span className="text-emerald-700 font-bold">
+                                        Admin/Laba: +{formatRupiah((item.adminFee || 0) * (item.quantity || 1))}
+                                      </span>
+                                      {item.isCashWithdrawal && (
+                                        <span className="px-1 py-0.2 rounded bg-rose-50 text-rose-700 border border-rose-200 font-sans font-bold text-[9px]">
+                                          Kas -{formatRupiah(item.principalAmount * (item.quantity || 1))}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
                                   {item.selectedVariant && (
                                     <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-700 mt-0.5">
                                       Varian: {item.selectedVariant}
@@ -1958,6 +2373,90 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                     )}
                   </div>
 
+                  {/* Riwayat Retur Barang & Pengembalian Stok Batch */}
+                  {selectedDetailTx.returns && selectedDetailTx.returns.length > 0 && (
+                    <div className="bg-amber-50/60 rounded-2xl p-4 border border-amber-200 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="font-bold text-amber-950 flex items-center gap-1.5 text-xs md:text-sm">
+                          <RotateCcw className="w-4 h-4 text-amber-700" />
+                          <span>Riwayat Retur Barang</span>
+                        </h4>
+                        <div className="flex items-center gap-2 text-[11px] font-mono tabular-nums">
+                          <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 font-bold border border-rose-200">
+                            Dana Diretur: {formatRupiah(selectedDetailTx.returnedAmount || 0)}
+                          </span>
+                          {(selectedDetailTx.returnedPoints || 0) > 0 && (
+                            <span className="px-2 py-0.5 rounded bg-purple-100 text-purple-800 font-bold border border-purple-200">
+                              Poin Dibatalkan: -{formatNumber(selectedDetailTx.returnedPoints || 0)} Pts
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {[...selectedDetailTx.returns].reverse().map((ret) => (
+                          <div
+                            key={ret.id}
+                            className="bg-white rounded-xl p-3 border border-amber-200/80 space-y-2"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                              <div className="flex items-center gap-1.5 font-bold text-slate-900">
+                                <span className="font-mono text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                                  {ret.returnNumber}
+                                </span>
+                                <span>• Diproses: {ret.processedByName}</span>
+                              </div>
+                              <span className="font-mono text-slate-500">
+                                {formatDateTime(ret.timestamp)}
+                              </span>
+                            </div>
+
+                            <div className="text-[11px] text-slate-700 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
+                              <span className="font-bold text-slate-500">Alasan Retur:</span> {ret.reason}
+                            </div>
+
+                            <div className="space-y-1.5">
+                              {ret.items.map((rit, rIdx) => (
+                                <div
+                                  key={rIdx}
+                                  className="text-[11px] flex flex-col sm:flex-row sm:items-center justify-between gap-1 px-2.5 py-1.5 rounded-lg bg-slate-50/70 border border-slate-100"
+                                >
+                                  <div>
+                                    <span className="font-bold text-slate-900">
+                                      {rit.returnedQuantity} {rit.unitName} × {rit.productName}
+                                    </span>
+                                    {rit.restoredBatches && rit.restoredBatches.length > 0 && (
+                                      <div className="flex flex-wrap gap-1 mt-1">
+                                        {rit.restoredBatches.map((rb, bIdx) => (
+                                          <span
+                                            key={bIdx}
+                                            className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-mono text-[10px] font-bold"
+                                          >
+                                            Batch {rb.batchNumber || rb.batchId}: +{rb.restoredBaseUnits} unit dasar
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="text-right font-mono tabular-nums shrink-0">
+                                    <div className="font-bold text-rose-700">
+                                      -{formatRupiah(rit.refundAmount)}
+                                    </div>
+                                    {rit.pointsCancelled > 0 && (
+                                      <div className="text-[10px] font-bold text-purple-700">
+                                        -{formatNumber(rit.pointsCancelled)} Poin
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Audit Log Perubahan Invoice (Admin) */}
                   {selectedDetailTx.auditLogs && selectedDetailTx.auditLogs.length > 0 && (
                     <div className="bg-indigo-50/70 rounded-2xl p-4 border border-indigo-200 space-y-3">
@@ -2031,6 +2530,21 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                   </button>
 
                   <div className="flex flex-wrap items-center gap-2">
+                    {isAdmin && onProcessReturn && (
+                      <button
+                        type="button"
+                        disabled={selectedDetailTx.returnStatus === 'FULL'}
+                        onClick={() => handleOpenReturnModal(selectedDetailTx)}
+                        className="px-3.5 py-2.5 rounded-xl bg-rose-50 hover:bg-rose-100 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200 text-rose-700 border border-rose-200 font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                        title="Proses Retur Barang, Kembalikan Stok ke Batch FIFO & Batalkan Poin Loyalitas (Admin)"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>
+                          {selectedDetailTx.returnStatus === 'FULL' ? 'Sudah Retur Penuh' : 'Retur Barang'}
+                        </span>
+                      </button>
+                    )}
+
                     {isAdmin && (
                       <button
                         type="button"
@@ -2784,6 +3298,449 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                   >
                     <Save className="w-4 h-4" />
                     <span>Simpan Perubahan &amp; Catat Audit</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+          </>
+        )}
+
+        {/* MODAL KONFIRMASI HAPUS TRANSAKSI (AUDIT AKUNTABILITAS) */}
+        {deletingTx && (
+          <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 select-none">
+            <div className="bg-white rounded-3xl max-w-md w-full p-6 border border-slate-200 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                <div className="flex items-center gap-2">
+                  <Trash2 className="w-5 h-5 text-rose-600" />
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">Hapus Transaksi Penjualan</h3>
+                    <p className="text-xs text-slate-500 font-mono">{deletingTx.invoiceNumber}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDeletingTx(null)}
+                  className="p-1 rounded-lg text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleConfirmDeleteTx} className="py-4 space-y-4">
+                <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-xs text-rose-900 space-y-1">
+                  <div className="font-bold">Tindakan Sensitif — Tercatat Permanen di Audit</div>
+                  <p>
+                    Penghapusan transaksi oleh <strong>{currentUser?.name}</strong> ({currentUser?.role}) akan dicatat otomatis di tab{' '}
+                    <strong>Aktivitas Karyawan</strong> lengkap dengan nominal, item, waktu, dan alasan.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-xs bg-slate-50 p-3 rounded-2xl border border-slate-200 tabular-nums">
+                  <div>
+                    <span className="text-slate-500 block">Nilai Transaksi</span>
+                    <strong className="font-mono text-rose-700 text-sm">
+                      {formatRupiah(deletingTx.finalAmount)}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block">Kasir / Pelanggan</span>
+                    <strong className="text-slate-900">
+                      {deletingTx.cashierName} / {deletingTx.customerName || 'Umum'}
+                    </strong>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-slate-700 block mb-1">
+                    Alasan Penghapusan Transaksi <span className="text-rose-600">*</span>
+                  </label>
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {['Salah Input Item', 'Transaksi Ganda', 'Pembatalan Pelanggan', 'Uji Coba Kasir'].map(
+                      (preset) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setDeleteReason(preset);
+                            setDeleteError('');
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[11px] font-bold border cursor-pointer transition-colors ${
+                            deleteReason === preset
+                              ? 'bg-rose-600 text-white border-rose-600'
+                              : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {preset}
+                        </button>
+                      )
+                    )}
+                  </div>
+                  <input
+                    type="text"
+                    required
+                    value={deleteReason}
+                    onChange={(e) => {
+                      setDeleteReason(e.target.value);
+                      setDeleteError('');
+                    }}
+                    placeholder="Jelaskan alasan penghapusan invoice ini..."
+                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs focus:border-rose-500 focus:outline-none"
+                  />
+                </div>
+
+                {deletingTx.items.some((i) => !i.isService && !i.isQuickSale) && (
+                  <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer text-xs">
+                    <input
+                      type="checkbox"
+                      checked={restoreStockOnDelete}
+                      onChange={(e) => setRestoreStockOnDelete(e.target.checked)}
+                      className="mt-0.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                    />
+                    <span>
+                      <strong className="text-slate-900 block">Kembalikan stok barang ke gudang</strong>
+                      <span className="text-slate-500">
+                        Menambahkan kembali kuantitas barang fisik dari invoice ini ke stok produk.
+                      </span>
+                    </span>
+                  </label>
+                )}
+
+                {deleteError && (
+                  <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span>{deleteError}</span>
+                  </div>
+                )}
+
+                <div className="pt-2 border-t border-slate-100 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDeletingTx(null)}
+                    className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 text-xs font-bold cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Hapus &amp; Catat Audit</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* MODAL RETUR BARANG (KHUSUS ADMIN) */}
+        {isAdmin && returningTx && returnPreview && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 md:p-6 bg-black/70 backdrop-blur-xs select-none overflow-y-auto">
+            <div className="bg-white rounded-3xl max-w-2xl w-full overflow-hidden shadow-2xl border border-slate-200 my-auto flex flex-col max-h-[92vh]">
+              {/* Header */}
+              <div className="p-4 md:p-5 bg-slate-900 text-white flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-rose-500/20 border border-rose-400/30 flex items-center justify-center">
+                    <RotateCcw className="w-5 h-5 text-rose-400" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-black text-sm md:text-base">Modul Retur Barang</h3>
+                      <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-400/30 text-[10px] font-mono font-bold">
+                        ADMIN ONLY
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-300 font-mono mt-0.5">
+                      {returningTx.invoiceNumber} • {returningTx.customerName || 'Pelanggan Umum'} • Total Awal{' '}
+                      {formatRupiah(returningTx.finalAmount)}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReturningTx(null)}
+                  className="p-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Body Form */}
+              <form onSubmit={handleConfirmProcessReturn} className="p-5 overflow-y-auto space-y-4 text-xs">
+                {/* Summary Strip */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 tabular-nums">
+                    <div className="text-[10.5px] font-bold text-slate-500">Pelanggan &amp; Poin</div>
+                    <div className="font-bold text-slate-900 mt-0.5 truncate">
+                      {returningTx.customerName || 'Pelanggan Umum'}
+                    </div>
+                    <div className="text-[10.5px] text-slate-500 font-mono mt-0.5">
+                      {returnPreview.customerProfile
+                        ? `Saldo poin saat ini: ${formatNumber(returnPreview.customerProfile.totalPoints)} Pts`
+                        : returningTx.pointsEarned > 0
+                        ? `Poin nota: +${formatNumber(returningTx.pointsEarned)} Pts`
+                        : 'Tanpa poin loyalitas'}
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 tabular-nums">
+                    <div className="text-[10.5px] font-bold text-rose-700">Estimasi Dana Retur</div>
+                    <div className="text-base font-black font-mono text-rose-700 mt-0.5">
+                      {formatRupiah(returnPreview.totalRefundAmount)}
+                    </div>
+                    <div className="text-[10.5px] text-rose-600 mt-0.5">
+                      {returnPreview.totalReturnQty} unit dipilih ({returnPreview.willBeFull ? 'Retur Penuh' : 'Retur Sebagian'})
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-purple-50 border border-purple-200 tabular-nums">
+                    <div className="text-[10.5px] font-bold text-purple-800">Pembatalan Poin Loyalitas</div>
+                    <div className="text-base font-black font-mono text-purple-700 mt-0.5">
+                      -{formatNumber(returnPreview.pointsToCancel)} Poin
+                    </div>
+                    <div className="text-[10.5px] text-purple-700 mt-0.5">
+                      Sisa poin nota dapat dibatalkan: {formatNumber(returnPreview.remainingTxPoints)} Pts
+                    </div>
+                  </div>
+                </div>
+
+                {/* Item Return Selector + Batch Preview */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-slate-900 text-xs">
+                      Pilih Kuantitas Item yang Diretur
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        const nextMap: Record<number, number> = {};
+                        returnPreview.itemPreviews.forEach((p) => {
+                          nextMap[p.itemIndex] = p.maxReturnableQty;
+                        });
+                        setReturnQtyByIndex(nextMap);
+                        setReturnError('');
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-[11px] whitespace-nowrap cursor-pointer"
+                    >
+                      Pilih Semua Sisa Item
+                    </button>
+                  </div>
+
+                  <div className="border border-slate-200 rounded-2xl divide-y divide-slate-200 overflow-hidden">
+                    {returnPreview.itemPreviews.map((p) => {
+                      const canReturn = p.maxReturnableQty > 0;
+                      return (
+                        <div
+                          key={p.itemIndex}
+                          className={`p-3 space-y-2 ${
+                            p.selectedQty > 0 ? 'bg-rose-50/40' : canReturn ? 'bg-white' : 'bg-slate-50 opacity-65'
+                          }`}
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                                <span>{p.item.productName}</span>
+                                {p.item.selectedVariant && (
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px]">
+                                    {p.item.selectedVariant}
+                                  </span>
+                                )}
+                                {p.item.isService && (
+                                  <span className="px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 text-[10px]">
+                                    Jasa
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                                Dibeli: {p.item.quantity} {p.item.unitName} @ {formatRupiah(p.item.unitPrice)}
+                                {p.alreadyReturnedQty > 0 && (
+                                  <span className="text-amber-700 font-bold ml-2">
+                                    • Sudah diretur: {p.alreadyReturnedQty} {p.item.unitName}
+                                  </span>
+                                )}
+                                {!canReturn && (
+                                  <span className="text-emerald-700 font-bold ml-2">• Sisa 0</span>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Stepper */}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                disabled={!canReturn || p.selectedQty <= 0}
+                                onClick={() => {
+                                  sound.playTap();
+                                  setReturnQtyByIndex((prev) => ({
+                                    ...prev,
+                                    [p.itemIndex]: Math.max(0, (prev[p.itemIndex] || 0) - 1),
+                                  }));
+                                  setReturnError('');
+                                }}
+                                className="w-8 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 font-black text-sm cursor-pointer"
+                              >
+                                -
+                              </button>
+                              <input
+                                type="number"
+                                min={0}
+                                max={p.maxReturnableQty}
+                                disabled={!canReturn}
+                                value={p.selectedQty}
+                                onChange={(e) => {
+                                  const raw = parseInt(e.target.value, 10);
+                                  const nextVal = Number.isFinite(raw)
+                                    ? Math.min(p.maxReturnableQty, Math.max(0, raw))
+                                    : 0;
+                                  setReturnQtyByIndex((prev) => ({
+                                    ...prev,
+                                    [p.itemIndex]: nextVal,
+                                  }));
+                                  setReturnError('');
+                                }}
+                                className="w-14 h-8 text-center rounded-lg border border-slate-300 bg-white font-mono font-bold text-slate-900 focus:outline-none focus:border-rose-500"
+                              />
+                              <button
+                                type="button"
+                                disabled={!canReturn || p.selectedQty >= p.maxReturnableQty}
+                                onClick={() => {
+                                  sound.playTap();
+                                  setReturnQtyByIndex((prev) => ({
+                                    ...prev,
+                                    [p.itemIndex]: Math.min(
+                                      p.maxReturnableQty,
+                                      (prev[p.itemIndex] || 0) + 1
+                                    ),
+                                  }));
+                                  setReturnError('');
+                                }}
+                                className="w-8 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 font-black text-sm cursor-pointer"
+                              >
+                                +
+                              </button>
+                              <span className="text-[11px] font-mono text-slate-500 w-12 truncate">
+                                / {p.maxReturnableQty}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Target Batch FIFO Restoration Preview */}
+                          {p.selectedQty > 0 && p.targetBatches.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[10.5px]">
+                              <span className="font-bold text-emerald-800">Target Batch Stok:</span>
+                              {p.targetBatches.map((tb, bIdx) => (
+                                <span
+                                  key={bIdx}
+                                  className={`px-2 py-0.5 rounded font-mono font-bold border ${
+                                    tb.isFallback
+                                      ? 'bg-sky-50 text-sky-800 border-sky-200'
+                                      : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                  }`}
+                                >
+                                  {tb.batchLabel} (+{tb.units} unit dasar{tb.isFallback ? ' • Batch Retur Baru' : ''})
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Stock Restoration Option */}
+                <label className="flex items-start gap-2.5 p-3 rounded-xl bg-emerald-50/60 border border-emerald-200 cursor-pointer text-xs">
+                  <input
+                    type="checkbox"
+                    checked={restoreStockOnReturn}
+                    onChange={(e) => setRestoreStockOnReturn(e.target.checked)}
+                    className="mt-0.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <span>
+                    <strong className="text-slate-900 block">
+                      Kembalikan stok ke batch asal yang sesuai (FIFO)
+                    </strong>
+                    <span className="text-slate-600">
+                      Menambahkan unit dasar yang diretur ke batch pembelian asal tempat item terjual. Hapus centang jika barang rusak berat dan tidak layak dijual kembali.
+                    </span>
+                  </span>
+                </label>
+
+                {/* Return Reason */}
+                <div>
+                  <label className="text-xs font-bold text-slate-700 block mb-1">
+                    Alasan Retur Barang <span className="text-rose-600">*</span>
+                  </label>
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {[
+                      'Barang Rusak / Cacat',
+                      'Salah Varian / Ukuran',
+                      'Mendekati / Lewat Kedaluwarsa',
+                      'Tidak Sesuai Pesanan',
+                      'Kesepakatan Tukar / Refund',
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setReturnReason(preset);
+                          setReturnError('');
+                        }}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border cursor-pointer transition-colors ${
+                          returnReason === preset
+                            ? 'bg-rose-600 text-white border-rose-600'
+                            : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+                  <input
+                    type="text"
+                    required
+                    value={returnReason}
+                    onChange={(e) => {
+                      setReturnReason(e.target.value);
+                      setReturnError('');
+                    }}
+                    placeholder="Jelaskan kondisi barang & alasan pengembalian..."
+                    className="w-full p-2.5 rounded-xl border border-slate-300 text-xs text-slate-900 focus:border-rose-500 focus:outline-none"
+                  />
+                </div>
+
+                {returnError && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 font-bold flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span>{returnError}</span>
+                  </div>
+                )}
+
+                <div className="pt-2 border-t border-slate-200 flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    disabled={isSubmittingReturn}
+                    onClick={() => setReturningTx(null)}
+                    className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 text-xs font-bold cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmittingReturn || returnPreview.totalReturnQty === 0}
+                    className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:bg-slate-300 text-white text-xs font-black flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>
+                      {isSubmittingReturn
+                        ? 'Memproses Retur...'
+                        : `Proses Retur (${formatRupiah(returnPreview.totalRefundAmount)})`}
+                    </span>
                   </button>
                 </div>
               </form>

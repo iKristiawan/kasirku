@@ -160,6 +160,7 @@ export async function clearAllDatabaseExceptUsers(adminUser?: {
     'attendances',
     'cashflows',
     'online_orders',
+    'activity_logs',
   ];
 
   const standardAdmin = adminUser || {
@@ -352,15 +353,182 @@ export async function saveBatchToFirestore<T extends { id: string }>(
 }
 
 /**
+ * Replaces all documents in a Firestore collection with the provided items.
+ * Deletes existing documents not present in items, then writes/overwrites the restored items.
+ */
+export async function replaceCollectionInFirestore<T extends { id: string }>(
+  collectionName: string,
+  items: T[]
+): Promise<void> {
+  if (cloudSyncPaused) return;
+  const safeItems = Array.isArray(items) ? items : [];
+  const nextIds = new Set(safeItems.map((item) => item.id));
+
+  try {
+    const colRef = collection(db, collectionName);
+    const existingSnap = await getDocs(colRef);
+    const docsToDelete = existingSnap.docs.filter((docSnap) => !nextIds.has(docSnap.id));
+
+    const CHUNK_SIZE = 400;
+    for (let i = 0; i < docsToDelete.length; i += CHUNK_SIZE) {
+      const chunk = docsToDelete.slice(i, i + CHUNK_SIZE);
+      try {
+        const batch = writeBatch(db);
+        chunk.forEach((docSnap) => {
+          batch.delete(docSnap.ref);
+        });
+        await batch.commit();
+      } catch (batchDelErr) {
+        console.warn(`[FirebaseSync] Batch delete fallback for ${collectionName}:`, batchDelErr);
+        for (const docSnap of chunk) {
+          try {
+            await deleteDoc(docSnap.ref);
+          } catch (delErr) {
+            console.warn(`[FirebaseSync] Could not delete ${docSnap.id} in ${collectionName}:`, delErr);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < safeItems.length; i += CHUNK_SIZE) {
+      const chunk = safeItems.slice(i, i + CHUNK_SIZE);
+      try {
+        const batch = writeBatch(db);
+        chunk.forEach((item) => {
+          const docRef = doc(db, collectionName, item.id);
+          batch.set(docRef, sanitizeForFirestore(item));
+        });
+        await batch.commit();
+      } catch (batchWriteErr) {
+        console.warn(`[FirebaseSync] Batch write fallback for ${collectionName}:`, batchWriteErr);
+        for (const item of chunk) {
+          try {
+            const docRef = doc(db, collectionName, item.id);
+            await setDoc(docRef, sanitizeForFirestore(item));
+          } catch (writeErr) {
+            console.warn(`[FirebaseSync] Could not restore doc ${item.id} in ${collectionName}:`, writeErr);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[FirebaseSync] Failed to replace collection ${collectionName}:`, err);
+    throw err;
+  }
+}
+
+/**
  * Saves store settings singleton document
  */
-export async function saveStoreSettingsToFirestore(settings: Record<string, any>): Promise<void> {
+export async function saveStoreSettingsToFirestore(
+  settings: Record<string, any>,
+  replace = false
+): Promise<void> {
   if (cloudSyncPaused) return;
   try {
     const docRef = doc(db, 'settings', 'store_config');
-    await setDoc(docRef, sanitizeForFirestore(settings), { merge: true });
+    await setDoc(docRef, sanitizeForFirestore(settings), { merge: !replace });
   } catch (err) {
     console.error('[FirebaseSync] Failed to save store settings:', err);
     throw err;
   }
 }
+
+export type FirebaseMailDeliveryState = 'QUEUED' | 'PENDING' | 'PROCESSING' | 'SUCCESS' | 'ERROR';
+
+export interface FirebaseMailDeliveryUpdate {
+  mailId: string;
+  state: FirebaseMailDeliveryState;
+  error?: string;
+}
+
+export interface SendReceiptEmailPayload {
+  toEmail: string;
+  subject: string;
+  textBody: string;
+  htmlBody: string;
+  transactionId: string;
+  invoiceNumber: string;
+  storeName: string;
+  customerName?: string;
+  finalAmount: number;
+}
+
+/**
+ * Triggers a transactional receipt email by writing to the Firebase Trigger Email (`mail`) collection.
+ */
+export async function sendReceiptEmailViaFirebase(
+  payload: SendReceiptEmailPayload
+): Promise<string> {
+  if (cloudSyncPaused) {
+    throw new Error('Mode Offline manual sedang aktif. Nonaktifkan mode offline agar pengiriman email Firebase dapat berjalan.');
+  }
+
+  const cleanEmail = payload.toEmail.trim().toLowerCase();
+  const mailId = `mail_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const path = `mail/${mailId}`;
+
+  const mailDoc = {
+    id: mailId,
+    to: [cleanEmail],
+    message: {
+      subject: payload.subject.slice(0, 200),
+      text: payload.textBody.slice(0, 20000),
+      html: payload.htmlBody.slice(0, 60000),
+    },
+    metadata: {
+      transactionId: payload.transactionId,
+      invoiceNumber: payload.invoiceNumber,
+      storeName: payload.storeName,
+      customerName: payload.customerName || 'Pelanggan Umum',
+      finalAmount: payload.finalAmount,
+    },
+    createdAt: Date.now(),
+  };
+
+  try {
+    const docRef = doc(db, 'mail', mailId);
+    await setDoc(docRef, sanitizeForFirestore(mailDoc));
+    return mailId;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+/**
+ * Listens for live Firebase Trigger Email extension `delivery.state` updates on a queued mail doc.
+ */
+export function subscribeMailDeliveryStatus(
+  mailId: string,
+  onUpdate: (status: FirebaseMailDeliveryUpdate) => void
+): () => void {
+  const docRef = doc(db, 'mail', mailId);
+  return onSnapshot(
+    docRef,
+    (snap) => {
+      if (!snap.exists()) return;
+      const data = snap.data() as {
+        delivery?: {
+          state?: string;
+          error?: string;
+        };
+      };
+      const rawState = String(data?.delivery?.state || '').toUpperCase();
+      let state: FirebaseMailDeliveryState = 'QUEUED';
+      if (rawState === 'PENDING') state = 'PENDING';
+      else if (rawState === 'PROCESSING') state = 'PROCESSING';
+      else if (rawState === 'SUCCESS') state = 'SUCCESS';
+      else if (rawState === 'ERROR') state = 'ERROR';
+
+      onUpdate({
+        mailId,
+        state,
+        error: data?.delivery?.error ? String(data.delivery.error) : undefined,
+      });
+    },
+    (err) => {
+      console.warn('[FirebaseSync] Mail status snapshot notice:', err);
+    }
+  );
+}
+

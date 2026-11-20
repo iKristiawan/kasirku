@@ -19,13 +19,16 @@ import {
   Minus,
   StickyNote,
   Clock,
-  History
+  History,
+  Printer,
+  Bluetooth
 } from 'lucide-react';
 import { PaymentMethod, Customer, StoreSettings, CustomPaymentMethod, PaymentMethodType } from '../types/pos';
 import { DEFAULT_PAYMENT_METHODS } from '../utils/mockData';
 import { formatRupiah, formatNumber } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { isCustomerMember, calculatePointsEarned } from '../utils/customerUtils';
+import { getPrinterConnectionInfo } from '../utils/bluetoothPrinter';
 
 interface PaymentModalProps {
   isOpen: boolean;
@@ -52,6 +55,7 @@ interface PaymentModalProps {
     dueDate?: string;
     notes?: string;
     customTimestamp?: number;
+    quickPrint?: boolean;
   }) => void;
   onOpenCustomerModal: () => void;
 }
@@ -167,6 +171,27 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
     formatLocalTimeInput(new Date())
   );
 
+  // Quick Print ("Cetak Cepat") state persisted in localStorage
+  const [quickPrintEnabled, setQuickPrintEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('kasir_quick_print_enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [livePrinterInfo, setLivePrinterInfo] = useState(() => getPrinterConnectionInfo());
+
+  const handleToggleQuickPrint = () => {
+    sound.playTap();
+    setQuickPrintEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('kasir_quick_print_enabled', String(next));
+      } catch {}
+      return next;
+    });
+  };
+
   const isNoteRequired = !!storeSettings.requireTransactionNote;
 
   // Reset per-checkout transient inputs when modal opens
@@ -177,6 +202,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
       setTransferRef('');
       setNoteValidationError(null);
       setIsForceNotePromptOpen(false);
+      setLivePrinterInfo(getPrinterConnectionInfo());
       const now = new Date();
       const yesterday = new Date(now.getTime() - 86400000);
       setTxDateMode(isAdmin && defaultBackdated ? 'BACKDATED' : 'NOW');
@@ -326,6 +352,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
         isAdmin && txDateMode === 'BACKDATED' && backdateEvaluation.valid
           ? backdateEvaluation.timestamp
           : undefined,
+      quickPrint: quickPrintEnabled,
     });
   };
 
@@ -1497,14 +1524,77 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
               </div>
             )}
 
-            {/* Bottom Confirmation Bar */}
-            <div className="pt-4 mt-4 border-t border-slate-200 flex items-center justify-between gap-3">
+            {/* Quick Print ("Cetak Cepat") Toggle */}
+            <div
+              onClick={handleToggleQuickPrint}
+              className={`mt-3 p-3 rounded-2xl border flex items-center justify-between gap-3 cursor-pointer transition-colors select-none ${
+                quickPrintEnabled
+                  ? 'bg-sky-50/80 border-sky-300'
+                  : 'bg-slate-50 border-slate-200 hover:bg-slate-100/70'
+              }`}
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div
+                  className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border ${
+                    quickPrintEnabled
+                      ? 'bg-sky-600 text-white border-sky-600'
+                      : 'bg-white text-slate-600 border-slate-200'
+                  }`}
+                >
+                  <Printer className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-bold text-slate-900">
+                      Cetak Cepat
+                    </span>
+                    <span className="text-[11px] font-medium text-slate-500">
+                      Lewati dialog pratinjau struk
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-600 flex items-center gap-1.5 mt-0.5 truncate">
+                    <Bluetooth className={`w-3 h-3 shrink-0 ${livePrinterInfo.bluetoothConnected ? 'text-emerald-600' : 'text-sky-600'}`} />
+                    <span className="truncate">
+                      {storeSettings.printerDeviceName || livePrinterInfo.bluetoothDeviceName
+                        ? `Printer tersimpan: ${storeSettings.printerDeviceName || livePrinterInfo.bluetoothDeviceName} (${storeSettings.printerPaperWidth || '58mm'})${
+                            livePrinterInfo.bluetoothConnected ? ' · Terhubung' : ''
+                          }`
+                        : `Langsung kirim ke printer Bluetooth tersimpan (${storeSettings.printerPaperWidth || '58mm'})`}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <button
+                type="button"
+                role="switch"
+                aria-checked={quickPrintEnabled}
+                aria-label="Aktifkan Cetak Cepat"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleToggleQuickPrint();
+                }}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-1 ${
+                  quickPrintEnabled ? 'bg-sky-600' : 'bg-slate-300'
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
+                    quickPrintEnabled ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Bottom Confirmation Bar */}
+            <div className="pt-4 mt-3 border-t border-slate-200 flex items-center justify-between gap-3">
+              <button
+                type="button"
                 onClick={() => {
                   sound.playTap();
                   onClose();
                 }}
-                className="py-3 px-5 rounded-2xl border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs md:text-sm flex items-center gap-1.5 cursor-pointer"
+                className="py-3 px-5 rounded-2xl border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs md:text-sm flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 title="Batal / Tutup (Esc)"
               >
                 <span>Batal</span>
@@ -1512,29 +1602,38 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
               </button>
 
               <button
+                type="button"
                 onClick={handleProcessPayment}
                 disabled={
                   (currentMethod.type === 'CASH' && !isCashSufficient) ||
                   (currentMethod.type === 'PIUTANG' && !isCustomerValidForPiutang) ||
                   (isAdmin && txDateMode === 'BACKDATED' && !backdateEvaluation.valid)
                 }
-                className={`flex-1 py-3.5 px-6 rounded-2xl disabled:opacity-40 text-white font-extrabold text-sm md:text-base shadow-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                className={`flex-1 py-3.5 px-6 rounded-2xl disabled:opacity-40 text-white font-extrabold text-sm md:text-base shadow-lg flex items-center justify-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
                   isAdmin && txDateMode === 'BACKDATED'
                     ? 'bg-amber-600 hover:bg-amber-500 active:bg-amber-700 disabled:hover:bg-amber-600 shadow-amber-600/30'
                     : 'bg-sky-600 hover:bg-sky-500 active:bg-sky-700 disabled:hover:bg-sky-600 shadow-sky-600/30'
                 }`}
                 title="Selesaikan Transaksi (Enter)"
               >
-                <CheckCircle2 className="w-5 h-5 stroke-[2.5]" />
+                {quickPrintEnabled ? (
+                  <Printer className="w-5 h-5 stroke-[2.5] shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 stroke-[2.5] shrink-0" />
+                )}
                 <span>
                   {isAdmin && txDateMode === 'BACKDATED'
                     ? 'Simpan Transaksi Mundur & Hitung Ulang FIFO'
+                    : quickPrintEnabled
+                    ? currentMethod.type === 'PIUTANG'
+                      ? 'Simpan Piutang & Cetak Cepat'
+                      : 'Konfirmasi & Cetak Cepat'
                     : currentMethod.type === 'PIUTANG'
                     ? 'Simpan Piutang & Cetak Nota'
                     : 'Konfirmasi & Selesaikan Transaksi'}
                 </span>
                 <kbd
-                  className={`px-1.5 py-0.5 text-[10px] font-mono font-black rounded border shadow-2xs ${
+                  className={`px-1.5 py-0.5 text-[10px] font-mono font-black rounded border shadow-2xs shrink-0 ${
                     isAdmin && txDateMode === 'BACKDATED'
                       ? 'bg-amber-700 text-amber-100 border-amber-400'
                       : 'bg-sky-700 text-sky-100 border-sky-400'

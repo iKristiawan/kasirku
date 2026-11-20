@@ -115,6 +115,18 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
   const [exportScope, setExportScope] = useState<'ALL' | 'FILTERED'>('ALL');
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [expandedRedemptionCustomerIds, setExpandedRedemptionCustomerIds] = useState<Record<string, boolean>>({});
+  const [panelCustomerId, setPanelCustomerId] = useState<string>(() => customers[0]?.id || '');
+  const [panelTxSearch, setPanelTxSearch] = useState('');
+  const [panelTxStatusFilter, setPanelTxStatusFilter] = useState<'ALL' | 'LUNAS' | 'BELUM_LUNAS' | 'RETURNED'>('ALL');
+  const [expandedPanelTxIds, setExpandedPanelTxIds] = useState<Record<string, boolean>>({});
+
+  React.useEffect(() => {
+    if (!panelCustomerId && customers.length > 0) {
+      setPanelCustomerId(customers[0].id);
+    } else if (panelCustomerId && !customers.some((c) => c.id === panelCustomerId)) {
+      setPanelCustomerId(customers[0]?.id || '');
+    }
+  }, [customers, panelCustomerId]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -361,19 +373,35 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
       const averageBasket = totalVisits > 0 ? totalPaymentsMade / totalVisits : 0;
       const lastTx = custTxs.length > 0 ? [...custTxs].sort((a, b) => b.timestamp - a.timestamp)[0] : null;
 
-      // Product frequency analysis
-      const itemCounts: Record<string, { name: string; qty: number; unit: string }> = {};
+      // Product frequency & spend analysis
+      const itemCounts: Record<
+        string,
+        { name: string; qty: number; unit: string; totalSpend: number; lastPrice: number; lastPurchasedAt: number }
+      > = {};
       custTxs.forEach((tx) => {
         tx.items.forEach((item) => {
-          if (!itemCounts[item.productId]) {
-            itemCounts[item.productId] = { name: item.productName, qty: 0, unit: item.unitName };
+          const key = `${item.productId}_${item.unitName}`;
+          if (!itemCounts[key]) {
+            itemCounts[key] = {
+              name: item.productName,
+              qty: 0,
+              unit: item.unitName,
+              totalSpend: 0,
+              lastPrice: item.unitPrice,
+              lastPurchasedAt: tx.timestamp,
+            };
           }
-          itemCounts[item.productId].qty += item.quantity;
+          itemCounts[key].qty += item.quantity;
+          itemCounts[key].totalSpend += item.totalAmount || 0;
+          if (tx.timestamp >= itemCounts[key].lastPurchasedAt) {
+            itemCounts[key].lastPrice = item.unitPrice;
+            itemCounts[key].lastPurchasedAt = tx.timestamp;
+          }
         });
       });
       const topProducts = Object.values(itemCounts)
         .sort((a, b) => b.qty - a.qty)
-        .slice(0, 3);
+        .slice(0, 5);
 
       // Payment method preference
       const paymentMethodCounts: Record<string, number> = {};
@@ -384,6 +412,7 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
 
       return {
         customer: cust,
+        transactions: [...custTxs].sort((a, b) => b.timestamp - a.timestamp),
         totalPaymentsMade,
         totalPointsEarned,
         totalPointsUsed,
@@ -397,6 +426,34 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
       };
     });
   }, [customers, customerTransactionsMap]);
+
+  const selectedPanelCustomerData = useMemo(() => {
+    if (!panelCustomerId) return customerAnalytics[0] || null;
+    return customerAnalytics.find((a) => a.customer.id === panelCustomerId) || customerAnalytics[0] || null;
+  }, [panelCustomerId, customerAnalytics]);
+
+  const filteredPanelTransactions = useMemo(() => {
+    const baseTxs = selectedPanelCustomerData?.transactions || [];
+    const q = panelTxSearch.trim().toLowerCase();
+    return baseTxs.filter((tx) => {
+      if (panelTxStatusFilter === 'LUNAS' && tx.paymentStatus !== 'LUNAS') return false;
+      if (panelTxStatusFilter === 'BELUM_LUNAS' && tx.paymentStatus !== 'BELUM_LUNAS') return false;
+      if (
+        panelTxStatusFilter === 'RETURNED' &&
+        !((tx.returns && tx.returns.length > 0) || (tx.returnedAmount || 0) > 0)
+      ) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        tx.invoiceNumber.toLowerCase().includes(q) ||
+        tx.cashierName.toLowerCase().includes(q) ||
+        tx.paymentMethod.toLowerCase().includes(q) ||
+        tx.items.some((it) => it.productName.toLowerCase().includes(q)) ||
+        (tx.notes || '').toLowerCase().includes(q)
+      );
+    });
+  }, [selectedPanelCustomerData, panelTxSearch, panelTxStatusFilter]);
 
   // Global KPIs for member activity
   const globalMemberKPIs = useMemo(() => {
@@ -1006,7 +1063,7 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                   sound.playTap();
                   setActiveSubTab('activity_log');
                 }}
-                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all ${
                   activeSubTab === 'activity_log'
                     ? 'bg-white text-emerald-700 shadow-2xs'
                     : 'text-slate-600 hover:text-slate-900'
@@ -1014,7 +1071,6 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
               >
                 <History className="w-3.5 h-3.5" />
                 <span>Log Aktivitas & Perilaku</span>
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
               </button>
             </div>
 
@@ -1274,18 +1330,29 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
               </div>
             </div>
 
-            {/* Customer Cards Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {/* Directory Split View: Customer Cards Grid + Selected Customer Transaction History Panel */}
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+              {/* Customer Cards Grid */}
+              <div className="xl:col-span-7 grid grid-cols-1 md:grid-cols-2 gap-4">
               {filteredCustomers.map((cust) => {
                 const analytics = customerAnalytics.find((a) => a.customer.id === cust.id);
                 const catObj = customerCategories.find(
                   (c) => c.name.toUpperCase() === (cust.customerCategory || 'UMUM').toUpperCase()
                 );
                 const categoryBadge = getCustomerCategoryBadge(cust.customerCategory, catObj?.color);
+                const isSelectedInPanel = selectedPanelCustomerData?.customer.id === cust.id;
                 return (
                   <div
                     key={cust.id}
-                    className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs hover:shadow-md transition-shadow flex flex-col justify-between"
+                    onClick={() => {
+                      sound.playTap();
+                      setPanelCustomerId(cust.id);
+                    }}
+                    className={`bg-white rounded-2xl border p-4 transition-all flex flex-col justify-between cursor-pointer ${
+                      isSelectedInPanel
+                        ? 'border-sky-500 ring-2 ring-sky-100'
+                        : 'border-slate-200 hover:border-slate-300'
+                    }`}
                   >
                     <div>
                       <div className="flex items-start justify-between gap-2 pb-3 border-b border-slate-100">
@@ -1483,28 +1550,46 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                     </div>
 
                     {/* Bottom Action Buttons */}
-                    <div className="pt-2 space-y-1.5">
-                      <button
-                        onClick={() => jumpToCustomerLog(cust)}
-                        className="w-full py-2 px-3 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-700 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors border border-sky-200/60"
-                      >
-                        <History className="w-3.5 h-3.5 text-sky-600" />
-                        <span>Lihat Log Aktivitas & Riwayat</span>
-                      </button>
+                    <div className="pt-2 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            sound.playTap();
+                            setPanelCustomerId(cust.id);
+                          }}
+                          className={`py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors border whitespace-nowrap cursor-pointer ${
+                            isSelectedInPanel
+                              ? 'bg-sky-600 text-white border-sky-600'
+                              : 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200/70'
+                          }`}
+                        >
+                          <Receipt className="w-3.5 h-3.5" />
+                          <span>Histori Transaksi</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => jumpToCustomerLog(cust)}
+                          className="py-2 px-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors border border-slate-200 whitespace-nowrap cursor-pointer"
+                        >
+                          <History className="w-3.5 h-3.5 text-slate-600" />
+                          <span>Audit Poin</span>
+                        </button>
+                      </div>
 
                       <div className="grid grid-cols-2 gap-1.5">
                         <button
                           onClick={() => handleSendWA(cust)}
-                          className="py-2 px-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold flex items-center justify-center gap-1 transition-colors border border-emerald-200/60"
+                          className="py-2 px-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold flex items-center justify-center gap-1 transition-colors border border-emerald-200/60 cursor-pointer"
                           title="Hubungi via WhatsApp (Sapaan Ramah / Tagihan)"
                         >
                           <MessageCircle className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Hubungi via WhatsApp</span>
+                          <span>WhatsApp</span>
                         </button>
 
                         <button
                           onClick={() => handleOpenBlastModal(cust.id)}
-                          className="py-2 px-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-bold flex items-center justify-center gap-1 transition-colors border border-teal-200/60"
+                          className="py-2 px-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-bold flex items-center justify-center gap-1 transition-colors border border-teal-200/60 cursor-pointer"
                           title="Pilih Template & Kirim Promo Blast WhatsApp"
                         >
                           <Megaphone className="w-3.5 h-3.5 text-teal-600" />
@@ -1515,6 +1600,332 @@ export const CustomerManagementView: React.FC<CustomerManagementViewProps> = ({
                   </div>
                 );
               })}
+              </div>
+
+              {/* Sticky Selected Customer Transaction History & Shopping Preferences Panel */}
+              <div className="xl:col-span-5 xl:sticky xl:top-4 bg-white rounded-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[82vh]">
+                {/* Panel Header */}
+                <div className="p-4 bg-slate-900 text-white space-y-3 shrink-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Receipt className="w-4 h-4 text-sky-400 shrink-0" />
+                      <h3 className="text-sm font-bold truncate">Panel Histori Transaksi Pelanggan</h3>
+                    </div>
+                    {selectedPanelCustomerData && (
+                      <button
+                        type="button"
+                        onClick={() => jumpToCustomerLog(selectedPanelCustomerData.customer)}
+                        className="text-[11px] font-bold text-sky-300 hover:text-sky-200 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        Buka Tab Log Lengkap →
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Quick Customer Picker inside Panel */}
+                  <select
+                    aria-label="Pilih pelanggan untuk panel histori transaksi"
+                    value={selectedPanelCustomerData?.customer.id || ''}
+                    onChange={(e) => {
+                      sound.playTap();
+                      setPanelCustomerId(e.target.value);
+                    }}
+                    className="w-full px-3 py-2 rounded-xl bg-slate-800 border border-slate-700 text-xs font-bold text-white focus:outline-none focus:border-sky-400 cursor-pointer"
+                  >
+                    {customers.length === 0 ? (
+                      <option value="">Belum ada pelanggan terdaftar</option>
+                    ) : (
+                      customers.map((c) => {
+                        const cCount = (customerTransactionsMap.get(c.id) || []).length;
+                        return (
+                          <option key={c.id} value={c.id}>
+                            {c.name} ({c.customerCategory || 'UMUM'}) • {cCount}x Transaksi
+                          </option>
+                        );
+                      })
+                    )}
+                  </select>
+                </div>
+
+                {!selectedPanelCustomerData ? (
+                  <div className="p-8 text-center text-slate-400 text-xs">
+                    <Users className="w-8 h-8 mx-auto mb-2 text-slate-300" />
+                    <p className="font-bold text-slate-600">Pilih pelanggan untuk melihat riwayat pembelian</p>
+                    <p className="mt-0.5">Klik salah satu kartu pelanggan di sebelah kiri.</p>
+                  </div>
+                ) : (
+                  <div className="flex-1 overflow-y-auto divide-y divide-slate-200">
+                    {/* Customer Quick Profile + Metrics */}
+                    <div className="p-4 space-y-3 bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-sm font-black text-slate-900 truncate">
+                              {selectedPanelCustomerData.customer.name}
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800 text-[10px] font-bold">
+                              {selectedPanelCustomerData.customer.customerCategory || 'UMUM'}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-slate-500 font-mono mt-0.5 flex flex-wrap items-center gap-2">
+                            <span>{selectedPanelCustomerData.customer.whatsapp || selectedPanelCustomerData.customer.phone}</span>
+                            <span>•</span>
+                            <span>
+                              Kunjungan terakhir:{' '}
+                              {selectedPanelCustomerData.lastTransaction
+                                ? formatDateTime(selectedPanelCustomerData.lastTransaction.timestamp)
+                                : 'Belum pernah belanja'}
+                            </span>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSendWA(selectedPanelCustomerData.customer)}
+                          className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          <span>Sapa WA</span>
+                        </button>
+                      </div>
+
+                      {/* 3 Clean Tabular-Nums KPIs */}
+                      <div className="grid grid-cols-3 gap-2 pt-1">
+                        <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+                          <div className="text-[10px] font-semibold text-slate-500">Total Belanja</div>
+                          <div className="text-xs font-black font-mono tabular-nums text-emerald-700 mt-0.5 truncate">
+                            {formatRupiah(selectedPanelCustomerData.totalPaymentsMade)}
+                          </div>
+                        </div>
+                        <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+                          <div className="text-[10px] font-semibold text-slate-500">Frekuensi</div>
+                          <div className="text-xs font-black font-mono tabular-nums text-slate-900 mt-0.5">
+                            {formatNumber(selectedPanelCustomerData.totalVisits)}x Order
+                          </div>
+                        </div>
+                        <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+                          <div className="text-[10px] font-semibold text-slate-500">Rata-rata Nota</div>
+                          <div className="text-xs font-black font-mono tabular-nums text-sky-700 mt-0.5 truncate">
+                            {formatRupiah(selectedPanelCustomerData.averageBasket)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Preferensi Belanja Pelanggan (Top Items & Favorite Payment) */}
+                      <div className="space-y-1.5 pt-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-bold text-slate-700 flex items-center gap-1">
+                            <ShoppingBag className="w-3.5 h-3.5 text-sky-600" />
+                            <span>Preferensi Produk Favorit</span>
+                          </span>
+                          <span className="text-slate-500 font-medium">
+                            Bayar Favorit:{' '}
+                            <strong className="text-slate-800 font-mono">
+                              {selectedPanelCustomerData.favoritePaymentMethod.replace(/_/g, ' ')}
+                            </strong>
+                          </span>
+                        </div>
+
+                        {selectedPanelCustomerData.topProducts.length === 0 ? (
+                          <p className="text-[11px] text-slate-400 italic">
+                            Belum ada pola belanja tercatat untuk pelanggan ini.
+                          </p>
+                        ) : (
+                          <div className="space-y-1">
+                            {selectedPanelCustomerData.topProducts.slice(0, 4).map((tp, idx) => (
+                              <div
+                                key={idx}
+                                className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-[11px]"
+                              >
+                                <div className="min-w-0">
+                                  <span className="font-bold text-slate-900 truncate block">
+                                    {idx + 1}. {tp.name}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500 font-mono tabular-nums">
+                                    Harga terakhir: {formatRupiah(tp.lastPrice)}/{tp.unit}
+                                  </span>
+                                </div>
+                                <div className="text-right shrink-0 font-mono tabular-nums">
+                                  <div className="font-black text-sky-700">
+                                    {formatNumber(tp.qty)} {tp.unit}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500">
+                                    {formatRupiah(tp.totalSpend)}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Panel Search & Filter Bar */}
+                    <div className="p-3 bg-white space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-slate-900">
+                          Seluruh Riwayat Pembelian ({filteredPanelTransactions.length})
+                        </span>
+                        <div className="flex items-center gap-1">
+                          {(['ALL', 'LUNAS', 'BELUM_LUNAS', 'RETURNED'] as const).map((status) => (
+                            <button
+                              key={status}
+                              type="button"
+                              onClick={() => {
+                                sound.playTap();
+                                setPanelTxStatusFilter(status);
+                              }}
+                              className={`px-2 py-1 rounded-lg text-[10px] font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                                panelTxStatusFilter === status
+                                  ? 'bg-slate-900 text-white'
+                                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                              }`}
+                            >
+                              {status === 'ALL'
+                                ? 'Semua'
+                                : status === 'LUNAS'
+                                ? 'Lunas'
+                                : status === 'BELUM_LUNAS'
+                                ? 'Piutang'
+                                : 'Retur'}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={panelTxSearch}
+                          onChange={(e) => setPanelTxSearch(e.target.value)}
+                          placeholder="Cari invoice, produk dibeli, kasir, atau catatan..."
+                          className="w-full pl-8 pr-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-800 focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Chronological Customer Transactions Feed */}
+                    <div className="p-3 space-y-2.5">
+                      {filteredPanelTransactions.length === 0 ? (
+                        <div className="py-8 text-center text-slate-400 text-xs">
+                          <Receipt className="w-8 h-8 mx-auto mb-1.5 text-slate-300" />
+                          <p className="font-semibold text-slate-600">Tidak ada riwayat transaksi sesuai filter</p>
+                          <p className="text-[11px] mt-0.5">
+                            Pelanggan ini belum memiliki pembelian pada kategori filter ini.
+                          </p>
+                        </div>
+                      ) : (
+                        filteredPanelTransactions.map((tx) => {
+                          const isExpanded = !!expandedPanelTxIds[tx.id];
+                          const visibleItems = isExpanded ? tx.items : tx.items.slice(0, 3);
+                          const hasReturn = (tx.returns && tx.returns.length > 0) || (tx.returnedAmount || 0) > 0;
+                          return (
+                            <div
+                              key={tx.id}
+                              className="rounded-xl border border-slate-200 bg-white overflow-hidden"
+                            >
+                              <div className="p-3 flex items-start justify-between gap-2 bg-slate-50/60 border-b border-slate-100">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="font-mono font-black text-xs text-slate-900">
+                                      {tx.invoiceNumber}
+                                    </span>
+                                    <span
+                                      className={`px-1.5 py-0.5 rounded text-[9.5px] font-bold uppercase ${
+                                        tx.paymentStatus === 'LUNAS'
+                                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                          : 'bg-rose-50 text-rose-700 border border-rose-200'
+                                      }`}
+                                    >
+                                      {tx.paymentStatus === 'LUNAS' ? 'Lunas' : 'Piutang'}
+                                    </span>
+                                    {hasReturn && (
+                                      <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[9.5px] font-bold uppercase">
+                                        {tx.returnStatus === 'FULL' ? 'Retur Penuh' : 'Ada Retur'}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[10.5px] text-slate-500 mt-0.5">
+                                    {formatDateTime(tx.timestamp)} • Kasir: {tx.cashierName} •{' '}
+                                    {tx.paymentMethod.replace(/_/g, ' ')}
+                                  </div>
+                                </div>
+
+                                <div className="text-right shrink-0 font-mono tabular-nums">
+                                  <div className="text-xs font-black text-slate-900">
+                                    {formatRupiah(tx.finalAmount)}
+                                  </div>
+                                  {hasReturn && (tx.returnedAmount || 0) > 0 && (
+                                    <div className="text-[10px] font-bold text-rose-600">
+                                      Retur -{formatRupiah(tx.returnedAmount || 0)}
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-end gap-1 mt-0.5 text-[10px]">
+                                    {(tx.pointsEarned || 0) > 0 && (
+                                      <span className="text-emerald-700 font-bold">
+                                        +{tx.pointsEarned} Pts
+                                      </span>
+                                    )}
+                                    {(tx.pointsUsed || 0) > 0 && (
+                                      <span className="text-purple-700 font-bold">
+                                        -{tx.pointsUsed} Pts
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="p-2.5 space-y-1">
+                                {visibleItems.map((it, i) => (
+                                  <div
+                                    key={i}
+                                    className="flex items-center justify-between gap-2 text-[11px] text-slate-700"
+                                  >
+                                    <div className="min-w-0 truncate">
+                                      <span className="font-mono font-bold text-sky-700">
+                                        {it.quantity} {it.unitName}
+                                      </span>{' '}
+                                      <span className="font-medium text-slate-800">{it.productName}</span>
+                                      {it.selectedVariant ? ` (${it.selectedVariant})` : ''}
+                                    </div>
+                                    <span className="font-mono tabular-nums text-slate-700 shrink-0">
+                                      {formatRupiah(it.totalAmount)}
+                                    </span>
+                                  </div>
+                                ))}
+
+                                {tx.items.length > 3 && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setExpandedPanelTxIds((prev) => ({
+                                        ...prev,
+                                        [tx.id]: !prev[tx.id],
+                                      }))
+                                    }
+                                    className="text-[10.5px] font-bold text-sky-700 hover:underline pt-0.5 cursor-pointer"
+                                  >
+                                    {isExpanded
+                                      ? 'Ringkas item'
+                                      : `+ Lihat semua ${tx.items.length} item`}
+                                  </button>
+                                )}
+
+                                {tx.notes?.trim() && (
+                                  <div className="mt-1.5 px-2 py-1 rounded bg-amber-50 border border-amber-200 text-[10.5px] text-amber-900">
+                                    Catatan: {tx.notes.trim()}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}

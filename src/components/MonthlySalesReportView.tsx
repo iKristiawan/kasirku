@@ -64,14 +64,42 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
 }) => {
   const currentYear = new Date().getFullYear();
   const [selectedYear, setSelectedYear] = useState<number>(currentYear);
+  const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [chartMetric, setChartMetric] = useState<'COMBINED' | 'REVENUE' | 'PROFIT' | 'TRANSACTIONS'>('COMBINED');
 
-  // Product map for COGS calculation
+  // Product map for category & COGS calculation
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
     products.forEach((p) => map.set(p.id, p));
     return map;
   }, [products]);
+
+  // Extract distinct product/service categories for filter dropdown
+  const availableCategories = useMemo(() => {
+    const catSet = new Set<string>();
+    categories.forEach((c) => {
+      if (c.name?.trim()) catSet.add(c.name.trim());
+    });
+    products.forEach((p) => {
+      if (p.category?.trim()) catSet.add(p.category.trim());
+      if (p.productType === 'JASA') catSet.add('Jasa');
+    });
+    transactions.forEach((tx) => {
+      tx.items.forEach((item) => {
+        const prod = productMap.get(item.productId);
+        const cat = (prod?.category || (item.isService ? 'Jasa' : '')).trim();
+        if (cat) catSet.add(cat);
+      });
+    });
+    return Array.from(catSet).sort((a, b) => a.localeCompare(b, 'id'));
+  }, [categories, products, transactions, productMap]);
+
+  const selectedCategoryLabel = useMemo(() => {
+    if (selectedCategory === 'ALL') return 'Semua Kategori';
+    if (selectedCategory === 'ALL_BARANG') return 'Semua Produk Barang';
+    if (selectedCategory === 'ALL_JASA') return 'Semua Layanan / Jasa';
+    return selectedCategory;
+  }, [selectedCategory]);
 
   // Extract available years from transaction timestamps
   const availableYears = useMemo(() => {
@@ -91,8 +119,23 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
     });
   }, [transactions, selectedYear]);
 
-  // Calculate 12-month aggregated metrics
+  // Calculate 12-month aggregated metrics (optionally scoped by product/service category)
   const monthlyData = useMemo(() => {
+    const isFilteringCategory = selectedCategory !== 'ALL';
+    const targetLower = selectedCategory.toLowerCase();
+
+    const matchesCategory = (item: Transaction['items'][number], prod?: Product): boolean => {
+      if (!isFilteringCategory) return true;
+      const itemCat = (prod?.category || (item.isService ? 'Jasa' : 'Umum')).trim();
+      const isJasa = Boolean(
+        item.isService || prod?.productType === 'JASA' || itemCat.toLowerCase() === 'jasa'
+      );
+      if (selectedCategory === 'ALL_BARANG') return !isJasa;
+      if (selectedCategory === 'ALL_JASA') return isJasa;
+      if (targetLower === 'jasa') return isJasa || itemCat.toLowerCase() === 'jasa';
+      return itemCat.toLowerCase() === targetLower;
+    };
+
     // Initialize 12 months array
     const months = MONTH_NAMES.map((name, idx) => ({
       monthIndex: idx,
@@ -115,12 +158,39 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
       const m = months[txMonth];
       if (!m) return;
 
-      m.transactionCount += 1;
-      m.totalRevenue += tx.finalAmount;
-      m.totalDiscount += tx.discount || 0;
-      m.totalPointsExpense += tx.pointsDiscountAmount || 0;
+      if (!isFilteringCategory) {
+        m.transactionCount += 1;
+        m.totalRevenue += tx.finalAmount;
+        m.totalDiscount += tx.discount || 0;
+        m.totalPointsExpense += tx.pointsDiscountAmount || 0;
 
-      tx.items.forEach((item) => {
+        tx.items.forEach((item) => {
+          const prod = productMap.get(item.productId);
+          const units = item.quantity * (item.conversionFactor || 1);
+          m.totalUnitsSold += units;
+          m.totalCOGS += getItemFifoCogs(item, prod);
+        });
+        return;
+      }
+
+      const matchingItems = tx.items.filter((item) =>
+        matchesCategory(item, productMap.get(item.productId))
+      );
+      if (matchingItems.length === 0) return;
+
+      const matchingGross = matchingItems.reduce((sum, it) => sum + (it.totalAmount || 0), 0);
+      const netRatio = tx.subtotal > 0 ? tx.finalAmount / tx.subtotal : 1;
+      const itemShareRatio =
+        tx.subtotal > 0
+          ? Math.min(1, matchingGross / tx.subtotal)
+          : matchingItems.length / Math.max(1, tx.items.length);
+
+      m.transactionCount += 1;
+      m.totalRevenue += Math.round(matchingGross * netRatio);
+      m.totalDiscount += Math.round((tx.discount || 0) * itemShareRatio);
+      m.totalPointsExpense += Math.round((tx.pointsDiscountAmount || 0) * itemShareRatio);
+
+      matchingItems.forEach((item) => {
         const prod = productMap.get(item.productId);
         const units = item.quantity * (item.conversionFactor || 1);
         m.totalUnitsSold += units;
@@ -138,7 +208,7 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
     });
 
     return months;
-  }, [yearTransactions, selectedYear, productMap]);
+  }, [yearTransactions, selectedYear, selectedCategory, productMap]);
 
   // Annual Totals
   const annualSummary = useMemo(() => {
@@ -195,7 +265,7 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
 
     doc.setFontSize(9);
     doc.setTextColor(100, 116, 139);
-    doc.text(`${storeName} • Tanggal Cetak: ${dateFormatted}`, 14, 21);
+    doc.text(`${storeName} • Kategori: ${selectedCategoryLabel} • Tanggal Cetak: ${dateFormatted}`, 14, 21);
     doc.text(
       `Total Omzet: ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Bersih: ${formatRupiah(annualSummary.totalProfit)} | Total Transaksi: ${formatNumber(annualSummary.totalTransactions)} Nota`,
       14,
@@ -249,12 +319,16 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
     doc.setFontSize(9);
     doc.setFont('helvetica', 'bold');
     doc.text(
-      `RINGKASAN TAHUN ${selectedYear}: Total Omzet ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Bersih ${formatRupiah(annualSummary.totalProfit)} (Margin ${annualSummary.avgMargin.toFixed(1)}%)`,
+      `RINGKASAN TAHUN ${selectedYear} (${selectedCategoryLabel}): Total Omzet ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Bersih ${formatRupiah(annualSummary.totalProfit)} (Margin ${annualSummary.avgMargin.toFixed(1)}%)`,
       14,
       finalY + 8
     );
 
-    doc.save(`laporan-penjualan-bulanan-${selectedYear}.pdf`);
+    const catSlug =
+      selectedCategory === 'ALL'
+        ? 'semua-kategori'
+        : selectedCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    doc.save(`laporan-penjualan-bulanan-${selectedYear}-${catSlug}.pdf`);
   };
 
   return (
@@ -277,13 +351,49 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
             </div>
           </div>
 
-          {/* Year Selector & Export Buttons */}
+          {/* Category Filter, Year Selector & Export Buttons */}
           <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-700">
+              <Filter className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+              <span className="whitespace-nowrap">Kategori:</span>
+              <select
+                value={selectedCategory}
+                aria-label="Filter Kategori Laporan Bulanan"
+                onChange={(e) => {
+                  sound.playTap();
+                  setSelectedCategory(e.target.value);
+                }}
+                className="bg-transparent font-bold text-slate-900 focus:outline-none cursor-pointer max-w-[180px]"
+              >
+                <option value="ALL">Semua Kategori</option>
+                <option value="ALL_BARANG">Semua Produk Barang</option>
+                <option value="ALL_JASA">Semua Layanan / Jasa</option>
+                {availableCategories.map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat}
+                  </option>
+                ))}
+              </select>
+              {selectedCategory !== 'ALL' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setSelectedCategory('ALL');
+                  }}
+                  className="ml-1 text-[11px] font-bold text-sky-700 hover:text-sky-900 underline whitespace-nowrap cursor-pointer"
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+
             <div className="flex items-center gap-1.5 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-700">
               <Calendar className="w-3.5 h-3.5 text-indigo-600" />
               <span>Tahun:</span>
               <select
                 value={selectedYear}
+                aria-label="Pilih Tahun Laporan Bulanan"
                 onChange={(e) => {
                   sound.playTap();
                   setSelectedYear(parseInt(e.target.value));
@@ -301,7 +411,7 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
             <button
               type="button"
               onClick={handleExportPdf}
-              className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+              className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-xs transition-colors cursor-pointer"
               title="Unduh Laporan Penjualan Bulanan ke PDF (jsPDF)"
             >
               <FileDown className="w-3.5 h-3.5 text-sky-400" />
@@ -320,8 +430,8 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
             <div className="text-xl md:text-2xl font-black text-slate-900 font-mono mt-1 tabular-nums">
               {formatRupiah(annualSummary.totalRevenue)}
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">
-              Akumulasi 12 bulan kalender
+            <div className="text-[10px] text-slate-500 mt-0.5 truncate">
+              {selectedCategory === 'ALL' ? 'Akumulasi 12 bulan kalender' : `Kategori: ${selectedCategoryLabel}`}
             </div>
           </div>
 
@@ -371,7 +481,7 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
             <div className="flex items-center gap-2">
               <TrendingUp className="w-4 h-4 text-indigo-600" />
               <h3 className="text-sm font-bold text-slate-900">
-                Grafik Tren Omzet &amp; Laba Per Bulan (Tahun {selectedYear})
+                Grafik Tren Omzet &amp; Laba Per Bulan (Tahun {selectedYear} • {selectedCategoryLabel})
               </h3>
             </div>
 
@@ -464,10 +574,10 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
                 <span>Tabel Rincian Kinerja Penjualan Bulanan (12 Bulan)</span>
               </h3>
               <p className="text-[11px] text-slate-400 mt-0.5">
-                Kalkulasi otomatis dari seluruh transaksi kasir yang tercatat pada tahun {selectedYear}.
+                Kalkulasi transaksi tahun {selectedYear} untuk filter: {selectedCategoryLabel}.
               </p>
             </div>
-            <span className="text-xs text-sky-300 font-mono font-bold bg-white/10 px-2.5 py-1 rounded-lg">
+            <span className="text-xs text-sky-300 font-mono font-bold bg-white/10 px-2.5 py-1 rounded-lg whitespace-nowrap shrink-0">
               {annualSummary.totalTransactions} Transaksi
             </span>
           </div>

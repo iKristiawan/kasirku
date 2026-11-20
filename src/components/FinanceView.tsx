@@ -37,12 +37,14 @@ import {
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { CashflowRecord, CashflowType, User as PosUser } from '../types/pos';
-import { formatRupiah, formatNumber, formatDateTime, formatDateOnly } from '../utils/formatters';
+import { CashflowRecord, CashflowType, Transaction, User as PosUser } from '../types/pos';
+import { formatRupiah, formatDateTime, formatDateOnly } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import { WithdrawalMonthlyChart } from './WithdrawalMonthlyChart';
 
 interface FinanceViewProps {
   cashflows: CashflowRecord[];
+  transactions?: Transaction[];
   onAddCashflow: (record: Omit<CashflowRecord, 'id' | 'createdAt'>) => Promise<void> | void;
   onUpdateCashflow: (record: CashflowRecord) => Promise<void> | void;
   onDeleteCashflow: (id: string) => Promise<void> | void;
@@ -59,10 +61,12 @@ const DEFAULT_EXPENSE_CATEGORIES = [
   'Pemeliharaan & Servis Alat',
   'Pajak, Iuran & Retribusi',
   'Konsumsi Karyawan / Snack',
+  'Tarik Tunai (Kas Keluar)',
   'Lain-lain (Pengeluaran)',
 ];
 
 const DEFAULT_INCOME_CATEGORIES = [
+  'Keuntungan Biaya Admin (Tarik Tunai)',
   'Modal / Suntikan Dana Pemilik',
   'Pendapatan Tambahan / Jasa Lain',
   'Komisi / Bonus / Cashback',
@@ -73,6 +77,7 @@ const DEFAULT_INCOME_CATEGORIES = [
 
 export const FinanceView: React.FC<FinanceViewProps> = ({
   cashflows = [],
+  transactions = [],
   onAddCashflow,
   onUpdateCashflow,
   onDeleteCashflow,
@@ -522,6 +527,9 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
           </div>
         </div>
 
+        {/* Monthly Bar Chart: Total Pendapatan Jasa Tarik Tunai vs Akumulasi Keuntungan Bersih Biaya Admin */}
+        <WithdrawalMonthlyChart cashflows={cashflows} transactions={transactions} />
+
         {/* Filter and Control Bar */}
         <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
           <div className="flex flex-col lg:flex-row items-center justify-between gap-3">
@@ -684,7 +692,17 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
 
                       {/* Kategori */}
                       <td className="py-3 px-3 font-semibold text-slate-800">
-                        {item.category}
+                        <div>{item.category}</div>
+                        {item.isCashWithdrawalOutflow && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 mt-0.5 rounded bg-amber-100 text-amber-800 text-[9.5px] font-bold border border-amber-200">
+                            Auto POS • Kas Keluar
+                          </span>
+                        )}
+                        {(item.isCashWithdrawalAdminProfit || item.category === 'Keuntungan Biaya Admin (Tarik Tunai)') && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 mt-0.5 rounded bg-emerald-100 text-emerald-800 text-[9.5px] font-bold border border-emerald-200">
+                            Auto POS • Laba Admin
+                          </span>
+                        )}
                       </td>
 
                       {/* Keterangan & Referensi */}

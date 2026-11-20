@@ -108,6 +108,7 @@ export interface Customer {
   name: string;
   phone: string;
   whatsapp: string;
+  email?: string;
   address: string;
   totalPoints: number;
   creditLimit: number; // Max debt limit allowed
@@ -164,6 +165,9 @@ export interface CartItem {
   availableStockInUnits: number;
   isService?: boolean;
   isQuickSale?: boolean;
+  isCashWithdrawal?: boolean;
+  principalAmount?: number;
+  adminFee?: number;
   serviceNotes?: string;
   selectedVariant?: string; // Varian terpilih misal: 'Cokelat' atau 'XL'
   isCustomPrice?: boolean;
@@ -183,11 +187,51 @@ export interface TransactionItem {
   totalAmount: number;
   isService?: boolean;
   isQuickSale?: boolean;
+  isCashWithdrawal?: boolean;
+  principalAmount?: number;
+  adminFee?: number;
   serviceNotes?: string;
   selectedVariant?: string; // Varian terpilih misal: 'Cokelat' atau 'XL'
   batchDeductions?: BatchDeduction[]; // Audit trail of FIFO batches deducted for this sale
   isCustomerSpecialPrice?: boolean;
   customerPriceCategory?: string;
+}
+
+export interface BatchReturnRestoration {
+  batchId: string;
+  batchNumber?: string;
+  restoredBaseUnits: number;
+  costPrice: number;
+  expiryDate?: string;
+  createdFallbackBatch?: boolean;
+}
+
+export interface TransactionReturnItem {
+  itemIndex: number;
+  productId: string;
+  productName: string;
+  unitName: string;
+  conversionFactor: number;
+  returnedQuantity: number;
+  unitPrice: number;
+  refundAmount: number;
+  pointsCancelled: number;
+  restoredBaseUnits: number;
+  restoredBatches?: BatchReturnRestoration[];
+}
+
+export interface TransactionReturnRecord {
+  id: string;
+  returnNumber: string;
+  timestamp: number;
+  processedByUserId: string;
+  processedByName: string;
+  processedByRole: UserRole;
+  reason: string;
+  restoreStock: boolean;
+  totalRefundAmount: number;
+  pointsCancelled: number;
+  items: TransactionReturnItem[];
 }
 
 export interface Transaction {
@@ -200,6 +244,9 @@ export interface Transaction {
   customerId?: string;
   customerName?: string;
   customerWhatsapp?: string;
+  customerEmail?: string;
+  receiptEmailSentTo?: string;
+  receiptEmailSentAt?: number;
   customerTier?: MembershipTier;
   customerCategory?: string; // Kategori pelanggan saat transaksi berlangsung
   subtotal: number;
@@ -222,6 +269,10 @@ export interface Transaction {
   qrCodeDataUrl?: string; // Digital e-receipt QR code
   notes?: string; // Catatan transaksi / permintaan khusus pelanggan atau keterangan internal
   auditLogs?: TransactionAuditLogEntry[]; // Riwayat audit perubahan invoice pasca-transaksi oleh Admin
+  returns?: TransactionReturnRecord[]; // Riwayat retur barang oleh Admin
+  returnedAmount?: number; // Akumulasi nominal pengembalian dana retur
+  returnedPoints?: number; // Akumulasi poin loyalitas yang dibatalkan akibat retur
+  returnStatus?: 'NONE' | 'PARTIAL' | 'FULL';
   customerRating?: number; // Penilaian kepuasan pelanggan (1-5 bintang) pada struk digital
   customerRatingTags?: string[]; // Tag cepat penilaian kualitas layanan
   customerRatingComment?: string; // Ulasan/masukan singkat pelanggan
@@ -264,6 +315,21 @@ export interface LowStockReportScheduleConfig {
   includeOutOfStockSummary?: boolean;
 }
 
+export type DailySalesScheduleIntervalMode = 'DAILY' | 'EVERY_N_DAYS' | 'DAYS_OF_WEEK';
+
+export interface DailySalesReportScheduleConfig {
+  enabled: boolean;
+  closingTime: string; // HH:mm (jam tutup toko 24-jam, misal "21:00")
+  intervalMode: DailySalesScheduleIntervalMode;
+  intervalDays: number; // Interval N hari (1-30) saat mode EVERY_N_DAYS
+  daysOfWeek: number[]; // 0 = Minggu ... 6 = Sabtu saat mode DAYS_OF_WEEK
+  includePaymentBreakdown?: boolean;
+  includeProfitSummary?: boolean;
+  includeTopProducts?: boolean;
+  includeExpenseSummary?: boolean;
+  sendOnlyIfHasTransactions?: boolean;
+}
+
 export interface StoreSettings {
   storeName: string;
   storeAddress: string;
@@ -290,6 +356,7 @@ export interface StoreSettings {
   useCustomLowStockWhatsAppTemplate?: boolean; // Aktifkan template pesan WhatsApp kustom untuk alert stok menipis
   customLowStockWhatsAppTemplate?: string; // Template kustom pesan WhatsApp alert stok menipis dengan placeholder
   scheduledAdminLowStockWhatsApp?: LowStockReportScheduleConfig; // Jadwal pengiriman otomatis laporan stok rendah via WhatsApp ke Admin
+  scheduledDailySalesReportWhatsApp?: DailySalesReportScheduleConfig; // Jadwal pengiriman otomatis laporan penjualan harian saat jam tutup toko via WhatsApp ke Admin
   // Printer connection settings
   printerConnectionType?: 'BLUETOOTH' | 'USB'; // Mode koneksi printer thermal
   printerPaperWidth?: '58mm' | '80mm'; // Lebar kertas thermal
@@ -441,6 +508,10 @@ export interface CashflowRecord {
   referenceNumber?: string; // No. Nota/Kuitansi
   recordedBy: string;
   recordedById?: string;
+  isCashWithdrawalOutflow?: boolean;
+  isCashWithdrawalAdminProfit?: boolean;
+  withdrawalPrincipalAmount?: number;
+  withdrawalAdminFeeAmount?: number;
   createdAt: string;
 }
 
@@ -501,6 +572,34 @@ export interface StockOpnameRecord {
   items: StockOpnameItem[];
 }
 
+export type EmployeeActivityType =
+  | 'DELETE_TRANSACTION'
+  | 'MANUAL_PRICE_EDIT'
+  | 'MANUAL_STOCK_ADJUSTMENT'
+  | 'EDIT_TRANSACTION'
+  | 'ITEM_RETURN';
+
+export interface EmployeeActivityLog {
+  id: string;
+  timestamp: number;
+  actionType: EmployeeActivityType;
+  actorId: string;
+  actorName: string;
+  actorRole: UserRole;
+  targetType: 'TRANSACTION' | 'PRODUCT' | 'CART_ITEM' | 'STOCK_OPNAME';
+  targetId: string;
+  targetLabel: string;
+  summary: string;
+  oldValue?: string;
+  newValue?: string;
+  deltaValue?: string;
+  numericDelta?: number;
+  reason?: string;
+  invoiceNumber?: string;
+  productId?: string;
+  metadata?: Record<string, string | number | boolean>;
+}
+
 export interface BackupPayload {
   app: string;
   version: string;
@@ -510,21 +609,31 @@ export interface BackupPayload {
     productCount: number;
     customerCount: number;
     supplierCount: number;
+    purchaseCount?: number;
     transactionCount: number;
+    cashflowCount?: number;
     attendanceCount?: number;
     userCount: number;
     categoryCount?: number;
+    customerCategoryCount?: number;
     stockOpnameCount?: number;
+    onlineOrderCount?: number;
+    activityLogCount?: number;
   };
   data: {
     products: Product[];
     customers: Customer[];
     suppliers: Supplier[];
+    purchases?: RestockOrder[];
     transactions: Transaction[];
+    cashflows?: CashflowRecord[];
     attendances?: AttendanceRecord[];
     storeSettings: StoreSettings;
     users?: User[];
     categories?: ProductCategory[];
+    customerCategories?: CustomerCategoryItem[];
     stockOpnames?: StockOpnameRecord[];
+    onlineOrders?: OnlineOrder[];
+    activityLogs?: EmployeeActivityLog[];
   };
 }

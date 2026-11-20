@@ -6,10 +6,15 @@ import {
   Check,
   ExternalLink,
   X,
-  Settings as SettingsIcon
+  Settings as SettingsIcon,
+  TrendingUp,
+  Printer,
+  Bluetooth,
+  RotateCcw
 } from 'lucide-react';
 import { 
   User, 
+  UserRole,
   Product, 
   ProductCategory,
   Customer, 
@@ -30,7 +35,11 @@ import {
   CashflowRecord,
   CustomerCategoryItem,
   OnlineOrder,
-  OnlineOrderStatus
+  OnlineOrderStatus,
+  EmployeeActivityLog,
+  TransactionReturnItem,
+  TransactionReturnRecord,
+  TransactionAuditLogEntry
 } from './types/pos';
 import { 
   DEFAULT_ADMIN_USER,
@@ -81,10 +90,16 @@ import {
   generateMembershipId,
   getCustomerMembershipId,
 } from './utils/customerUtils';
-import { generateInvoiceNumber, formatNumber } from './utils/formatters';
-import { recalculateChronologicalFifoForNewTransaction } from './utils/fifoUtils';
+import { generateInvoiceNumber, formatNumber, formatRupiah } from './utils/formatters';
+import { recalculateChronologicalFifoForNewTransaction, restoreProductBatchesForReturn } from './utils/fifoUtils';
 import { getCategoryColor } from './utils/categoryColors';
 import { sound } from './utils/audio';
+import {
+  printDirectBluetooth,
+  openRawBtPrint,
+  getPrinterConnectionInfo,
+  isPrinterPolicyError,
+} from './utils/bluetoothPrinter';
 import {
   DAILY_LOW_STOCK_LEDGER_KEY,
   DailyLowStockHit,
@@ -101,17 +116,31 @@ import {
   collectLowStockHitsFromProducts,
   buildScheduledLowStockWhatsAppMessage,
 } from './utils/adminLowStockAlert';
+import {
+  DailySalesClosingSummary,
+  DEFAULT_DAILY_SALES_SCHEDULE,
+  normalizeDailySalesSchedule,
+  loadScheduledDailySalesDispatch,
+  markScheduledDailySalesDispatched,
+  evaluateScheduledDailySalesDue,
+  formatDailySalesScheduleSummaryLabel,
+  computeTodaySalesClosingSummary,
+  buildDailySalesClosingWhatsAppMessage,
+} from './utils/adminDailySalesAlert';
 import { 
   seedCollectionIfEmpty, 
   subscribeToCollection, 
   saveDocumentToFirestore, 
   deleteDocumentFromFirestore, 
   saveBatchToFirestore, 
+  replaceCollectionInFirestore,
   saveStoreSettingsToFirestore,
   clearAllDatabaseExceptUsers,
   pauseFirestoreCloudSync,
   resumeFirestoreCloudSync,
   setCloudSyncPaused,
+  handleFirestoreError,
+  OperationType,
   CloudSyncStatus
 } from './utils/firebaseSync';
 
@@ -246,6 +275,9 @@ export default function App() {
   const [stockOpnames, setStockOpnames] = useState<StockOpnameRecord[]>(() => loadStorage('kasir_stock_opnames', []));
   const [cashflows, setCashflows] = useState<CashflowRecord[]>(() => loadStorage('kasir_cashflows', []));
   const [onlineOrders, setOnlineOrders] = useState<OnlineOrder[]>(() => loadStorage('kasir_online_orders', []));
+  const [activityLogs, setActivityLogs] = useState<EmployeeActivityLog[]>(() =>
+    loadStorage('kasir_activity_logs', [])
+  );
   const [isGlobalFifoReconcileOpen, setIsGlobalFifoReconcileOpen] = useState<boolean>(false);
   const [storeSettings, setStoreSettings] = useState<StoreSettings>(() => {
     const loaded = loadStorage<Partial<StoreSettings>>('kasir_settings', INITIAL_STORE_SETTINGS);
@@ -291,6 +323,9 @@ export default function App() {
     }
     combined.scheduledAdminLowStockWhatsApp = normalizeLowStockSchedule(
       combined.scheduledAdminLowStockWhatsApp || DEFAULT_LOW_STOCK_SCHEDULE
+    );
+    combined.scheduledDailySalesReportWhatsApp = normalizeDailySalesSchedule(
+      combined.scheduledDailySalesReportWhatsApp || DEFAULT_DAILY_SALES_SCHEDULE
     );
     if (!combined.printerConnectionType) {
       combined.printerConnectionType = 'BLUETOOTH';
@@ -410,9 +445,26 @@ export default function App() {
   const [shouldAutoSendWaOnReceipt, setShouldAutoSendWaOnReceipt] = useState(false);
   const [shouldAutoPrintOnReceipt, setShouldAutoPrintOnReceipt] = useState(false);
   const [lastCompletedTransaction, setLastCompletedTransaction] = useState<Transaction | null>(null);
+  const [quickPrintFeedback, setQuickPrintFeedback] = useState<{
+    status: 'PRINTING' | 'SUCCESS' | 'ERROR';
+    invoiceNumber: string;
+    deviceName: string;
+    message: string;
+    transaction: Transaction;
+  } | null>(null);
+  const quickPrintDismissTimerRef = useRef<number | null>(null);
   const [isScannerModalOpen, setIsScannerModalOpen] = useState(false);
   const [scannerInitialMode, setScannerInitialMode] = useState<ScannerModalMode>('SCAN');
   const [scanFeedbackNotice, setScanFeedbackNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [cashWithdrawalAlertToast, setCashWithdrawalAlertToast] = useState<{
+    title: string;
+    message: string;
+    requestedAmount: number;
+    availableBalance: number;
+    shortfall: number;
+    timestamp: number;
+  } | null>(null);
+  const cashWithdrawalAlertTimerRef = useRef<number | null>(null);
   const [isCustomerModalOpen, setIsCustomerModalOpen] = useState(false);
   const [isSwitchUserModalOpen, setIsSwitchUserModalOpen] = useState(false);
   const [isShiftSummaryModalOpen, setIsShiftSummaryModalOpen] = useState(false);
@@ -435,6 +487,20 @@ export default function App() {
   } | null>(null);
   const [copiedAdminWaAlert, setCopiedAdminWaAlert] = useState(false);
   const adminWaAnchorRef = useRef<HTMLAnchorElement>(null);
+
+  // Scheduled Daily Closing Sales Report Admin WhatsApp Alert state
+  const [adminDailySalesWaAlert, setAdminDailySalesWaAlert] = useState<{
+    summary: DailySalesClosingSummary;
+    scheduleLabel: string;
+    message: string;
+    waUrl: string;
+    hasAdminPhone: boolean;
+    triggeredAt: number;
+    autoLaunchPending: boolean;
+  } | null>(null);
+  const [copiedAdminDailySalesWa, setCopiedAdminDailySalesWa] = useState(false);
+  const adminDailySalesWaAnchorRef = useRef<HTMLAnchorElement>(null);
+
   const prevProductsStockRef = useRef<Map<string, { stock: number; minStockAlert: number }>>(new Map());
   const hasSeededStockTrackerRef = useRef(false);
 
@@ -452,6 +518,7 @@ export default function App() {
   useEffect(() => scheduleSaveStorage('kasir_stock_opnames', stockOpnames), [stockOpnames]);
   useEffect(() => scheduleSaveStorage('kasir_cashflows', cashflows), [cashflows]);
   useEffect(() => scheduleSaveStorage('kasir_online_orders', onlineOrders), [onlineOrders]);
+  useEffect(() => scheduleSaveStorage('kasir_activity_logs', activityLogs), [activityLogs]);
   useEffect(() => scheduleSaveStorage('kasir_settings', storeSettings), [storeSettings]);
 
   // O(1) Product & Barcode lookup indexes to avoid linear scans across large catalogs
@@ -612,6 +679,13 @@ export default function App() {
         setCloudSyncStatus('SYNCED');
       }),
 
+      subscribeToCollection<EmployeeActivityLog>('activity_logs', (cloudLogs) => {
+        if (!active) return;
+        const sorted = cloudLogs.sort((a, b) => b.timestamp - a.timestamp);
+        setActivityLogs(sorted);
+        setCloudSyncStatus('SYNCED');
+      }),
+
       subscribeToCollection<User>('users', (cloudUsers) => {
         if (!active) return;
         if (cloudUsers.length > 0) {
@@ -649,6 +723,9 @@ export default function App() {
             scheduledAdminLowStockWhatsApp: rest.scheduledAdminLowStockWhatsApp
               ? normalizeLowStockSchedule(rest.scheduledAdminLowStockWhatsApp)
               : (prev.scheduledAdminLowStockWhatsApp ?? DEFAULT_LOW_STOCK_SCHEDULE),
+            scheduledDailySalesReportWhatsApp: rest.scheduledDailySalesReportWhatsApp
+              ? normalizeDailySalesSchedule(rest.scheduledDailySalesReportWhatsApp)
+              : (prev.scheduledDailySalesReportWhatsApp ?? DEFAULT_DAILY_SALES_SCHEDULE),
             printerConnectionType: rest.printerConnectionType || prev.printerConnectionType || 'BLUETOOTH',
             printerPaperWidth: rest.printerPaperWidth || prev.printerPaperWidth || '58mm',
             printerDeviceName: rest.printerDeviceName !== undefined ? rest.printerDeviceName : (prev.printerDeviceName || ''),
@@ -867,6 +944,89 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [adminLowStockWaAlert]);
 
+  // Scheduled Daily Closing Sales Report via WhatsApp checker (triggers at configured closingTime + interval)
+  useEffect(() => {
+    const scheduleCfg = normalizeDailySalesSchedule(
+      storeSettings.scheduledDailySalesReportWhatsApp
+    );
+    if (!scheduleCfg.enabled) return;
+
+    const checkAndDispatchClosingSales = () => {
+      const dispatchState = loadScheduledDailySalesDispatch();
+      const { isDue, slotKey, todayKey, schedule } = evaluateScheduledDailySalesDue(
+        scheduleCfg,
+        new Date(),
+        dispatchState
+      );
+      if (!isDue) return;
+
+      const summary = computeTodaySalesClosingSummary({
+        transactions,
+        products,
+        cashflows,
+        targetDateKey: todayKey,
+      });
+
+      if (schedule.sendOnlyIfHasTransactions && summary.transactionCount === 0) {
+        markScheduledDailySalesDispatched(slotKey, todayKey, 0, 0);
+        return;
+      }
+
+      const nowTs = Date.now();
+      const message = buildDailySalesClosingWhatsAppMessage({
+        storeName: storeSettings.storeName,
+        summary,
+        schedule,
+        timestamp: nowTs,
+      });
+
+      const adminPhone = (storeSettings.adminWhatsAppNumber || '').trim();
+      const hasAdminPhone = adminPhone.replace(/\D/g, '').length >= 8;
+      const waUrl = buildAdminWhatsAppUrl(adminPhone, message);
+
+      markScheduledDailySalesDispatched(
+        slotKey,
+        todayKey,
+        summary.transactionCount,
+        summary.totalNetRevenue
+      );
+      sound.playSuccessChime();
+      setCopiedAdminDailySalesWa(false);
+      setAdminDailySalesWaAlert({
+        summary,
+        scheduleLabel: formatDailySalesScheduleSummaryLabel(schedule),
+        message,
+        waUrl,
+        hasAdminPhone,
+        triggeredAt: nowTs,
+        autoLaunchPending: hasAdminPhone,
+      });
+    };
+
+    checkAndDispatchClosingSales();
+    const intervalId = window.setInterval(checkAndDispatchClosingSales, 20000);
+    return () => window.clearInterval(intervalId);
+  }, [
+    transactions,
+    products,
+    cashflows,
+    storeSettings.scheduledDailySalesReportWhatsApp,
+    storeSettings.adminWhatsAppNumber,
+    storeSettings.storeName,
+  ]);
+
+  // Automatically trigger WhatsApp launch via hidden anchor when Scheduled Daily Closing Sales alert triggers
+  useEffect(() => {
+    if (!adminDailySalesWaAlert?.autoLaunchPending || !adminDailySalesWaAlert.hasAdminPhone) return;
+    const timer = setTimeout(() => {
+      adminDailySalesWaAnchorRef.current?.click();
+      setAdminDailySalesWaAlert((prev) =>
+        prev ? { ...prev, autoLaunchPending: false } : null
+      );
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [adminDailySalesWaAlert]);
+
   // Support opening transaction summary modal directly from shared ?invoice=... URL
   const handledInvoiceParamRef = React.useRef<string | null>(null);
   useEffect(() => {
@@ -1080,22 +1240,157 @@ export default function App() {
     }
   };
 
+  const availableStoreCashBalance = useMemo(() => {
+    const existingCashflowIds = new Set(cashflows.map((c) => c.id));
+
+    const cashSalesTotal = transactions.reduce((sum, tx) => {
+      const isCashTx = tx.paymentMethod === 'CASH' || tx.settledPaymentMethod === 'CASH';
+      if (!isCashTx) return sum;
+      const netAmount = Math.max(0, (tx.finalAmount || 0) - (tx.returnedAmount || 0));
+      return sum + netAmount;
+    }, 0);
+
+    const cashInFromCashflows = cashflows.reduce((sum, cf) => {
+      if (cf.type !== 'PEMASUKAN') return sum;
+      if ((cf.paymentMethod || '').toUpperCase() !== 'CASH') return sum;
+      if (cf.isCashWithdrawalAdminProfit || cf.category === 'Keuntungan Biaya Admin (Tarik Tunai)') {
+        return sum;
+      }
+      return sum + Math.max(0, cf.amount || 0);
+    }, 0);
+
+    const cashOutFromCashflows = cashflows.reduce((sum, cf) => {
+      if (cf.type !== 'PENGELUARAN') return sum;
+      if ((cf.paymentMethod || '').toUpperCase() !== 'CASH') return sum;
+      return sum + Math.max(0, cf.amount || 0);
+    }, 0);
+
+    const unrecordedWithdrawalOut = transactions.reduce((sum, tx) => {
+      if (existingCashflowIds.has(`cf_tarik_${tx.id}`)) return sum;
+      const txWithdrawal = (tx.items || []).reduce((itemSum, item) => {
+        const isWd =
+          Boolean(item.isCashWithdrawal) ||
+          (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+        if (!isWd) return itemSum;
+        const principal =
+          item.principalAmount !== undefined
+            ? Math.max(0, item.principalAmount)
+            : Math.max(0, item.costPrice || 0);
+        return itemSum + Math.max(1, item.quantity || 1) * principal;
+      }, 0);
+      return sum + txWithdrawal;
+    }, 0);
+
+    return Math.max(0, cashSalesTotal + cashInFromCashflows - cashOutFromCashflows - unrecordedWithdrawalOut);
+  }, [transactions, cashflows]);
+
+  const triggerCashWithdrawalBlockedToast = ({
+    requestedAmount,
+    availableBalance,
+    existingCartAmount = 0,
+    customMessage,
+  }: {
+    requestedAmount: number;
+    availableBalance: number;
+    existingCartAmount?: number;
+    customMessage?: string;
+  }) => {
+    sound.playError();
+    const shortfall = Math.max(0, requestedAmount - availableBalance);
+    const defaultMsg =
+      availableBalance <= 0
+        ? `Saldo kas toko saat ini Rp 0${
+            existingCartAmount > 0 ? ` (sudah terpakai ${formatRupiah(existingCartAmount)} di keranjang)` : ''
+          }. Penambahan item Tarik Tunai diblokir hingga modal kas tersedia.`
+        : `Nominal Tarik Tunai (${formatRupiah(requestedAmount)}) melebihi sisa saldo kas toko yang tersedia (${formatRupiah(availableBalance)})${
+            existingCartAmount > 0 ? ` — ${formatRupiah(existingCartAmount)} sudah di keranjang` : ''
+          }.`;
+    const finalMessage = customMessage || defaultMsg;
+
+    setScanFeedbackNotice({
+      type: 'error',
+      message: `${finalMessage} Kekurangan kas: ${formatRupiah(shortfall)}.`,
+    });
+
+    if (cashWithdrawalAlertTimerRef.current !== null) {
+      window.clearTimeout(cashWithdrawalAlertTimerRef.current);
+    }
+    setCashWithdrawalAlertToast({
+      title: 'Penarikan Tunai Diblokir — Saldo Kas Tidak Cukup!',
+      message: finalMessage,
+      requestedAmount,
+      availableBalance,
+      shortfall,
+      timestamp: Date.now(),
+    });
+    cashWithdrawalAlertTimerRef.current = window.setTimeout(() => {
+      setCashWithdrawalAlertToast(null);
+      cashWithdrawalAlertTimerRef.current = null;
+    }, 8000);
+  };
+
   const handleAddQuickSaleItem = ({
     description,
     amount,
+    adminFee = 0,
     quantity,
     unitName = 'ITEM',
+    isCashWithdrawal,
   }: {
     description: string;
     amount: number;
+    adminFee?: number;
     quantity: number;
     unitName?: string;
-  }) => {
+    isCashWithdrawal?: boolean;
+  }): { ok: boolean; error?: string; availableCashBalance?: number; blocked?: boolean } => {
     const cleanDesc = description.trim();
-    const safeAmount = Math.max(0, Math.round(amount));
+    const safeNominal = Math.max(0, Math.round(amount));
+    const safeAdminFee = Math.max(0, Math.round(adminFee || 0));
+    const totalUnitPrice = safeNominal + safeAdminFee;
     const safeQty = Math.max(1, quantity);
     const cleanUnit = unitName.trim().toUpperCase() || 'ITEM';
-    if (!cleanDesc || safeAmount <= 0) return;
+    if (!cleanDesc || safeNominal <= 0) {
+      return { ok: false, error: 'Masukkan deskripsi dan nominal yang valid (> Rp 0).' };
+    }
+
+    const isTarikTunai = Boolean(isCashWithdrawal) || /tarik\s*tunai/i.test(cleanDesc);
+
+    if (isTarikTunai) {
+      const existingCartWithdrawalCash = cart.reduce((sum, item) => {
+        const itemIsWd =
+          Boolean(item.isCashWithdrawal) ||
+          (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+        if (!itemIsWd) return sum;
+        const itemPrincipal =
+          item.principalAmount !== undefined ? Math.max(0, item.principalAmount) : Math.max(0, item.unitPrice || 0);
+        return sum + itemPrincipal * Math.max(1, item.quantity || 1);
+      }, 0);
+
+      const remainingAvailableCash = Math.max(0, availableStoreCashBalance - existingCartWithdrawalCash);
+      const requestedWithdrawalCash = safeNominal * safeQty;
+
+      if (remainingAvailableCash <= 0 || requestedWithdrawalCash > remainingAvailableCash) {
+        const deficit = requestedWithdrawalCash - remainingAvailableCash;
+        const errorMsg = `Penambahan ke keranjang diblokir: Nominal Tarik Tunai (${formatRupiah(requestedWithdrawalCash)}) melebihi sisa saldo kas toko tersedia (${formatRupiah(remainingAvailableCash)})${
+          existingCartWithdrawalCash > 0 ? ` (${formatRupiah(existingCartWithdrawalCash)} sudah di keranjang)` : ''
+        }. Kekurangan kas: ${formatRupiah(deficit)}.`;
+
+        triggerCashWithdrawalBlockedToast({
+          requestedAmount: requestedWithdrawalCash,
+          availableBalance: remainingAvailableCash,
+          existingCartAmount: existingCartWithdrawalCash,
+          customMessage: errorMsg,
+        });
+
+        return {
+          ok: false,
+          blocked: true,
+          error: errorMsg,
+          availableCashBalance: remainingAvailableCash,
+        };
+      }
+    }
 
     sound.playTap();
     const unitId = 'unit_qs_' + Date.now() + '_' + Math.random().toString(36).substring(2, 5);
@@ -1109,25 +1404,62 @@ export default function App() {
         id: unitId,
         unitName: cleanUnit,
         conversionFactor: 1,
-        sellingPrice: safeAmount,
-        costPrice: 0,
+        sellingPrice: totalUnitPrice,
+        costPrice: isTarikTunai ? safeNominal : 0,
       },
       quantity: safeQty,
-      unitPrice: safeAmount,
-      originalUnitPrice: safeAmount,
-      subtotal: safeQty * safeAmount,
+      unitPrice: totalUnitPrice,
+      originalUnitPrice: totalUnitPrice,
+      subtotal: safeQty * totalUnitPrice,
       availableStockInUnits: 999999,
       isService: false,
       isQuickSale: true,
+      isCashWithdrawal: isTarikTunai,
+      principalAmount: safeNominal,
+      adminFee: safeAdminFee,
     };
 
     setCart((prev) => [...prev, quickSaleItem]);
+    return { ok: true, availableCashBalance: availableStoreCashBalance };
   };
 
   const handleUpdateCartItemQty = (cartItemId: string, newQty: number) => {
     if (newQty <= 0) {
       handleRemoveCartItem(cartItemId);
       return;
+    }
+
+    const targetCartItem = cart.find((item) => item.cartItemId === cartItemId);
+    if (targetCartItem && newQty > targetCartItem.quantity) {
+      const targetIsWithdrawal =
+        Boolean(targetCartItem.isCashWithdrawal) ||
+        (Boolean(targetCartItem.isQuickSale) && /tarik\s*tunai/i.test(targetCartItem.productName || ''));
+      if (targetIsWithdrawal) {
+        const principalPerUnit =
+          targetCartItem.principalAmount !== undefined
+            ? Math.max(0, targetCartItem.principalAmount)
+            : Math.max(0, targetCartItem.unitPrice || 0);
+        const otherWithdrawalCash = cart.reduce((sum, ci) => {
+          if (ci.cartItemId === cartItemId) return sum;
+          const isWd =
+            Boolean(ci.isCashWithdrawal) ||
+            (Boolean(ci.isQuickSale) && /tarik\s*tunai/i.test(ci.productName || ''));
+          if (!isWd) return sum;
+          const p = ci.principalAmount !== undefined ? Math.max(0, ci.principalAmount) : Math.max(0, ci.unitPrice || 0);
+          return sum + p * Math.max(1, ci.quantity || 1);
+        }, 0);
+        const nextTotalWithdrawalCash = otherWithdrawalCash + principalPerUnit * newQty;
+        if (nextTotalWithdrawalCash > availableStoreCashBalance) {
+          const remainingForItem = Math.max(0, availableStoreCashBalance - otherWithdrawalCash);
+          triggerCashWithdrawalBlockedToast({
+            requestedAmount: principalPerUnit * newQty,
+            availableBalance: remainingForItem,
+            existingCartAmount: otherWithdrawalCash,
+            customMessage: `Penambahan jumlah Tarik Tunai diblokir! Total penarikan (${formatRupiah(nextTotalWithdrawalCash)}) melebihi saldo kas toko (${formatRupiah(availableStoreCashBalance)}).`,
+          });
+          return;
+        }
+      }
     }
 
     setCart((prev) =>
@@ -1218,8 +1550,81 @@ export default function App() {
     );
   };
 
-  const handleUpdateCartItemPrice = (cartItemId: string, newUnitPrice: number) => {
+  const recordActivityLog = (
+    payload: Omit<EmployeeActivityLog, 'id' | 'timestamp' | 'actorId' | 'actorName' | 'actorRole'>
+  ) => {
+    const newEntry: EmployeeActivityLog = {
+      id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+      actorId: currentUser.id,
+      actorName: currentUser.name,
+      actorRole: currentUser.role,
+      ...payload,
+    };
+    setActivityLogs((prev) => [newEntry, ...prev]);
+    saveDocumentToFirestore('activity_logs', newEntry.id, newEntry).catch(() => {});
+  };
+
+  const handleUpdateCartItemPrice = (
+    cartItemId: string,
+    newUnitPrice: number,
+    overrideReason?: string
+  ) => {
     if (newUnitPrice < 0) return;
+    const targetItem = cart.find((item) => item.cartItemId === cartItemId);
+    if (targetItem && targetItem.unitPrice !== newUnitPrice) {
+      const baselinePrice =
+        targetItem.originalUnitPrice || targetItem.selectedUnit.sellingPrice || targetItem.unitPrice;
+      const prevPrice = targetItem.unitPrice;
+      const unitDiff = newUnitPrice - prevPrice;
+      const diffFromCatalog = newUnitPrice - baselinePrice;
+      const totalCartDelta = unitDiff * targetItem.quantity;
+      const totalDiscountFromCatalog = Math.max(0, (baselinePrice - newUnitPrice) * targetItem.quantity);
+      const discountPercentFromCatalog =
+        baselinePrice > 0
+          ? Math.round(((baselinePrice - newUnitPrice) / baselinePrice) * 1000) / 10
+          : 0;
+      const sign = totalCartDelta > 0 ? '+' : '';
+      const trimmedReason = overrideReason?.trim() || '';
+
+      recordActivityLog({
+        actionType: 'MANUAL_PRICE_EDIT',
+        targetType: 'CART_ITEM',
+        targetId: targetItem.productId,
+        targetLabel: `${targetItem.productName} (${targetItem.selectedUnit.unitName})`,
+        summary: `[Pra-Pembayaran] Manual Override / Edit Harga oleh ${currentUser.name} untuk ${targetItem.quantity} ${targetItem.selectedUnit.unitName}${
+          discountPercentFromCatalog > 0
+            ? ` (Diskon manual ${discountPercentFromCatalog}% dari normal ${formatRupiah(baselinePrice)}; potongan total -${formatRupiah(totalDiscountFromCatalog)})`
+            : diffFromCatalog > 0
+            ? ` (Kenaikan +${formatRupiah(diffFromCatalog)}/unit dari normal ${formatRupiah(baselinePrice)})`
+            : ' (Dikembalikan ke harga normal katalog)'
+        }`,
+        oldValue:
+          prevPrice !== baselinePrice
+            ? `${formatRupiah(prevPrice)} (Normal: ${formatRupiah(baselinePrice)})`
+            : formatRupiah(prevPrice),
+        newValue: formatRupiah(newUnitPrice),
+        deltaValue: `${sign}${formatRupiah(totalCartDelta)} (${targetItem.quantity} ${targetItem.selectedUnit.unitName})`,
+        numericDelta: totalCartDelta,
+        reason:
+          trimmedReason ||
+          (diffFromCatalog < 0
+            ? 'Manual Override / Diskon manual item keranjang sebelum pembayaran'
+            : 'Manual Override / Edit harga item keranjang sebelum pembayaran'),
+        productId: targetItem.productId,
+        metadata: {
+          stage: 'PRE_PAYMENT',
+          baselinePrice,
+          prevPrice,
+          newPrice: newUnitPrice,
+          quantity: targetItem.quantity,
+          discountPercentFromCatalog: Math.max(0, discountPercentFromCatalog),
+          totalDiscountFromCatalog,
+          customerName: selectedCustomer?.name || 'Pelanggan Umum',
+        },
+      });
+    }
+
     setCart((prev) =>
       prev.map((item) => {
         if (item.cartItemId === cartItemId) {
@@ -1230,6 +1635,11 @@ export default function App() {
             subtotal: item.quantity * newUnitPrice,
             isCustomPrice: newUnitPrice !== originalPrice,
             originalUnitPrice: originalPrice,
+            ...(item.isCashWithdrawal
+              ? {
+                  adminFee: Math.max(0, newUnitPrice - (item.principalAmount || 0)),
+                }
+              : {}),
           };
         }
         return item;
@@ -1372,6 +1782,155 @@ export default function App() {
 
   const pointsEarned = calculatePointsEarned(grandTotal, storeSettings, selectedCustomer);
 
+  const executeQuickBluetoothPrint = async (tx: Transaction) => {
+    if (quickPrintDismissTimerRef.current !== null) {
+      window.clearTimeout(quickPrintDismissTimerRef.current);
+      quickPrintDismissTimerRef.current = null;
+    }
+
+    const paperWidth = storeSettings.printerPaperWidth || '58mm';
+    const targetDeviceName =
+      getPrinterConnectionInfo().bluetoothDeviceName ||
+      storeSettings.printerDeviceName ||
+      'Printer Bluetooth';
+
+    setQuickPrintFeedback({
+      status: 'PRINTING',
+      invoiceNumber: tx.invoiceNumber,
+      deviceName: targetDeviceName,
+      message: `Mengirim struk ${tx.invoiceNumber} ke ${targetDeviceName}...`,
+      transaction: tx,
+    });
+
+    try {
+      await printDirectBluetooth(tx, storeSettings, paperWidth);
+      const connectedName =
+        getPrinterConnectionInfo().bluetoothDeviceName ||
+        storeSettings.printerDeviceName ||
+        'Printer Bluetooth';
+
+      sound.playSuccessChime();
+      setQuickPrintFeedback({
+        status: 'SUCCESS',
+        invoiceNumber: tx.invoiceNumber,
+        deviceName: connectedName,
+        message: `Struk ${tx.invoiceNumber} berhasil dicetak ke ${connectedName}.`,
+        transaction: tx,
+      });
+
+      quickPrintDismissTimerRef.current = window.setTimeout(() => {
+        setQuickPrintFeedback((prev) =>
+          prev?.invoiceNumber === tx.invoiceNumber && prev?.status === 'SUCCESS' ? null : prev
+        );
+      }, 4500);
+    } catch (err: any) {
+      sound.playWarningChime();
+      const errMessage = isPrinterPolicyError(err)
+        ? err.message
+        : err?.message || `Gagal mencetak langsung ke ${targetDeviceName}.`;
+
+      setQuickPrintFeedback({
+        status: 'ERROR',
+        invoiceNumber: tx.invoiceNumber,
+        deviceName: targetDeviceName,
+        message: errMessage,
+        transaction: tx,
+      });
+    }
+  };
+
+  // Helper: Explicitly separate Tarik Tunai principal cash outflow and net admin fee profit in cashflows
+  const recordWithdrawalCashflowForTransaction = (tx: Transaction) => {
+    let totalWithdrawalCashOut = 0;
+    let totalWithdrawalAdminProfit = 0;
+
+    (tx.items || []).forEach((item) => {
+      const isTarikTunai =
+        Boolean(item.isCashWithdrawal) ||
+        (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+      if (!isTarikTunai) return;
+
+      const qty = Math.max(1, item.quantity || 1);
+      const principalPerUnit =
+        item.principalAmount !== undefined
+          ? Math.max(0, item.principalAmount)
+          : Math.max(0, item.costPrice || 0);
+      const adminFeePerUnit =
+        item.adminFee !== undefined
+          ? Math.max(0, item.adminFee)
+          : Math.max(0, (item.unitPrice || 0) - principalPerUnit);
+
+      totalWithdrawalCashOut += qty * principalPerUnit;
+      totalWithdrawalAdminProfit += qty * adminFeePerUnit;
+    });
+
+    if (totalWithdrawalCashOut <= 0 && totalWithdrawalAdminProfit <= 0) return;
+
+    const txDate = new Date(tx.timestamp);
+    const localDateStr = [
+      txDate.getFullYear(),
+      String(txDate.getMonth() + 1).padStart(2, '0'),
+      String(txDate.getDate()).padStart(2, '0'),
+    ].join('-');
+    const createdAtIso = new Date().toISOString();
+    const customerTag = tx.customerName ? ` (${tx.customerName})` : '';
+    const recordsToSave: CashflowRecord[] = [];
+
+    if (totalWithdrawalCashOut > 0) {
+      recordsToSave.push({
+        id: `cf_tarik_${tx.id}`,
+        type: 'PENGELUARAN',
+        category: 'Tarik Tunai (Kas Keluar)',
+        amount: totalWithdrawalCashOut,
+        date: localDateStr,
+        timestamp: tx.timestamp,
+        paymentMethod: 'CASH',
+        description: `Kas Keluar Tarik Tunai ${tx.invoiceNumber}${customerTag} • Pokok Dana Tunai`,
+        referenceNumber: tx.invoiceNumber,
+        recordedBy: tx.cashierName || currentUser.name,
+        recordedById: tx.cashierId || currentUser.id,
+        isCashWithdrawalOutflow: true,
+        withdrawalPrincipalAmount: totalWithdrawalCashOut,
+        withdrawalAdminFeeAmount: totalWithdrawalAdminProfit,
+        createdAt: createdAtIso,
+      });
+    }
+
+    if (totalWithdrawalAdminProfit > 0) {
+      recordsToSave.push({
+        id: `cf_tarik_admin_${tx.id}`,
+        type: 'PEMASUKAN',
+        category: 'Keuntungan Biaya Admin (Tarik Tunai)',
+        amount: totalWithdrawalAdminProfit,
+        date: localDateStr,
+        timestamp: tx.timestamp + 1,
+        paymentMethod: tx.paymentMethod === 'CASH' ? 'CASH' : (tx.paymentMethod || 'CASH'),
+        description: `Keuntungan Bersih Biaya Admin Tarik Tunai ${tx.invoiceNumber}${customerTag} • Pokok Tarik ${formatRupiah(totalWithdrawalCashOut)}`,
+        referenceNumber: tx.invoiceNumber,
+        recordedBy: tx.cashierName || currentUser.name,
+        recordedById: tx.cashierId || currentUser.id,
+        isCashWithdrawalAdminProfit: true,
+        withdrawalPrincipalAmount: totalWithdrawalCashOut,
+        withdrawalAdminFeeAmount: totalWithdrawalAdminProfit,
+        createdAt: createdAtIso,
+      });
+    }
+
+    if (recordsToSave.length === 0) return;
+
+    const recordIdSet = new Set(recordsToSave.map((r) => r.id));
+    setCashflows((prev) => [...recordsToSave, ...prev.filter((c) => !recordIdSet.has(c.id))]);
+    if (recordsToSave.length === 1) {
+      saveDocumentToFirestore('cashflows', recordsToSave[0].id, recordsToSave[0]).catch((err) => {
+        console.error('[FirebaseSync] Failed to save Tarik Tunai cashflow record:', err);
+      });
+    } else {
+      saveBatchToFirestore('cashflows', recordsToSave).catch((err) => {
+        console.error('[FirebaseSync] Failed to batch save Tarik Tunai cashflow records:', err);
+      });
+    }
+  };
+
   // =========================================================================
   // PAYMENT COMPLETION & INVENTORY DEDUCTION (Supports Admin Backdate + FIFO)
   // =========================================================================
@@ -1384,6 +1943,7 @@ export default function App() {
     dueDate?: string;
     notes?: string;
     customTimestamp?: number;
+    quickPrint?: boolean;
   }) => {
     const isAdminUser = currentUser.role === 'ADMIN';
     const isBackdated =
@@ -1434,11 +1994,18 @@ export default function App() {
             conversionFactor: item.selectedUnit.conversionFactor,
             quantity: item.quantity,
             unitPrice: item.unitPrice,
-            costPrice: item.isQuickSale ? 0 : (prod?.costPrice || 0),
+            costPrice: item.isCashWithdrawal
+              ? Math.max(0, item.principalAmount || 0)
+              : item.isQuickSale
+              ? 0
+              : (prod?.costPrice || 0),
             totalAmount: item.subtotal,
             selectedVariant: item.selectedVariant,
             isService: item.isService,
             isQuickSale: item.isQuickSale,
+            ...(item.isCashWithdrawal ? { isCashWithdrawal: true } : {}),
+            ...(item.principalAmount !== undefined ? { principalAmount: item.principalAmount } : {}),
+            ...(item.adminFee !== undefined ? { adminFee: item.adminFee } : {}),
             serviceNotes: item.serviceNotes,
             batchDeductions: [],
             isCustomerSpecialPrice: item.isCustomerSpecialPrice,
@@ -1458,6 +2025,7 @@ export default function App() {
 
       setProducts(recalcResult.updatedProducts);
       setTransactions(recalcResult.updatedTransactions);
+      recordWithdrawalCashflowForTransaction(finalizedNewTransaction);
 
       if (selectedCustomer) {
         const updatedCustomers = customers.map((c) => {
@@ -1489,11 +2057,18 @@ export default function App() {
       }
 
       setLastCompletedTransaction(finalizedNewTransaction);
-      setShouldAutoSendWaOnReceipt(Boolean(storeSettings.autoSendWhatsAppReceipt));
-      setShouldAutoPrintOnReceipt(Boolean(storeSettings.autoPrintReceipt));
       setIsPaymentModalOpen(false);
       setPreferBackdatedCheckout(false);
-      setIsReceiptModalOpen(true);
+      if (paymentData.quickPrint) {
+        setShouldAutoSendWaOnReceipt(false);
+        setShouldAutoPrintOnReceipt(false);
+        setIsReceiptModalOpen(false);
+        void executeQuickBluetoothPrint(finalizedNewTransaction);
+      } else {
+        setShouldAutoSendWaOnReceipt(Boolean(storeSettings.autoSendWhatsAppReceipt));
+        setShouldAutoPrintOnReceipt(Boolean(storeSettings.autoPrintReceipt));
+        setIsReceiptModalOpen(true);
+      }
       setCart([]);
       setRequestedPoints(0);
       setHasManualPointOverride(false);
@@ -1682,7 +2257,13 @@ export default function App() {
       items: cart.map((item) => {
         const prod = productMap.get(item.productId);
         const fifoData = itemDeductionsMap.get(item.productId);
-        const effectiveHpp = fifoData ? fifoData.costPrice : (item.isQuickSale ? 0 : (prod?.costPrice || 0));
+        const effectiveHpp = fifoData
+          ? fifoData.costPrice
+          : item.isCashWithdrawal
+          ? Math.max(0, item.principalAmount || 0)
+          : item.isQuickSale
+          ? 0
+          : (prod?.costPrice || 0);
 
         return {
           productId: item.productId,
@@ -1696,6 +2277,9 @@ export default function App() {
           selectedVariant: item.selectedVariant,
           isService: item.isService,
           isQuickSale: item.isQuickSale,
+          ...(item.isCashWithdrawal ? { isCashWithdrawal: true } : {}),
+          ...(item.principalAmount !== undefined ? { principalAmount: item.principalAmount } : {}),
+          ...(item.adminFee !== undefined ? { adminFee: item.adminFee } : {}),
           serviceNotes: item.serviceNotes,
           batchDeductions: fifoData?.batchDeductions || [],
           isCustomerSpecialPrice: item.isCustomerSpecialPrice,
@@ -1706,12 +2290,20 @@ export default function App() {
 
     const nextTransactions = [newTransaction, ...transactions];
     setTransactions(nextTransactions);
+    recordWithdrawalCashflowForTransaction(newTransaction);
     setLastCompletedTransaction(newTransaction);
-    setShouldAutoSendWaOnReceipt(Boolean(storeSettings.autoSendWhatsAppReceipt));
-    setShouldAutoPrintOnReceipt(Boolean(storeSettings.autoPrintReceipt));
     setIsPaymentModalOpen(false);
     setPreferBackdatedCheckout(false);
-    setIsReceiptModalOpen(true);
+    if (paymentData.quickPrint) {
+      setShouldAutoSendWaOnReceipt(false);
+      setShouldAutoPrintOnReceipt(false);
+      setIsReceiptModalOpen(false);
+      void executeQuickBluetoothPrint(newTransaction);
+    } else {
+      setShouldAutoSendWaOnReceipt(Boolean(storeSettings.autoSendWhatsAppReceipt));
+      setShouldAutoPrintOnReceipt(Boolean(storeSettings.autoPrintReceipt));
+      setIsReceiptModalOpen(true);
+    }
     setCart([]);
     setRequestedPoints(0);
     setHasManualPointOverride(false);
@@ -1817,6 +2409,456 @@ export default function App() {
         }
       }
     }
+
+    // Record centralized employee/manager accountability log if audit entry was added
+    const prevAuditLen = prevTx?.auditLogs?.length || 0;
+    const nextAuditLen = updatedTx.auditLogs?.length || 0;
+    if (nextAuditLen > prevAuditLen) {
+      const latestAudit = updatedTx.auditLogs![nextAuditLen - 1];
+      recordActivityLog({
+        actionType: 'EDIT_TRANSACTION',
+        targetType: 'TRANSACTION',
+        targetId: updatedTx.id,
+        targetLabel: updatedTx.invoiceNumber,
+        summary: `Edit invoice ${updatedTx.invoiceNumber} (${latestAudit.changes.length} perubahan: ${latestAudit.changes.map((c) => c.field).join(', ')})`,
+        oldValue: latestAudit.changes.map((c) => `${c.field}: ${c.oldValue}`).join('; '),
+        newValue: latestAudit.changes.map((c) => `${c.field}: ${c.newValue}`).join('; '),
+        reason: latestAudit.reason || 'Perubahan data invoice',
+        invoiceNumber: updatedTx.invoiceNumber,
+      });
+    }
+  };
+
+  // Delete Transaction with optional stock restoration & mandatory Activity Log
+  const handleDeleteTransaction = (
+    tx: Transaction,
+    reason: string,
+    restoreStock: boolean
+  ) => {
+    setTransactions((prev) => prev.filter((t) => t.id !== tx.id));
+    deleteDocumentFromFirestore('transactions', tx.id).catch(() => {});
+
+    const linkedWithdrawalIds = [`cf_tarik_${tx.id}`, `cf_tarik_admin_${tx.id}`];
+    const existingLinkedIds = linkedWithdrawalIds.filter((id) => cashflows.some((c) => c.id === id));
+    if (existingLinkedIds.length > 0) {
+      setCashflows((prev) => prev.filter((c) => !existingLinkedIds.includes(c.id)));
+      existingLinkedIds.forEach((id) => {
+        deleteDocumentFromFirestore('cashflows', id).catch(() => {});
+      });
+    }
+
+    if (restoreStock) {
+      const restoreMap = new Map<string, number>();
+      tx.items.forEach((item) => {
+        if (item.isService || item.isQuickSale) return;
+        const baseUnits = Math.max(0, (item.quantity || 0) * (item.conversionFactor || 1));
+        if (baseUnits > 0) {
+          restoreMap.set(item.productId, (restoreMap.get(item.productId) || 0) + baseUnits);
+        }
+      });
+
+      if (restoreMap.size > 0) {
+        const changedProducts: Product[] = [];
+        setProducts((prev) =>
+          prev.map((prod) => {
+            const qtyToAdd = restoreMap.get(prod.id);
+            if (!qtyToAdd) return prod;
+            const nextProd = {
+              ...prod,
+              stockInBaseUnit: prod.stockInBaseUnit + qtyToAdd,
+            };
+            changedProducts.push(nextProd);
+            return nextProd;
+          })
+        );
+        if (changedProducts.length > 0) {
+          saveBatchToFirestore('products', changedProducts).catch(() => {});
+        }
+      }
+    }
+
+    if (tx.customerId) {
+      let targetUpdatedCust: Customer | null = null;
+      const isUnsettledPiutang =
+        tx.paymentMethod === 'PIUTANG' && tx.paymentStatus !== 'LUNAS';
+      const pointsDiff = (tx.pointsUsed || 0) - (tx.pointsEarned || 0);
+      if (isUnsettledPiutang || pointsDiff !== 0) {
+        setCustomers((prev) =>
+          prev.map((c) => {
+            if (c.id !== tx.customerId) return c;
+            targetUpdatedCust = {
+              ...c,
+              totalDebt: isUnsettledPiutang
+                ? Math.max(0, c.totalDebt - tx.finalAmount)
+                : c.totalDebt,
+              totalPoints: Math.max(0, c.totalPoints + pointsDiff),
+            };
+            return targetUpdatedCust;
+          })
+        );
+        if (targetUpdatedCust) {
+          saveDocumentToFirestore('customers', tx.customerId, targetUpdatedCust).catch(() => {});
+        }
+      }
+    }
+
+    const totalItemsQty = tx.items.reduce((s, i) => s + i.quantity, 0);
+    recordActivityLog({
+      actionType: 'DELETE_TRANSACTION',
+      targetType: 'TRANSACTION',
+      targetId: tx.id,
+      targetLabel: tx.invoiceNumber,
+      summary: `Hapus transaksi ${tx.invoiceNumber} senilai ${formatRupiah(tx.finalAmount)} (${tx.items.length} jenis / ${totalItemsQty} unit${restoreStock ? ', stok dikembalikan' : ''})`,
+      oldValue: formatRupiah(tx.finalAmount),
+      newValue: 'DIHAPUS',
+      deltaValue: `-${formatRupiah(tx.finalAmount)}`,
+      numericDelta: -tx.finalAmount,
+      reason: reason || 'Penghapusan transaksi',
+      invoiceNumber: tx.invoiceNumber,
+    });
+  };
+
+  // Merchandise Return Processing (Admin Only):
+  // Restores returned stock to exact source FIFO batches, cancels loyalty points earned from returned items, and persists atomically
+  const handleProcessTransactionReturn = async (payload: {
+    transaction: Transaction;
+    returnItems: Array<{ itemIndex: number; returnedQuantity: number }>;
+    reason: string;
+    restoreStock: boolean;
+  }): Promise<{ updatedTx: Transaction; returnRecord: TransactionReturnRecord }> => {
+    if (currentUser.role !== 'ADMIN') {
+      throw new Error('Hanya Admin yang memiliki izin memproses retur barang.');
+    }
+
+    const tx = transactions.find((t) => t.id === payload.transaction.id) || payload.transaction;
+    const prevReturns = Array.isArray(tx.returns) ? tx.returns : [];
+
+    // Calculate previously returned quantities per item index
+    const prevReturnedQtyMap = new Map<number, number>();
+    prevReturns.forEach((ret) => {
+      (ret.items || []).forEach((ri) => {
+        prevReturnedQtyMap.set(
+          ri.itemIndex,
+          (prevReturnedQtyMap.get(ri.itemIndex) || 0) + (ri.returnedQuantity || 0)
+        );
+      });
+    });
+
+    const requestedMap = new Map<number, number>();
+    payload.returnItems.forEach((entry) => {
+      if (entry.returnedQuantity > 0) {
+        requestedMap.set(entry.itemIndex, (requestedMap.get(entry.itemIndex) || 0) + entry.returnedQuantity);
+      }
+    });
+
+    if (requestedMap.size === 0) {
+      throw new Error('Pilih minimal 1 item dan kuantitas retur lebih dari 0.');
+    }
+
+    // Check whether after this return ALL items in transaction will be 100% returned
+    const willBeFullReturn = tx.items.every((item, idx) => {
+      const alreadyQty = prevReturnedQtyMap.get(idx) || 0;
+      const nowQty = requestedMap.get(idx) || 0;
+      return alreadyQty + nowQty >= item.quantity;
+    });
+
+    const netFactor = tx.subtotal > 0 ? Math.min(1, tx.finalAmount / tx.subtotal) : 1;
+    const remainingTransactionAmount = Math.max(0, tx.finalAmount - (tx.returnedAmount || 0));
+    const remainingTransactionPoints = Math.max(0, (tx.pointsEarned || 0) - (tx.returnedPoints || 0));
+
+    // Calculate raw item refunds & stock restorations
+    const workingProductsMap = new Map<string, Product>();
+    products.forEach((p) => workingProductsMap.set(p.id, p));
+    const changedProductIds = new Set<string>();
+
+    const draftItems: Array<{
+      itemIndex: number;
+      productId: string;
+      productName: string;
+      unitName: string;
+      conversionFactor: number;
+      returnedQuantity: number;
+      unitPrice: number;
+      rawRefund: number;
+      restoredBaseUnits: number;
+      restoredBatches: TransactionReturnItem['restoredBatches'];
+    }> = [];
+
+    tx.items.forEach((item, idx) => {
+      const reqQty = requestedMap.get(idx) || 0;
+      if (reqQty <= 0) return;
+
+      const alreadyQty = prevReturnedQtyMap.get(idx) || 0;
+      const clampedQty = Math.min(reqQty, Math.max(0, item.quantity - alreadyQty));
+      if (clampedQty <= 0) return;
+
+      const conv = item.conversionFactor || 1;
+      const returnBaseUnits = clampedQty * conv;
+      const alreadyBaseUnits = alreadyQty * conv;
+      const perUnitAmount = item.totalAmount / Math.max(1, item.quantity);
+      const rawRefund = Math.round(perUnitAmount * clampedQty * netFactor);
+
+      let restoredBaseUnits = 0;
+      let restoredBatches: TransactionReturnItem['restoredBatches'] = [];
+
+      if (payload.restoreStock && !item.isService && !item.isQuickSale) {
+        const targetProduct = workingProductsMap.get(item.productId);
+        if (targetProduct && targetProduct.productType !== 'JASA') {
+          const { updatedProduct, restoredBatches: batchInfo } = restoreProductBatchesForReturn({
+            product: targetProduct,
+            item,
+            returnBaseUnits,
+            alreadyReturnedBaseUnits: alreadyBaseUnits,
+            invoiceNumber: tx.invoiceNumber,
+          });
+          workingProductsMap.set(targetProduct.id, updatedProduct);
+          changedProductIds.add(targetProduct.id);
+          restoredBaseUnits = returnBaseUnits;
+          restoredBatches = batchInfo;
+        }
+      }
+
+      draftItems.push({
+        itemIndex: idx,
+        productId: item.productId,
+        productName: item.productName,
+        unitName: item.unitName,
+        conversionFactor: conv,
+        returnedQuantity: clampedQty,
+        unitPrice: item.unitPrice,
+        rawRefund,
+        restoredBaseUnits,
+        restoredBatches,
+      });
+    });
+
+    if (draftItems.length === 0) {
+      throw new Error('Tidak ada item valid yang masih dapat diretur pada transaksi ini.');
+    }
+
+    const rawRefundSum = draftItems.reduce((s, d) => s + d.rawRefund, 0);
+    const totalRefundAmount = willBeFullReturn
+      ? remainingTransactionAmount
+      : Math.min(remainingTransactionAmount, rawRefundSum);
+
+    // Adjust last item refund cleanly if full return corrected rounding by a few Rupiah
+    let assignedRefundSum = 0;
+    const refundAllocated = draftItems.map((d, i) => {
+      if (i === draftItems.length - 1) {
+        return Math.max(0, totalRefundAmount - assignedRefundSum);
+      }
+      const scaled =
+        rawRefundSum > 0
+          ? Math.round((d.rawRefund / rawRefundSum) * totalRefundAmount)
+          : 0;
+      assignedRefundSum += scaled;
+      return scaled;
+    });
+
+    // Compute loyalty points cancelled from these returned items
+    const totalPointsCancelled = willBeFullReturn
+      ? remainingTransactionPoints
+      : Math.min(
+          remainingTransactionPoints,
+          Math.round((tx.pointsEarned || 0) * (totalRefundAmount / Math.max(1, tx.finalAmount)))
+        );
+
+    let assignedPts = 0;
+    const finalReturnItems: TransactionReturnItem[] = draftItems.map((d, i) => {
+      const itemRefund = refundAllocated[i];
+      let itemPtsCancelled = 0;
+      if (totalPointsCancelled > 0) {
+        if (i === draftItems.length - 1) {
+          itemPtsCancelled = Math.max(0, totalPointsCancelled - assignedPts);
+        } else {
+          itemPtsCancelled =
+            totalRefundAmount > 0
+              ? Math.round((itemRefund / totalRefundAmount) * totalPointsCancelled)
+              : 0;
+          assignedPts += itemPtsCancelled;
+        }
+      }
+
+      return {
+        itemIndex: d.itemIndex,
+        productId: d.productId,
+        productName: d.productName,
+        unitName: d.unitName,
+        conversionFactor: d.conversionFactor,
+        returnedQuantity: d.returnedQuantity,
+        unitPrice: d.unitPrice,
+        refundAmount: itemRefund,
+        pointsCancelled: itemPtsCancelled,
+        restoredBaseUnits: d.restoredBaseUnits,
+        ...(d.restoredBatches && d.restoredBatches.length > 0
+          ? { restoredBatches: d.restoredBatches }
+          : {}),
+      };
+    });
+
+    const now = Date.now();
+    const dateSlug = new Date(now).toISOString().slice(0, 10).replace(/-/g, '');
+    const returnRecord: TransactionReturnRecord = {
+      id: `ret_${now}_${Math.random().toString(36).substring(2, 7)}`,
+      returnNumber: `RET-${dateSlug}-${Math.floor(1000 + Math.random() * 9000)}`,
+      timestamp: now,
+      processedByUserId: currentUser.id,
+      processedByName: currentUser.name,
+      processedByRole: currentUser.role,
+      reason: payload.reason.trim() || 'Retur barang pelanggan',
+      restoreStock: payload.restoreStock,
+      totalRefundAmount,
+      pointsCancelled: totalPointsCancelled,
+      items: finalReturnItems,
+    };
+
+    const nextReturnedAmount = Math.min(tx.finalAmount, (tx.returnedAmount || 0) + totalRefundAmount);
+    const nextReturnedPoints = Math.min(tx.pointsEarned || 0, (tx.returnedPoints || 0) + totalPointsCancelled);
+    const nextReturnStatus: 'NONE' | 'PARTIAL' | 'FULL' = willBeFullReturn ? 'FULL' : 'PARTIAL';
+
+    const totalUnitsReturned = finalReturnItems.reduce((s, it) => s + it.returnedQuantity, 0);
+    const batchSummaryText = finalReturnItems
+      .flatMap((it) =>
+        (it.restoredBatches || []).map(
+          (b) => `${b.batchNumber || b.batchId} (+${b.restoredBaseUnits})`
+        )
+      )
+      .slice(0, 6)
+      .join(', ');
+
+    const auditEntry: TransactionAuditLogEntry = {
+      id: `audit_${now}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: now,
+      editedByUserId: currentUser.id,
+      editedByName: currentUser.name,
+      editedByRole: currentUser.role,
+      reason: `Retur Barang (${returnRecord.returnNumber}): ${returnRecord.reason}`,
+      changes: [
+        {
+          field: 'returnedAmount',
+          label: 'Total Dana Diretur',
+          oldValue: formatRupiah(tx.returnedAmount || 0),
+          newValue: formatRupiah(nextReturnedAmount),
+        },
+        ...(totalPointsCancelled > 0
+          ? [
+              {
+                field: 'returnedPoints',
+                label: 'Pembatalan Poin Loyalitas',
+                oldValue: `${formatNumber(tx.returnedPoints || 0)} Poin`,
+                newValue: `${formatNumber(nextReturnedPoints)} Poin`,
+              },
+            ]
+          : []),
+        ...(batchSummaryText
+          ? [
+              {
+                field: 'batchRestoration',
+                label: 'Pengembalian Batch FIFO',
+                oldValue: '-',
+                newValue: batchSummaryText,
+              },
+            ]
+          : []),
+      ],
+    };
+
+    const updatedTx: Transaction = {
+      ...tx,
+      returns: [...prevReturns, returnRecord],
+      returnedAmount: nextReturnedAmount,
+      returnedPoints: nextReturnedPoints,
+      returnStatus: nextReturnStatus,
+      auditLogs: [...(tx.auditLogs || []), auditEntry],
+    };
+
+    // Prepare changed products and updated customer
+    const changedProducts: Product[] = Array.from(changedProductIds)
+      .map((pid) => workingProductsMap.get(pid))
+      .filter((p): p is Product => Boolean(p));
+
+    let updatedCustomerObj: Customer | null = null;
+    if (tx.customerId) {
+      const existingCustomer = customers.find((c) => c.id === tx.customerId);
+      if (existingCustomer) {
+        const isUnsettledPiutang =
+          tx.paymentMethod === 'PIUTANG' && tx.paymentStatus !== 'LUNAS';
+        const nextTotalPoints = Math.max(0, (existingCustomer.totalPoints || 0) - totalPointsCancelled);
+        const nextTotalDebt = isUnsettledPiutang
+          ? Math.max(0, (existingCustomer.totalDebt || 0) - totalRefundAmount)
+          : existingCustomer.totalDebt;
+
+        if (
+          nextTotalPoints !== existingCustomer.totalPoints ||
+          nextTotalDebt !== existingCustomer.totalDebt
+        ) {
+          updatedCustomerObj = {
+            ...existingCustomer,
+            totalPoints: nextTotalPoints,
+            totalDebt: nextTotalDebt,
+          };
+        }
+      }
+    }
+
+    // Persist to Firestore with explicit structured error handling
+    try {
+      await saveDocumentToFirestore('transactions', updatedTx.id, updatedTx);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `transactions/${updatedTx.id}`);
+    }
+
+    if (changedProducts.length > 0) {
+      try {
+        await saveBatchToFirestore('products', changedProducts);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, 'products');
+      }
+    }
+
+    if (updatedCustomerObj) {
+      try {
+        await saveDocumentToFirestore('customers', updatedCustomerObj.id, updatedCustomerObj);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `customers/${updatedCustomerObj.id}`);
+      }
+    }
+
+    // Update React states cleanly after validation/persistence
+    setTransactions((prev) => prev.map((t) => (t.id === updatedTx.id ? updatedTx : t)));
+    if (changedProducts.length > 0) {
+      setProducts((prev) => prev.map((p) => workingProductsMap.get(p.id) || p));
+    }
+    if (updatedCustomerObj) {
+      setCustomers((prev) =>
+        prev.map((c) => (c.id === updatedCustomerObj!.id ? updatedCustomerObj! : c))
+      );
+    }
+
+    // Record accountability log
+    recordActivityLog({
+      actionType: 'ITEM_RETURN',
+      targetType: 'TRANSACTION',
+      targetId: tx.id,
+      targetLabel: `${tx.invoiceNumber} (${returnRecord.returnNumber})`,
+      summary: `Retur ${finalReturnItems.length} jenis / ${totalUnitsReturned} unit senilai ${formatRupiah(totalRefundAmount)}${
+        totalPointsCancelled > 0 ? `, batal -${formatNumber(totalPointsCancelled)} poin` : ''
+      }${batchSummaryText ? ` • Batch: ${batchSummaryText}` : ''}`,
+      oldValue: formatRupiah(tx.finalAmount),
+      newValue: formatRupiah(Math.max(0, tx.finalAmount - nextReturnedAmount)),
+      deltaValue: `-${formatRupiah(totalRefundAmount)}`,
+      numericDelta: -totalRefundAmount,
+      reason: returnRecord.reason,
+      invoiceNumber: tx.invoiceNumber,
+      metadata: {
+        returnNumber: returnRecord.returnNumber,
+        pointsCancelled: totalPointsCancelled,
+        restoreStock: payload.restoreStock,
+        returnedItemCount: finalReturnItems.length,
+      },
+    });
+
+    return { updatedTx, returnRecord };
   };
 
   // Customer Satisfaction Rating (1-5 stars) submitted from Digital Receipt
@@ -1856,6 +2898,45 @@ export default function App() {
       prev?.id === transactionId ? updatedTx : prev
     );
     saveDocumentToFirestore('transactions', transactionId, updatedTx).catch(() => {});
+  };
+
+  // Persist receipt email metadata on transaction and optionally customer profile
+  const handleSaveReceiptEmail = (
+    transactionId: string,
+    email: string,
+    customerId?: string,
+    saveToCustomerProfile?: boolean
+  ) => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail) return;
+
+    const targetTx = transactions.find((t) => t.id === transactionId);
+    if (targetTx) {
+      const updatedTx: Transaction = {
+        ...targetTx,
+        customerEmail: cleanEmail,
+        receiptEmailSentTo: cleanEmail,
+        receiptEmailSentAt: Date.now(),
+      };
+      setTransactions((prev) =>
+        prev.map((t) => (t.id === transactionId ? updatedTx : t))
+      );
+      setLastCompletedTransaction((prev) =>
+        prev?.id === transactionId ? updatedTx : prev
+      );
+      saveDocumentToFirestore('transactions', transactionId, updatedTx).catch(() => {});
+    }
+
+    if (customerId && saveToCustomerProfile) {
+      const targetCustomer = customers.find((c) => c.id === customerId);
+      if (targetCustomer && targetCustomer.email !== cleanEmail) {
+        const updatedCustomer: Customer = {
+          ...targetCustomer,
+          email: cleanEmail,
+        };
+        handleUpdateCustomer(updatedCustomer);
+      }
+    }
   };
 
   // Complete Restock / PO from Supplier
@@ -2084,6 +3165,7 @@ export default function App() {
       localStorage.removeItem(DAILY_LOW_STOCK_LEDGER_KEY);
       localStorage.removeItem('kasir_latest_sunday_backup');
       localStorage.removeItem('kasir_cashflows');
+      localStorage.removeItem('kasir_activity_logs');
       hasSeededStockTrackerRef.current = false;
       prevProductsStockRef.current = new Map();
       setAdminLowStockWaAlert(null);
@@ -2098,6 +3180,7 @@ export default function App() {
       saveStorage('kasir_attendances', []);
       saveStorage('kasir_stock_opnames', []);
       saveStorage('kasir_cashflows', []);
+      saveStorage('kasir_activity_logs', []);
 
       // Reset local React state to zero/empty
       setProducts([]);
@@ -2109,6 +3192,7 @@ export default function App() {
       setAttendances([]);
       setStockOpnames([]);
       setCashflows([]);
+      setActivityLogs([]);
       setCart([]);
       setSelectedCustomer(null);
       setRequestedPoints(0);
@@ -2134,6 +3218,7 @@ export default function App() {
       setAttendances([]);
       setStockOpnames([]);
       setCashflows([]);
+      setActivityLogs([]);
       setCart([]);
 
       sound.playSuccessChime();
@@ -2144,53 +3229,93 @@ export default function App() {
     }
   };
 
-  // Restore application backup data
-  const handleRestoreBackup = (backup: BackupPayload) => {
-    if (backup.data.products && Array.isArray(backup.data.products)) {
-      setProducts(backup.data.products);
-      saveBatchToFirestore('products', backup.data.products).catch(() => {});
-    }
-    if (backup.data.categories && Array.isArray(backup.data.categories)) {
-      setCategories(backup.data.categories);
-      saveBatchToFirestore('categories', backup.data.categories).catch(() => {});
-    }
-    if (backup.data.customers && Array.isArray(backup.data.customers)) {
-      setCustomers(backup.data.customers);
-      saveBatchToFirestore('customers', backup.data.customers).catch(() => {});
-    }
-    if (backup.data.suppliers && Array.isArray(backup.data.suppliers)) {
-      setSuppliers(backup.data.suppliers);
-      saveBatchToFirestore('suppliers', backup.data.suppliers).catch(() => {});
-    }
-    if (backup.data.transactions && Array.isArray(backup.data.transactions)) {
-      setTransactions(backup.data.transactions);
-      saveBatchToFirestore('transactions', backup.data.transactions).catch(() => {});
-    }
-    if (backup.data.attendances && Array.isArray(backup.data.attendances)) {
-      setAttendances(backup.data.attendances);
-      saveBatchToFirestore('attendances', backup.data.attendances).catch(() => {});
-    }
-    if (backup.data.stockOpnames && Array.isArray(backup.data.stockOpnames)) {
-      setStockOpnames(backup.data.stockOpnames);
-      saveBatchToFirestore('stock_opnames', backup.data.stockOpnames).catch(() => {});
-    }
-    if (backup.data.storeSettings) {
-      setStoreSettings(backup.data.storeSettings);
-      saveStoreSettingsToFirestore(backup.data.storeSettings).catch(() => {});
-    }
-    if (backup.data.users && Array.isArray(backup.data.users) && backup.data.users.length > 0) {
-      setUsers(backup.data.users);
-      saveBatchToFirestore('users', backup.data.users).catch(() => {});
-      if (!backup.data.users.some((u) => u.id === currentUser.id)) {
-        setCurrentUser(backup.data.users[0]);
+  // Restore application backup data (replaces existing data across local state and Cloud Firestore)
+  const handleRestoreBackup = async (backup: BackupPayload): Promise<void> => {
+    const nextProducts = Array.isArray(backup.data.products) ? backup.data.products : [];
+    const nextCategories = Array.isArray(backup.data.categories) ? backup.data.categories : [];
+    const nextCustomerCategories =
+      Array.isArray(backup.data.customerCategories) && backup.data.customerCategories.length > 0
+        ? backup.data.customerCategories
+        : INITIAL_CUSTOMER_CATEGORIES;
+    const nextCustomers = Array.isArray(backup.data.customers) ? backup.data.customers : [];
+    const nextSuppliers = Array.isArray(backup.data.suppliers) ? backup.data.suppliers : [];
+    const nextPurchases = Array.isArray(backup.data.purchases) ? backup.data.purchases : [];
+    const nextTransactions = Array.isArray(backup.data.transactions) ? backup.data.transactions : [];
+    const nextCashflows = Array.isArray(backup.data.cashflows) ? backup.data.cashflows : [];
+    const nextAttendances = Array.isArray(backup.data.attendances) ? backup.data.attendances : [];
+    const nextStockOpnames = Array.isArray(backup.data.stockOpnames) ? backup.data.stockOpnames : [];
+    const nextOnlineOrders = Array.isArray(backup.data.onlineOrders) ? backup.data.onlineOrders : [];
+    const nextActivityLogs = Array.isArray(backup.data.activityLogs) ? backup.data.activityLogs : [];
+    const nextSettings: StoreSettings = backup.data.storeSettings
+      ? {
+          ...INITIAL_STORE_SETTINGS,
+          ...backup.data.storeSettings,
+          scheduledAdminLowStockWhatsApp: normalizeLowStockSchedule(
+            backup.data.storeSettings.scheduledAdminLowStockWhatsApp || DEFAULT_LOW_STOCK_SCHEDULE
+          ),
+          scheduledDailySalesReportWhatsApp: normalizeDailySalesSchedule(
+            backup.data.storeSettings.scheduledDailySalesReportWhatsApp || DEFAULT_DAILY_SALES_SCHEDULE
+          ),
+        }
+      : storeSettings;
+
+    setProducts(nextProducts);
+    setCategories(nextCategories);
+    setCustomerCategories(nextCustomerCategories);
+    setCustomers(nextCustomers);
+    setSuppliers(nextSuppliers);
+    setPurchases(nextPurchases);
+    setTransactions(nextTransactions);
+    setCashflows(nextCashflows);
+    setAttendances(nextAttendances);
+    setStockOpnames(nextStockOpnames);
+    setOnlineOrders(nextOnlineOrders);
+    setActivityLogs(nextActivityLogs);
+    setStoreSettings(nextSettings);
+
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('kasir_db_cleared_by_user');
+      }
+    } catch {}
+
+    const hasUsersToRestore = Array.isArray(backup.data.users) && backup.data.users.length > 0;
+    if (hasUsersToRestore) {
+      const nextUsers = backup.data.users!;
+      setUsers(nextUsers);
+      if (!nextUsers.some((u) => u.id === currentUser.id)) {
+        setCurrentUser(nextUsers[0]);
       }
     }
+
     // Reset active cart and selected customer to prevent broken references
     setCart([]);
     setSelectedCustomer(null);
     setRequestedPoints(0);
     setHasManualPointOverride(false);
     setSpecialPriceNotice(null);
+
+    const cloudTasks: Promise<unknown>[] = [
+      replaceCollectionInFirestore('products', nextProducts),
+      replaceCollectionInFirestore('categories', nextCategories),
+      replaceCollectionInFirestore('customer_categories', nextCustomerCategories),
+      replaceCollectionInFirestore('customers', nextCustomers),
+      replaceCollectionInFirestore('suppliers', nextSuppliers),
+      replaceCollectionInFirestore('purchases', nextPurchases),
+      replaceCollectionInFirestore('transactions', nextTransactions),
+      replaceCollectionInFirestore('cashflows', nextCashflows),
+      replaceCollectionInFirestore('attendances', nextAttendances),
+      replaceCollectionInFirestore('stock_opnames', nextStockOpnames),
+      replaceCollectionInFirestore('online_orders', nextOnlineOrders),
+      replaceCollectionInFirestore('activity_logs', nextActivityLogs),
+      saveStoreSettingsToFirestore(nextSettings, true),
+    ];
+
+    if (hasUsersToRestore) {
+      cloudTasks.push(replaceCollectionInFirestore('users', backup.data.users!));
+    }
+
+    await Promise.all(cloudTasks);
   };
 
   // Attendance Handlers
@@ -2439,13 +3564,190 @@ export default function App() {
       console.error('[FirebaseSync] Failed to save product to Firestore:', err);
     });
     registerMissingCategoriesFromProducts([newProd], 'Otomatis ditambahkan dari produk');
+
+    const baseUnit = newProd.units?.[0];
+    if (baseUnit && (baseUnit.sellingPrice || 0) > 0) {
+      const sell = Number(baseUnit.sellingPrice || 0);
+      const cost = Number(baseUnit.costPrice || newProd.costPrice || 0);
+      const marginRp = sell - cost;
+      const marginPct = sell > 0 ? Math.round((marginRp / sell) * 1000) / 10 : 0;
+      recordActivityLog({
+        actionType: 'MANUAL_PRICE_EDIT',
+        targetType: 'PRODUCT',
+        targetId: newProd.id,
+        targetLabel: `${newProd.name} (${baseUnit.unitName})`.slice(0, 235),
+        summary: `Harga jual awal ditetapkan ${formatRupiah(sell)}/${baseUnit.unitName} (Modal ${formatRupiah(cost)}, Margin ${marginPct.toFixed(1)}%)`.slice(0, 590),
+        oldValue: formatRupiah(0),
+        newValue: formatRupiah(sell),
+        deltaValue: `Margin ${marginPct.toFixed(1)}% (${formatRupiah(marginRp)})`,
+        numericDelta: sell,
+        reason: 'Harga jual awal saat produk ditambahkan',
+        productId: newProd.id,
+        metadata: {
+          stage: 'CATALOG_PRICE_UPDATE',
+          sku: String(newProd.sku || newProd.barcode || '').slice(0, 40),
+          category: String(newProd.category || 'Umum').slice(0, 60),
+          unitName: baseUnit.unitName,
+          conversionFactor: baseUnit.conversionFactor || 1,
+          oldSellingPrice: 0,
+          newSellingPrice: sell,
+          oldCostPrice: cost,
+          newCostPrice: cost,
+          oldMarginRupiah: 0,
+          newMarginRupiah: marginRp,
+          oldMarginPercent: 0,
+          newMarginPercent: marginPct,
+          marginDeltaPercent: marginPct,
+          priceDeltaPercent: 0,
+          changeDirection: 'HARGA_AWAL',
+        },
+      });
+    }
   };
 
-  const handleUpdateProduct = (updated: Product) => {
+  const handleUpdateProduct = (updated: Product, priceChangeReason?: string) => {
+    const prevProd = productMap.get(updated.id);
     setProducts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     saveDocumentToFirestore('products', updated.id, updated).catch((err) => {
       console.error('[FirebaseSync] Failed to update product in Firestore:', err);
     });
+
+    if (prevProd) {
+      const cleanedReason = (priceChangeReason || '').trim();
+      const prevBaseCost = Number(prevProd.costPrice || prevProd.units?.[0]?.costPrice || 0);
+      const nextBaseCost = Number(updated.costPrice || updated.units?.[0]?.costPrice || 0);
+
+      (updated.units || []).forEach((newUnit) => {
+        const oldUnit =
+          (prevProd.units || []).find(
+            (u) =>
+              u.id === newUnit.id ||
+              u.unitName.trim().toUpperCase() === newUnit.unitName.trim().toUpperCase()
+          ) || null;
+        if (!oldUnit) return;
+
+        const factor = newUnit.conversionFactor || 1;
+        const oldSell = Number(oldUnit.sellingPrice || 0);
+        const newSell = Number(newUnit.sellingPrice || 0);
+        const oldCost = Number(
+          oldUnit.costPrice !== undefined && oldUnit.costPrice > 0
+            ? oldUnit.costPrice
+            : Math.round(prevBaseCost * factor)
+        );
+        const newCost = Number(
+          newUnit.costPrice !== undefined && newUnit.costPrice > 0
+            ? newUnit.costPrice
+            : Math.round(nextBaseCost * factor)
+        );
+
+        if (oldSell === newSell && oldCost === newCost) return;
+
+        const priceDelta = newSell - oldSell;
+        const priceDeltaPct = oldSell > 0 ? Math.round((priceDelta / oldSell) * 1000) / 10 : 0;
+        const oldMarginRp = oldSell - oldCost;
+        const newMarginRp = newSell - newCost;
+        const oldMarginPct = oldSell > 0 ? Math.round((oldMarginRp / oldSell) * 1000) / 10 : 0;
+        const newMarginPct = newSell > 0 ? Math.round((newMarginRp / newSell) * 1000) / 10 : 0;
+        const marginDeltaPct = Math.round((newMarginPct - oldMarginPct) * 10) / 10;
+
+        const changeDirection =
+          priceDelta > 0 ? 'NAIK' : priceDelta < 0 ? 'TURUN' : 'MODAL_BERUBAH';
+
+        const summaryText =
+          priceDelta !== 0
+            ? `Harga jual ${newUnit.unitName} berubah ${formatRupiah(oldSell)} → ${formatRupiah(newSell)} (${priceDelta > 0 ? '+' : ''}${priceDeltaPct.toFixed(1)}%). Margin: ${oldMarginPct.toFixed(1)}% → ${newMarginPct.toFixed(1)}% (${marginDeltaPct >= 0 ? '+' : ''}${marginDeltaPct.toFixed(1)}%)`
+            : `Harga modal/HPP ${newUnit.unitName} berubah ${formatRupiah(oldCost)} → ${formatRupiah(newCost)} (Jual tetap ${formatRupiah(newSell)}). Margin: ${oldMarginPct.toFixed(1)}% → ${newMarginPct.toFixed(1)}%`;
+
+        recordActivityLog({
+          actionType: 'MANUAL_PRICE_EDIT',
+          targetType: 'PRODUCT',
+          targetId: updated.id,
+          targetLabel: `${updated.name} (${newUnit.unitName})`.slice(0, 235),
+          summary: summaryText.slice(0, 590),
+          oldValue: `${formatRupiah(oldSell)} (Modal ${formatRupiah(oldCost)})`,
+          newValue: `${formatRupiah(newSell)} (Modal ${formatRupiah(newCost)})`,
+          deltaValue: `${priceDelta >= 0 ? '+' : ''}${formatRupiah(priceDelta)} · Margin ${marginDeltaPct >= 0 ? '+' : ''}${marginDeltaPct.toFixed(1)}%`,
+          numericDelta: priceDelta !== 0 ? priceDelta : newMarginRp - oldMarginRp,
+          reason:
+            cleanedReason ||
+            (priceDelta > 0
+              ? 'Kenaikan harga jual master produk'
+              : priceDelta < 0
+              ? 'Penyesuaian / penurunan harga jual master produk'
+              : 'Perubahan harga modal / HPP berdampak pada margin'),
+          productId: updated.id,
+          metadata: {
+            stage: 'CATALOG_PRICE_UPDATE',
+            sku: String(updated.sku || updated.barcode || '').slice(0, 40),
+            category: String(updated.category || 'Umum').slice(0, 60),
+            unitName: newUnit.unitName,
+            conversionFactor: factor,
+            oldSellingPrice: oldSell,
+            newSellingPrice: newSell,
+            oldCostPrice: oldCost,
+            newCostPrice: newCost,
+            oldMarginRupiah: oldMarginRp,
+            newMarginRupiah: newMarginRp,
+            oldMarginPercent: oldMarginPct,
+            newMarginPercent: newMarginPct,
+            marginDeltaPercent: marginDeltaPct,
+            priceDeltaPercent: priceDeltaPct,
+            changeDirection,
+          },
+        });
+      });
+
+      // Also track per-variant selling price changes if configured
+      (updated.variants || []).forEach((newVar) => {
+        const oldVar = (prevProd.variants || []).find(
+          (v) => v.id === newVar.id || v.name.trim().toLowerCase() === newVar.name.trim().toLowerCase()
+        );
+        if (!oldVar) return;
+        const oldVarSell = Number(oldVar.price ?? prevProd.units?.[0]?.sellingPrice ?? 0);
+        const newVarSell = Number(newVar.price ?? updated.units?.[0]?.sellingPrice ?? 0);
+        if (oldVarSell === newVarSell) return;
+
+        const priceDelta = newVarSell - oldVarSell;
+        const priceDeltaPct = oldVarSell > 0 ? Math.round((priceDelta / oldVarSell) * 1000) / 10 : 0;
+        const oldMarginRp = oldVarSell - prevBaseCost;
+        const newMarginRp = newVarSell - nextBaseCost;
+        const oldMarginPct = oldVarSell > 0 ? Math.round((oldMarginRp / oldVarSell) * 1000) / 10 : 0;
+        const newMarginPct = newVarSell > 0 ? Math.round((newMarginRp / newVarSell) * 1000) / 10 : 0;
+        const marginDeltaPct = Math.round((newMarginPct - oldMarginPct) * 10) / 10;
+
+        recordActivityLog({
+          actionType: 'MANUAL_PRICE_EDIT',
+          targetType: 'PRODUCT',
+          targetId: updated.id,
+          targetLabel: `${updated.name} (Varian: ${newVar.name})`.slice(0, 235),
+          summary: `Harga varian "${newVar.name}" berubah ${formatRupiah(oldVarSell)} → ${formatRupiah(newVarSell)} (${priceDelta >= 0 ? '+' : ''}${priceDeltaPct.toFixed(1)}%). Margin ${oldMarginPct.toFixed(1)}% → ${newMarginPct.toFixed(1)}%`.slice(0, 590),
+          oldValue: formatRupiah(oldVarSell),
+          newValue: formatRupiah(newVarSell),
+          deltaValue: `${priceDelta >= 0 ? '+' : ''}${formatRupiah(priceDelta)} · Margin ${marginDeltaPct >= 0 ? '+' : ''}${marginDeltaPct.toFixed(1)}%`,
+          numericDelta: priceDelta,
+          reason: cleanedReason || `Pembaruan harga varian ${newVar.name}`,
+          productId: updated.id,
+          metadata: {
+            stage: 'CATALOG_PRICE_UPDATE',
+            sku: String(updated.sku || updated.barcode || '').slice(0, 40),
+            category: String(updated.category || 'Umum').slice(0, 60),
+            unitName: `${updated.baseUnit} (${newVar.name})`.slice(0, 40),
+            conversionFactor: 1,
+            oldSellingPrice: oldVarSell,
+            newSellingPrice: newVarSell,
+            oldCostPrice: prevBaseCost,
+            newCostPrice: nextBaseCost,
+            oldMarginRupiah: oldMarginRp,
+            newMarginRupiah: newMarginRp,
+            oldMarginPercent: oldMarginPct,
+            newMarginPercent: newMarginPct,
+            marginDeltaPercent: marginDeltaPct,
+            priceDeltaPercent: priceDeltaPct,
+            changeDirection: priceDelta > 0 ? 'NAIK' : 'TURUN',
+          },
+        });
+      });
+    }
   };
 
   const handleDeleteProduct = (id: string) => {
@@ -2614,8 +3916,9 @@ export default function App() {
     deleteDocumentFromFirestore('suppliers', id).catch(() => {});
   };
 
-  const handleUpdateStock = (productId: string, newStock: number) => {
+  const handleUpdateStock = (productId: string, newStock: number, reason?: string) => {
     const finalStock = Math.max(0, newStock);
+    const existingProd = productMap.get(productId);
     const updatedProducts = products.map((p) =>
       p.id === productId ? { ...p, stockInBaseUnit: finalStock } : p
     );
@@ -2623,6 +3926,29 @@ export default function App() {
     const targetProd = updatedProducts.find((p) => p.id === productId);
     if (targetProd) {
       saveDocumentToFirestore('products', productId, targetProd).catch(() => {});
+      if (existingProd && existingProd.stockInBaseUnit !== finalStock) {
+        const diff = finalStock - existingProd.stockInBaseUnit;
+        const sign = diff > 0 ? '+' : '';
+        recordActivityLog({
+          actionType: 'MANUAL_STOCK_ADJUSTMENT',
+          targetType: 'PRODUCT',
+          targetId: existingProd.id,
+          targetLabel: existingProd.name,
+          summary: `Penyesuaian stok manual ${existingProd.name} oleh ${currentUser.name} (${currentUser.role})`,
+          oldValue: `${formatNumber(existingProd.stockInBaseUnit)} ${existingProd.baseUnit}`,
+          newValue: `${formatNumber(finalStock)} ${existingProd.baseUnit}`,
+          deltaValue: `${sign}${formatNumber(diff)} ${existingProd.baseUnit}`,
+          numericDelta: diff,
+          reason: reason || 'Penyesuaian stok manual',
+          productId: existingProd.id,
+          metadata: {
+            opnameEvent: 'MANUAL_ADJUSTMENT',
+            responsibleUserId: currentUser.id,
+            responsibleUserName: currentUser.name,
+            responsibleUserRole: currentUser.role,
+          },
+        });
+      }
     }
   };
 
@@ -2631,12 +3957,54 @@ export default function App() {
     sessionRecord: StockOpnameRecord
   ) => {
     const adjMap = new Map(adjustments.map((a) => [a.productId, a.newStock]));
+    const opnameItemMap = new Map(sessionRecord.items.map((item) => [item.productId, item]));
     const changedProducts: Product[] = [];
+    const logsToCreate: EmployeeActivityLog[] = [];
+    const baseTs = Date.now();
+    const matchedResponsible = users.find(
+      (u) => u.name.toLowerCase() === (sessionRecord.auditorName || '').toLowerCase()
+    );
+    const responsibleId = matchedResponsible?.id || currentUser.id;
+    const responsibleName = sessionRecord.auditorName || currentUser.name;
+    const responsibleRole = sessionRecord.auditorRole || currentUser.role;
+
     const updatedProducts = products.map((p) => {
       const newStockVal = adjMap.get(p.id);
       if (newStockVal !== undefined) {
-        const nextProd = { ...p, stockInBaseUnit: Math.max(0, newStockVal) };
+        const clamped = Math.max(0, newStockVal);
+        const nextProd = { ...p, stockInBaseUnit: clamped };
         changedProducts.push(nextProd);
+
+        if (clamped !== p.stockInBaseUnit) {
+          const diff = clamped - p.stockInBaseUnit;
+          const sign = diff > 0 ? '+' : '';
+          const opItem = opnameItemMap.get(p.id);
+          logsToCreate.push({
+            id: `act_${baseTs}_${p.id}_${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: baseTs,
+            actionType: 'MANUAL_STOCK_ADJUSTMENT',
+            actorId: currentUser.id,
+            actorName: currentUser.name,
+            actorRole: currentUser.role,
+            targetType: 'STOCK_OPNAME',
+            targetId: p.id,
+            targetLabel: `${p.name} (${sessionRecord.sessionNumber})`,
+            summary: `Opname stok (${sessionRecord.sessionNumber}) untuk ${p.name}`,
+            oldValue: `${formatNumber(p.stockInBaseUnit)} ${p.baseUnit}`,
+            newValue: `${formatNumber(clamped)} ${p.baseUnit}`,
+            deltaValue: `${sign}${formatNumber(diff)} ${p.baseUnit}`,
+            numericDelta: diff,
+            reason: opItem?.reason || sessionRecord.generalReason || 'Sesi Stock Opname',
+            productId: p.id,
+            metadata: {
+              opnameEvent: 'OPNAME_ADJUSTMENT',
+              sessionNumber: sessionRecord.sessionNumber,
+              responsibleUserId: responsibleId,
+              responsibleUserName: responsibleName,
+              responsibleUserRole: responsibleRole,
+            },
+          });
+        }
         return nextProd;
       }
       return p;
@@ -2644,11 +4012,87 @@ export default function App() {
     setProducts(updatedProducts);
     setStockOpnames((prev) => [sessionRecord, ...prev]);
 
+    if (logsToCreate.length > 0) {
+      setActivityLogs((prev) => [...logsToCreate, ...prev]);
+      saveBatchToFirestore('activity_logs', logsToCreate).catch(() => {});
+    }
+
     // Sync ONLY adjusted products & audit record to Firestore
     if (changedProducts.length > 0) {
       saveBatchToFirestore('products', changedProducts).catch(() => {});
     }
     saveDocumentToFirestore('stock_opnames', sessionRecord.id, sessionRecord).catch(() => {});
+  };
+
+  const handleDeleteStockOpname = (
+    record: StockOpnameRecord,
+    deletionReason: string,
+    responsibleUser: { id: string; name: string; role: UserRole },
+    revertStockChanges: boolean
+  ) => {
+    const cleanReason = deletionReason.trim() || 'Penghapusan riwayat Stock Opname';
+    const revertDeltaMap = new Map<string, number>();
+    if (revertStockChanges && Array.isArray(record.items)) {
+      record.items.forEach((item) => {
+        if (item.difference !== 0) {
+          revertDeltaMap.set(
+            item.productId,
+            (revertDeltaMap.get(item.productId) || 0) + item.difference
+          );
+        }
+      });
+    }
+
+    const changedProducts: Product[] = [];
+    if (revertDeltaMap.size > 0) {
+      const updatedProducts = products.map((prod) => {
+        const opDiff = revertDeltaMap.get(prod.id);
+        if (opDiff === undefined) return prod;
+        const revertedStock = Math.max(0, prod.stockInBaseUnit - opDiff);
+        if (revertedStock !== prod.stockInBaseUnit) {
+          const nextProd = { ...prod, stockInBaseUnit: revertedStock };
+          changedProducts.push(nextProd);
+          return nextProd;
+        }
+        return prod;
+      });
+      setProducts(updatedProducts);
+      if (changedProducts.length > 0) {
+        saveBatchToFirestore('products', changedProducts).catch(() => {});
+      }
+    }
+
+    setStockOpnames((prev) => prev.filter((so) => so.id !== record.id));
+    deleteDocumentFromFirestore('stock_opnames', record.id).catch(() => {});
+
+    recordActivityLog({
+      actionType: 'MANUAL_STOCK_ADJUSTMENT',
+      targetType: 'STOCK_OPNAME',
+      targetId: record.id,
+      targetLabel: record.sessionNumber,
+      summary: `[Hapus Stock Opname] Sesi ${record.sessionNumber} (${record.totalItemsAudited} SKU, varians ${
+        record.totalDifferenceValue >= 0
+          ? `+${formatRupiah(record.totalDifferenceValue)}`
+          : formatRupiah(record.totalDifferenceValue)
+      })${revertStockChanges ? ' — stok dikembalikan ke kondisi sebelum opname' : ''}`,
+      oldValue: `${record.totalItemsAudited} SKU (${record.totalDiscrepancies} selisih)`,
+      newValue: 'DIHAPUS',
+      deltaValue: revertStockChanges
+        ? `${changedProducts.length} SKU stok dikembalikan`
+        : 'Arsip sesi dihapus',
+      numericDelta: -record.totalDiscrepancies,
+      reason: cleanReason,
+      metadata: {
+        opnameEvent: 'DELETE_OPNAME',
+        sessionNumber: record.sessionNumber,
+        responsibleUserId: responsibleUser.id,
+        responsibleUserName: responsibleUser.name,
+        responsibleUserRole: responsibleUser.role,
+        deletionNote: cleanReason,
+        revertStockApplied: revertStockChanges,
+        deletedSkusCount: record.totalItemsAudited,
+      },
+    });
   };
 
   const handleUpdateStoreSettings = (newSettings: StoreSettings) => {
@@ -3039,6 +4483,8 @@ export default function App() {
         activeShiftCount={activeShiftCount}
         isCurrentUserClockedIn={isCurrentUserClockedIn}
         products={products}
+        transactions={transactions}
+        customers={customers}
         cloudSyncStatus={cloudSyncStatus === 'SYNCED' ? 'SYNCED' : cloudSyncStatus === 'CONNECTING' ? 'CONNECTING' : 'OFFLINE'}
       />
 
@@ -3066,6 +4512,7 @@ export default function App() {
             pointsToUse={pointsUsed}
             storeSettings={storeSettings}
             transactions={transactions}
+            availableStoreCashBalance={availableStoreCashBalance}
             specialPriceNotice={specialPriceNotice}
             onDismissSpecialPriceNotice={() => setSpecialPriceNotice(null)}
             onAddToCart={handleAddToCart}
@@ -3111,6 +4558,7 @@ export default function App() {
             customerCategories={customerCategories}
             currentUserRole={currentUser.role}
             transactions={transactions}
+            activityLogs={activityLogs}
             onAddProduct={handleAddProduct}
             onBatchAddProducts={handleBatchAddProducts}
             onUpdateProduct={handleUpdateProduct}
@@ -3155,11 +4603,15 @@ export default function App() {
             suppliers={suppliers}
             currentUser={currentUser}
             currentUserRole={currentUser.role}
+            users={users}
             stockOpnames={stockOpnames}
             storeSettings={storeSettings}
             transactions={transactions}
+            purchases={purchases}
             onUpdateStock={handleUpdateStock}
+            onUpdateProduct={handleUpdateProduct}
             onBulkUpdateStock={handleBulkUpdateStock}
+            onDeleteStockOpname={handleDeleteStockOpname}
             onOpenThresholdSettings={() => setIsThresholdModalOpen(true)}
             onNavigateToSuppliers={() => setActiveTab('suppliers')}
           />
@@ -3221,7 +4673,10 @@ export default function App() {
             products={products}
             customers={customers}
             currentUser={currentUser}
+            activityLogs={activityLogs}
             onUpdateTransaction={handleUpdateTransaction}
+            onDeleteTransaction={handleDeleteTransaction}
+            onProcessReturn={handleProcessTransactionReturn}
             onViewReceipt={(tx) => {
               setShouldAutoSendWaOnReceipt(false);
               setShouldAutoPrintOnReceipt(false);
@@ -3276,6 +4731,7 @@ export default function App() {
         {activeTab === 'finance' && (
           <FinanceView
             cashflows={cashflows}
+            transactions={transactions}
             onAddCashflow={handleAddCashflow}
             onUpdateCashflow={handleUpdateCashflow}
             onDeleteCashflow={handleDeleteCashflow}
@@ -3318,6 +4774,9 @@ export default function App() {
                   })
                 }
                 onOpenSettings={currentUser.role === 'ADMIN' ? () => setActiveTab('settings') : undefined}
+                bcaAccountNumber={storeSettings.bcaAccountNumber}
+                bcaAccountName={storeSettings.bcaAccountName}
+                onNavigateToPiutang={() => setActiveTab('piutang')}
                 onSaveProducts={async (updatedProducts) => {
                   const changedProducts = updatedProducts.filter((p) => productMap.get(p.id) !== p);
                   setProducts(updatedProducts);
@@ -3346,11 +4805,17 @@ export default function App() {
             users={users}
             products={products}
             categories={categories}
+            customerCategories={customerCategories}
             customers={customers}
             suppliers={suppliers}
+            purchases={purchases}
             transactions={transactions}
+            cashflows={cashflows}
             attendances={attendances}
             stockOpnames={stockOpnames}
+            onlineOrders={onlineOrders}
+            activityLogs={activityLogs}
+            currentUserRole={currentUser.role}
             onUpdateStoreSettings={handleUpdateStoreSettings}
             onUpdateUsers={handleUpdateUsers}
             onResetToDemoData={handleResetToDemoData}
@@ -3397,6 +4862,7 @@ export default function App() {
         customers={customers}
         isDigitalLinkMode={isDigitalReceiptLinkView}
         onRateTransaction={handleRateTransaction}
+        onSaveReceiptEmail={handleSaveReceiptEmail}
         autoSendWhatsApp={shouldAutoSendWaOnReceipt}
         onAutoSendWhatsAppHandled={() => setShouldAutoSendWaOnReceipt(false)}
         autoPrintReceipt={shouldAutoPrintOnReceipt}
@@ -3634,6 +5100,299 @@ export default function App() {
             </div>
           </div>
         </>
+      )}
+
+      {/* Hidden anchor + Floating Alert for Scheduled Daily Closing Sales WhatsApp */}
+      {adminDailySalesWaAlert && (
+        <>
+          <a
+            ref={adminDailySalesWaAnchorRef}
+            href={adminDailySalesWaAlert.waUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hidden"
+            aria-hidden="true"
+          />
+
+          <div className="fixed bottom-4 left-4 z-50 max-w-md w-[calc(100vw-2rem)] bg-white rounded-2xl border-2 border-emerald-400 shadow-2xl overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-200 select-none">
+            <div className="px-4 py-3 text-white bg-gradient-to-r from-emerald-600 to-teal-600 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <TrendingUp className="w-5 h-5 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-xs font-extrabold tracking-tight truncate">
+                    Laporan Penutupan Penjualan Harian
+                  </div>
+                  <div className="text-[10px] text-emerald-100 truncate">
+                    Jadwal {adminDailySalesWaAlert.scheduleLabel} ·{' '}
+                    {adminDailySalesWaAlert.hasAdminPhone
+                      ? `WA Admin (${storeSettings.adminWhatsAppNumber}) siap dikirim`
+                      : 'Nomor WA Admin belum diatur'}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setAdminDailySalesWaAlert(null);
+                }}
+                className="p-1 rounded-lg hover:bg-white/20 text-white/90 cursor-pointer shrink-0"
+                title="Tutup notifikasi"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3.5 space-y-3">
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="p-2 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[10px] font-semibold text-slate-500">Transaksi</div>
+                  <div className="text-xs font-black text-slate-900 tabular-nums">
+                    {formatNumber(adminDailySalesWaAlert.summary.transactionCount)} Nota
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-emerald-50/70 border border-emerald-200">
+                  <div className="text-[10px] font-semibold text-emerald-700">Omzet Bersih</div>
+                  <div className="text-xs font-black text-emerald-900 tabular-nums">
+                    Rp {formatNumber(adminDailySalesWaAlert.summary.totalNetRevenue)}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-sky-50/70 border border-sky-200">
+                  <div className="text-[10px] font-semibold text-sky-700">Laba Kotor</div>
+                  <div className="text-xs font-black text-sky-900 tabular-nums">
+                    Rp {formatNumber(adminDailySalesWaAlert.summary.grossProfit)}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <a
+                  href={adminDailySalesWaAlert.waUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => sound.playSuccessChime()}
+                  className="flex-1 min-w-[160px] py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors"
+                >
+                  <MessageCircle className="w-4 h-4" />
+                  <span>Kirim WA ke Admin</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                      navigator.clipboard.writeText(adminDailySalesWaAlert.message).catch(() => {});
+                    }
+                    setCopiedAdminDailySalesWa(true);
+                    setTimeout(() => setCopiedAdminDailySalesWa(false), 2500);
+                  }}
+                  className="py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  {copiedAdminDailySalesWa ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span className="text-emerald-700">Tersalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Salin Pesan</span>
+                    </>
+                  )}
+                </button>
+
+                {!adminDailySalesWaAlert.hasAdminPhone && currentUser.role === 'ADMIN' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setAdminDailySalesWaAlert(null);
+                      setActiveTab('settings');
+                    }}
+                    className="w-full py-1.5 px-3 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <SettingsIcon className="w-3.5 h-3.5" />
+                    <span>Atur Nomor WhatsApp Admin di Pengaturan</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+      {/* Non-blocking Toast for Cetak Cepat Bluetooth Direct Print */}
+      {quickPrintFeedback && (
+        <div
+          className={`fixed bottom-4 right-4 z-50 max-w-sm w-[calc(100vw-2rem)] bg-white rounded-2xl border shadow-xl overflow-hidden select-none ${
+            quickPrintFeedback.status === 'SUCCESS'
+              ? 'border-emerald-300'
+              : quickPrintFeedback.status === 'ERROR'
+              ? 'border-rose-300'
+              : 'border-sky-300'
+          }`}
+        >
+          <div
+            className={`px-3.5 py-2.5 flex items-center justify-between gap-2 border-b ${
+              quickPrintFeedback.status === 'SUCCESS'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
+                : quickPrintFeedback.status === 'ERROR'
+                ? 'bg-rose-50 border-rose-200 text-rose-950'
+                : 'bg-sky-50 border-sky-200 text-sky-950'
+            }`}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <Bluetooth className="w-4 h-4 shrink-0" />
+              <span className="text-xs font-bold truncate">
+                {quickPrintFeedback.status === 'PRINTING'
+                  ? 'Cetak Cepat Bluetooth...'
+                  : quickPrintFeedback.status === 'SUCCESS'
+                  ? 'Cetak Cepat Berhasil'
+                  : 'Cetak Cepat Bluetooth Gagal'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setQuickPrintFeedback(null)}
+              className="p-1 rounded-lg hover:bg-black/5 cursor-pointer shrink-0"
+              title="Tutup"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="p-3 space-y-2.5">
+            <p className="text-xs text-slate-700 leading-relaxed">{quickPrintFeedback.message}</p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {quickPrintFeedback.status === 'ERROR' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void executeQuickBluetoothPrint(quickPrintFeedback.transaction)}
+                    className="px-2.5 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-bold flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Coba Lagi</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      openRawBtPrint(
+                        quickPrintFeedback.transaction,
+                        storeSettings,
+                        storeSettings.printerPaperWidth || '58mm'
+                      );
+                    }}
+                    className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-bold flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Printer className="w-3 h-3" />
+                    <span>RawBT</span>
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setLastCompletedTransaction(quickPrintFeedback.transaction);
+                  setShouldAutoPrintOnReceipt(false);
+                  setShouldAutoSendWaOnReceipt(false);
+                  setIsReceiptModalOpen(true);
+                  setQuickPrintFeedback(null);
+                }}
+                className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-[11px] font-semibold flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Printer className="w-3 h-3" />
+                <span>Lihat Struk</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* High-Visibility Floating Alert Toast: Tarik Tunai Melebihi Saldo Kas */}
+      {cashWithdrawalAlertToast && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-[80] w-[94vw] max-w-lg bg-white rounded-2xl border-2 border-rose-500 shadow-2xl shadow-rose-950/30 overflow-hidden animate-in fade-in slide-in-from-top-4 duration-200 select-none"
+        >
+          <div className="px-4 py-3 bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white flex items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-xl bg-white/20 border border-white/30 flex items-center justify-center shrink-0 animate-pulse">
+                <AlertTriangle className="w-5 h-5 text-amber-200" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs sm:text-sm font-black tracking-tight truncate">
+                  {cashWithdrawalAlertToast.title}
+                </div>
+                <div className="text-[10px] text-rose-100 font-medium truncate">
+                  Penambahan ke keranjang otomatis diblokir oleh sistem kas
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setCashWithdrawalAlertToast(null)}
+              className="p-1.5 rounded-xl hover:bg-white/20 text-white/90 cursor-pointer shrink-0 transition-colors"
+              title="Tutup peringatan"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="p-3.5 space-y-3 bg-rose-50/40">
+            <p className="text-xs font-semibold text-slate-800 leading-relaxed">
+              {cashWithdrawalAlertToast.message}
+            </p>
+
+            <div className="grid grid-cols-3 gap-2">
+              <div className="p-2 rounded-xl bg-white border border-rose-200">
+                <div className="text-[9.5px] font-bold text-slate-500 uppercase">Diminta</div>
+                <div className="text-xs font-black font-mono text-rose-700 tabular-nums mt-0.5">
+                  {formatRupiah(cashWithdrawalAlertToast.requestedAmount)}
+                </div>
+              </div>
+              <div className="p-2 rounded-xl bg-white border border-slate-200">
+                <div className="text-[9.5px] font-bold text-slate-500 uppercase">Sisa Saldo Kas</div>
+                <div className="text-xs font-black font-mono text-slate-900 tabular-nums mt-0.5">
+                  {formatRupiah(cashWithdrawalAlertToast.availableBalance)}
+                </div>
+              </div>
+              <div className="p-2 rounded-xl bg-rose-100/70 border border-rose-300">
+                <div className="text-[9.5px] font-bold text-rose-700 uppercase">Kekurangan</div>
+                <div className="text-xs font-black font-mono text-rose-800 tabular-nums mt-0.5">
+                  -{formatRupiah(cashWithdrawalAlertToast.shortfall)}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2">
+              {currentUser.role !== 'KARYAWAN' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setCashWithdrawalAlertToast(null);
+                    setActiveTab('finance');
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-bold cursor-pointer transition-colors"
+                >
+                  Catat Modal Kas di Keuangan
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setCashWithdrawalAlertToast(null)}
+                className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold cursor-pointer transition-colors"
+              >
+                Mengerti
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

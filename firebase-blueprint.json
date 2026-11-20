@@ -27,6 +27,7 @@
         "name": { "type": "string", "description": "Full customer name" },
         "phone": { "type": "string", "description": "Primary phone number" },
         "whatsapp": { "type": "string", "description": "WhatsApp contact number" },
+        "email": { "type": "string", "description": "Optional customer email address for digital e-receipts" },
         "address": { "type": "string", "description": "Delivery address" },
         "totalPoints": { "type": "number", "description": "Loyalty points balance" },
         "creditLimit": { "type": "number", "description": "Maximum allowed debt" },
@@ -51,6 +52,9 @@
         "customerId": { "type": "string", "description": "Optional member customer ID" },
         "customerName": { "type": "string", "description": "Optional member customer name" },
         "customerWhatsapp": { "type": "string", "description": "WhatsApp number for e-receipts" },
+        "customerEmail": { "type": "string", "description": "Optional customer email address" },
+        "receiptEmailSentTo": { "type": "string", "description": "Last recipient email address for receipt delivery" },
+        "receiptEmailSentAt": { "type": "number", "description": "Unix timestamp in ms when receipt email was queued via Firebase" },
         "subtotal": { "type": "number", "description": "Gross total before points discount" },
         "discount": { "type": "number", "description": "Applied discount" },
         "pointsUsed": { "type": "number", "description": "Points redeemed" },
@@ -67,6 +71,10 @@
         "paidAt": { "type": "string", "description": "Debt settlement timestamp" },
         "notes": { "type": "string", "description": "Optional transaction note or internal/customer remark" },
         "auditLogs": { "type": "array", "description": "Administrator post-transaction edit audit log entries" },
+        "returns": { "type": "array", "description": "List of processed merchandise return records with restored batch details" },
+        "returnedAmount": { "type": "number", "description": "Cumulative refunded nominal amount in IDR" },
+        "returnedPoints": { "type": "number", "description": "Cumulative loyalty points cancelled due to item returns" },
+        "returnStatus": { "type": "string", "description": "NONE | PARTIAL | FULL" },
         "customerRating": { "type": "number", "description": "Customer satisfaction star rating (1 to 5)" },
         "customerRatingTags": { "type": "array", "description": "Selected quick service quality feedback tags" },
         "customerRatingComment": { "type": "string", "description": "Optional customer satisfaction comment" },
@@ -131,6 +139,9 @@
         "useCustomLowStockWhatsAppTemplate": { "type": "boolean", "description": "Toggle custom WhatsApp template for low-stock alerts" },
         "customLowStockWhatsAppTemplate": { "type": "string", "description": "Customizable WhatsApp low-stock alert template with product and stock placeholders" },
         "scheduledAdminLowStockWhatsApp": { "type": "object", "description": "Scheduled recurring WhatsApp low-stock report settings (enabled, frequency, time, daysOfWeek, sendEvenIfAllSafe, includeOutOfStockSummary)" },
+        "scheduledDailySalesReportWhatsApp": { "type": "object", "description": "Scheduled daily store-closing sales report WhatsApp settings (enabled, closingTime, intervalMode, intervalDays, daysOfWeek, section toggles)" },
+        "categorySalesGoals": { "type": "object", "description": "Per-category daily, weekly, and monthly sales targets" },
+        "chartTheme": { "type": "object", "description": "Dashboard chart color palette preset and custom theme configuration" },
         "printerConnectionType": { "type": "string", "description": "Thermal printer connection mode: BLUETOOTH or USB" },
         "printerPaperWidth": { "type": "string", "description": "Thermal printer paper width: 58mm or 80mm" },
         "printerDeviceName": { "type": "string", "description": "Paired thermal printer device label" },
@@ -153,6 +164,34 @@
         "onlineStoreMinFreeDelivery": { "type": "number", "description": "Minimum order subtotal for free local courier delivery in IDR" },
         "onlineStorePickupEnabled": { "type": "boolean", "description": "Allow store pickup fulfillment for online orders" },
         "onlineStoreDeliveryEnabled": { "type": "boolean", "description": "Allow local courier delivery fulfillment for online orders" }
+      }
+    },
+    "users": {
+      "path": "users/{userId}",
+      "description": "POS staff accounts with role-based permissions and numeric PIN credentials",
+      "fields": {
+        "id": { "type": "string", "description": "Unique staff user ID" },
+        "name": { "type": "string", "description": "Staff full name" },
+        "pin": { "type": "string", "description": "Numeric login PIN (4-8 digits)" },
+        "role": { "type": "string", "description": "ADMIN | STORE_MANAGER | KARYAWAN" },
+        "avatarColor": { "type": "string", "description": "Tailwind background class for user badge" }
+      }
+    },
+    "purchases": {
+      "path": "purchases/{purchaseId}",
+      "description": "Supplier purchase orders and warehouse stock receiving records",
+      "fields": {
+        "id": { "type": "string", "description": "Unique purchase order ID" },
+        "poNumber": { "type": "string", "description": "Generated PO number e.g. PO-20261117-001" },
+        "supplierId": { "type": "string", "description": "Linked supplier ID" },
+        "supplierName": { "type": "string", "description": "Supplier business name" },
+        "supplierWhatsapp": { "type": "string", "description": "Supplier WhatsApp number" },
+        "date": { "type": "string", "description": "Purchase date YYYY-MM-DD" },
+        "items": { "type": "array", "description": "Restock items with conversion factor and cost price" },
+        "totalAmount": { "type": "number", "description": "Total PO amount in IDR" },
+        "status": { "type": "string", "description": "DRAFT | SELESAI" },
+        "notes": { "type": "string", "description": "Optional PO notes" },
+        "createdAt": { "type": "number", "description": "Unix timestamp in ms" }
       }
     },
     "categories": {
@@ -198,6 +237,10 @@
         "description": { "type": "string", "description": "Detailed description or notes" },
         "referenceNumber": { "type": "string", "description": "Optional receipt or invoice reference code" },
         "recordedBy": { "type": "string", "description": "Name of user who created the record" },
+        "isCashWithdrawalOutflow": { "type": "boolean", "description": "True if this cash outflow represents physical cash handed out for a Tarik Tunai POS item" },
+        "isCashWithdrawalAdminProfit": { "type": "boolean", "description": "True if this cashflow income entry represents the net admin fee profit from a Tarik Tunai POS transaction" },
+        "withdrawalPrincipalAmount": { "type": "number", "description": "Total physical cash principal disbursed for linked Tarik Tunai transaction" },
+        "withdrawalAdminFeeAmount": { "type": "number", "description": "Total admin fee profit earned for linked Tarik Tunai transaction" },
         "createdAt": { "type": "string", "description": "ISO timestamp of creation" }
       }
     },
@@ -240,6 +283,41 @@
         "linkedInvoiceNumber": { "type": "string", "description": "POS invoice number once finalized by cashier" },
         "processedByName": { "type": "string", "description": "Staff name who processed the order" },
         "cancelReason": { "type": "string", "description": "Optional reason when order is cancelled" }
+      }
+    },
+    "activity_logs": {
+      "path": "activity_logs/{logId}",
+      "description": "Immutable employee/manager accountability audit log for sensitive POS actions (transaction delete/edit, manual price edit, manual stock adjustment)",
+      "fields": {
+        "id": { "type": "string", "description": "Unique activity log ID" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "actionType": { "type": "string", "description": "DELETE_TRANSACTION | MANUAL_PRICE_EDIT | MANUAL_STOCK_ADJUSTMENT | EDIT_TRANSACTION | ITEM_RETURN" },
+        "actorId": { "type": "string", "description": "User ID who executed the action" },
+        "actorName": { "type": "string", "description": "User name" },
+        "actorRole": { "type": "string", "description": "ADMIN | STORE_MANAGER | KARYAWAN" },
+        "targetType": { "type": "string", "description": "TRANSACTION | PRODUCT | CART_ITEM | STOCK_OPNAME" },
+        "targetId": { "type": "string", "description": "Affected document or item ID" },
+        "targetLabel": { "type": "string", "description": "Human-readable target label" },
+        "summary": { "type": "string", "description": "Clear Indonesian summary of the sensitive action" },
+        "oldValue": { "type": "string", "description": "Previous formatted value" },
+        "newValue": { "type": "string", "description": "Updated formatted value" },
+        "deltaValue": { "type": "string", "description": "Formatted variance/delta" },
+        "numericDelta": { "type": "number", "description": "Numeric delta for calculation" },
+        "reason": { "type": "string", "description": "Recorded reason or remarks" },
+        "invoiceNumber": { "type": "string", "description": "Related invoice number if applicable" },
+        "productId": { "type": "string", "description": "Related product ID if applicable" }
+      }
+    },
+    "mail": {
+      "path": "mail/{mailId}",
+      "description": "Firebase Trigger Email queue documents storing digital transaction receipt emails to be dispatched and tracked with delivery state",
+      "fields": {
+        "id": { "type": "string", "description": "Unique mail queue document ID" },
+        "to": { "type": "array", "description": "List of recipient email addresses" },
+        "message": { "type": "object", "description": "Email message payload containing subject, text, and html body" },
+        "metadata": { "type": "object", "description": "Related transaction invoiceNumber, transactionId, storeName, customerName, finalAmount, triggeredBy" },
+        "createdAt": { "type": "number", "description": "Unix timestamp in ms when email dispatch was triggered" },
+        "delivery": { "type": "object", "description": "Server-managed Firebase Trigger Email extension delivery status (state, error, endTime)" }
       }
     }
   }

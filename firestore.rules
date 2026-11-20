@@ -2,127 +2,434 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions for data validation
-    function isValidProduct(data) {
-      return data.name is string && data.name.size() > 0 &&
-             data.baseUnit is string &&
-             data.stockInBaseUnit is number && data.stockInBaseUnit >= 0;
+    // =========================================================================
+    // COMMON HARDENING PRIMITIVES
+    // =========================================================================
+    function isValidDocId(docId) {
+      return docId is string &&
+             docId.size() >= 1 &&
+             docId.size() <= 128 &&
+             docId.matches('^[a-zA-Z0-9_.-]+$');
     }
 
-    function isValidCustomer(data) {
-      return data.name is string && data.name.size() > 0 &&
-             data.phone is string &&
-             data.totalPoints is number && data.totalPoints >= 0 &&
-             data.totalDebt is number && data.totalDebt >= 0;
+    function nonEmptyStr(val, maxLen) {
+      return val is string && val.size() > 0 && val.size() <= maxLen;
     }
 
-    function isValidTransaction(data) {
-      return data.invoiceNumber is string &&
-             data.timestamp is number &&
-             data.finalAmount is number && data.finalAmount >= 0 &&
-             data.items is list && data.items.size() > 0;
+    function optStr(val, maxLen) {
+      return val == null || (val is string && val.size() <= maxLen);
     }
 
-    function isValidSupplier(data) {
-      return data.name is string && data.name.size() > 0 &&
-             data.phone is string;
+    function nonNegNum(val, maxVal) {
+      return val is number && val >= 0 && val <= maxVal;
     }
 
-    function isValidAttendance(data) {
-      return data.userId is string &&
-             data.userName is string &&
-             data.date is string &&
-             data.checkInTime is string &&
-             data.status in ['PRESENT', 'COMPLETED'];
+    function optNonNegNum(val, maxVal) {
+      return val == null || (val is number && val >= 0 && val <= maxVal);
+    }
+
+    function optBoundedNum(val, minVal, maxVal) {
+      return val == null || (val is number && val >= minVal && val <= maxVal);
+    }
+
+    function optBool(val) {
+      return val == null || val is bool;
+    }
+
+    function optList(val, maxItems) {
+      return val == null || (val is list && val.size() <= maxItems);
+    }
+
+    function optMap(val, maxKeys) {
+      return val == null || (val is map && val.keys().size() <= maxKeys);
+    }
+
+    // =========================================================================
+    // DOMAIN ENTITY VALIDATORS (Strict Schema, Bounds & Enum Enforcement)
+    // =========================================================================
+    function isValidUser(data) {
+      return data.keys().size() <= 12 &&
+             nonEmptyStr(data.get('name', ''), 120) &&
+             data.get('pin', '') is string &&
+             data.get('pin', '').matches('^[0-9]{4,8}$') &&
+             data.get('role', '') in ['ADMIN', 'STORE_MANAGER', 'KARYAWAN'] &&
+             optStr(data.get('avatarColor', null), 80);
     }
 
     function isValidCategory(data) {
-      return data.name is string && data.name.size() > 0 &&
-             data.color is string && data.color.size() > 0;
+      return data.keys().size() <= 12 &&
+             nonEmptyStr(data.get('name', ''), 100) &&
+             nonEmptyStr(data.get('color', ''), 32) &&
+             optStr(data.get('description', null), 300) &&
+             optStr(data.get('icon', null), 60);
+    }
+
+    function isValidProduct(data) {
+      return data.keys().size() <= 40 &&
+             nonEmptyStr(data.get('name', ''), 180) &&
+             nonEmptyStr(data.get('category', ''), 100) &&
+             nonEmptyStr(data.get('baseUnit', ''), 40) &&
+             optStr(data.get('barcode', null), 80) &&
+             optStr(data.get('sku', null), 80) &&
+             nonNegNum(data.get('stockInBaseUnit', -1), 10000000) &&
+             optNonNegNum(data.get('minStockAlert', null), 10000000) &&
+             optNonNegNum(data.get('costPrice', null), 1000000000) &&
+             (data.get('productType', null) == null || data.get('productType', null) in ['BARANG', 'JASA']) &&
+             optStr(data.get('imageUrl', null), 500000) &&
+             optStr(data.get('expiryDate', null), 32) &&
+             optStr(data.get('supplierId', null), 128) &&
+             optList(data.get('units', null), 20) &&
+             optList(data.get('batches', null), 250) &&
+             optList(data.get('variantOptions', null), 50) &&
+             optMap(data.get('customerCategoryPrices', null), 40);
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().size() <= 26 &&
+             nonEmptyStr(data.get('name', ''), 140) &&
+             optStr(data.get('phone', null), 40) &&
+             optStr(data.get('whatsapp', null), 40) &&
+             optStr(data.get('email', null), 160) &&
+             optStr(data.get('address', null), 400) &&
+             nonNegNum(data.get('totalPoints', -1), 100000000) &&
+             optNonNegNum(data.get('creditLimit', null), 10000000000) &&
+             nonNegNum(data.get('totalDebt', -1), 10000000000) &&
+             optStr(data.get('customerCategory', null), 60) &&
+             optStr(data.get('membershipTier', null), 40) &&
+             optStr(data.get('membershipId', null), 64) &&
+             optBool(data.get('isMember', null)) &&
+             optStr(data.get('notes', null), 1000);
+    }
+
+    function isValidCustomerCategory(data) {
+      return data.keys().size() <= 12 &&
+             nonEmptyStr(data.get('name', ''), 80) &&
+             nonEmptyStr(data.get('color', ''), 40) &&
+             optStr(data.get('description', null), 300) &&
+             optBool(data.get('isSystemDefault', null));
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().size() <= 54 &&
+             nonEmptyStr(data.get('invoiceNumber', ''), 64) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('cashierId', ''), 128) &&
+             nonEmptyStr(data.get('cashierName', ''), 120) &&
+             optStr(data.get('customerEmail', null), 160) &&
+             optStr(data.get('receiptEmailSentTo', null), 160) &&
+             optNonNegNum(data.get('receiptEmailSentAt', null), 10000000000000) &&
+             nonNegNum(data.get('subtotal', 0), 10000000000) &&
+             optNonNegNum(data.get('discount', null), 10000000000) &&
+             optNonNegNum(data.get('pointsUsed', null), 100000000) &&
+             optNonNegNum(data.get('pointsDiscountAmount', null), 10000000000) &&
+             optNonNegNum(data.get('pointsEarned', null), 100000000) &&
+             nonNegNum(data.get('finalAmount', -1), 10000000000) &&
+             nonEmptyStr(data.get('paymentMethod', ''), 120) &&
+             data.get('paymentStatus', '') in ['LUNAS', 'BELUM_LUNAS'] &&
+             optStr(data.get('dueDate', null), 32) &&
+             optStr(data.get('notes', null), 2000) &&
+             optStr(data.get('qrCodeDataUrl', null), 200000) &&
+             optBoundedNum(data.get('customerRating', null), 1, 5) &&
+             optStr(data.get('customerRatingComment', null), 1000) &&
+             optList(data.get('customerRatingTags', null), 20) &&
+             optList(data.get('auditLogs', null), 100) &&
+             optList(data.get('returns', null), 50) &&
+             optNonNegNum(data.get('returnedAmount', null), 10000000000) &&
+             optNonNegNum(data.get('returnedPoints', null), 100000000) &&
+             (data.get('returnStatus', null) == null || data.get('returnStatus', null) in ['NONE', 'PARTIAL', 'FULL']) &&
+             data.get('items', null) is list &&
+             data.get('items', []).size() > 0 &&
+             data.get('items', []).size() <= 250;
+    }
+
+    function isValidSupplier(data) {
+      return data.keys().size() <= 16 &&
+             nonEmptyStr(data.get('name', ''), 160) &&
+             optStr(data.get('contactPerson', null), 120) &&
+             optStr(data.get('phone', null), 40) &&
+             optStr(data.get('whatsapp', null), 40) &&
+             optStr(data.get('address', null), 400) &&
+             optList(data.get('suppliedCategories', null), 50);
+    }
+
+    function isValidAttendance(data) {
+      return data.keys().size() <= 18 &&
+             nonEmptyStr(data.get('userId', ''), 128) &&
+             nonEmptyStr(data.get('userName', ''), 120) &&
+             data.get('userRole', '') in ['ADMIN', 'STORE_MANAGER', 'KARYAWAN'] &&
+             nonEmptyStr(data.get('date', ''), 20) &&
+             nonEmptyStr(data.get('checkInTime', ''), 20) &&
+             data.get('checkInTimestamp', 0) is number &&
+             data.get('checkInTimestamp', 0) > 0 &&
+             optNonNegNum(data.get('durationMinutes', null), 10000) &&
+             optStr(data.get('notes', null), 500) &&
+             data.get('status', '') in ['PRESENT', 'COMPLETED'];
     }
 
     function isValidStockOpname(data) {
-      return data.sessionNumber is string &&
-             data.date is string &&
-             data.auditorName is string &&
-             data.items is list;
+      return data.keys().size() <= 20 &&
+             nonEmptyStr(data.get('sessionNumber', ''), 64) &&
+             nonEmptyStr(data.get('date', ''), 20) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('auditorName', ''), 120) &&
+             optNonNegNum(data.get('totalItemsAudited', null), 100000) &&
+             optNonNegNum(data.get('totalDiscrepancies', null), 100000) &&
+             data.get('items', null) is list &&
+             data.get('items', []).size() > 0 &&
+             data.get('items', []).size() <= 500 &&
+             optStr(data.get('generalReason', null), 200) &&
+             optStr(data.get('notes', null), 1000);
+    }
+
+    function isValidPurchase(data) {
+      return data.keys().size() <= 28 &&
+             nonEmptyStr(data.get('poNumber', ''), 64) &&
+             optStr(data.get('supplierId', null), 128) &&
+             nonEmptyStr(data.get('supplierName', ''), 160) &&
+             nonEmptyStr(data.get('date', ''), 20) &&
+             data.get('status', '') in ['DRAFT', 'SELESAI'] &&
+             nonNegNum(data.get('totalAmount', -1), 10000000000) &&
+             data.get('items', null) is list &&
+             data.get('items', []).size() > 0 &&
+             data.get('items', []).size() <= 250 &&
+             optStr(data.get('notes', null), 1000);
+    }
+
+    function isValidCashflow(data) {
+      return data.keys().size() <= 22 &&
+             data.get('type', '') in ['PENGELUARAN', 'PEMASUKAN'] &&
+             nonEmptyStr(data.get('category', ''), 100) &&
+             nonNegNum(data.get('amount', -1), 10000000000) &&
+             nonEmptyStr(data.get('date', ''), 20) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('paymentMethod', ''), 60) &&
+             optStr(data.get('description', null), 1000) &&
+             optStr(data.get('referenceNumber', null), 100) &&
+             optStr(data.get('recordedBy', null), 120) &&
+             optBool(data.get('isCashWithdrawalOutflow', null)) &&
+             optBool(data.get('isCashWithdrawalAdminProfit', null)) &&
+             optNonNegNum(data.get('withdrawalPrincipalAmount', null), 10000000000) &&
+             optNonNegNum(data.get('withdrawalAdminFeeAmount', null), 10000000000);
+    }
+
+    function isValidStoreSettings(data) {
+      return data.keys().size() <= 75 &&
+             nonEmptyStr(data.get('storeName', ''), 160) &&
+             optStr(data.get('storeAddress', null), 400) &&
+             optStr(data.get('storePhone', null), 40) &&
+             optStr(data.get('storeFooterReceipt', null), 500) &&
+             optStr(data.get('storeLogo', null), 500000) &&
+             optNonNegNum(data.get('dailySalesGoal', null), 10000000000) &&
+             optNonNegNum(data.get('weeklySalesGoal', null), 10000000000) &&
+             optNonNegNum(data.get('monthlySalesGoal', null), 100000000000) &&
+             optStr(data.get('adminWhatsAppNumber', null), 40) &&
+             optBoundedNum(data.get('adminLowStockTriggerCount', null), 1, 100) &&
+             optNonNegNum(data.get('spendPerPoint', null), 100000000) &&
+             optNonNegNum(data.get('pointsPerSpend', null), 100000) &&
+             optNonNegNum(data.get('pointValueRupiah', null), 10000000) &&
+             optList(data.get('customPaymentMethods', null), 25) &&
+             optMap(data.get('categorySalesGoals', null), 100) &&
+             optMap(data.get('scheduledAdminLowStockWhatsApp', null), 15) &&
+             optMap(data.get('scheduledDailySalesReportWhatsApp', null), 15);
     }
 
     function isValidOnlineOrder(data) {
-      return data.orderCode is string && data.orderCode.size() > 0 && data.orderCode.size() <= 40 &&
-             data.customerName is string && data.customerName.size() > 0 && data.customerName.size() <= 120 &&
-             data.customerWhatsapp is string && data.customerWhatsapp.size() >= 6 && data.customerWhatsapp.size() <= 30 &&
-             data.fulfillmentType in ['AMBIL_DI_TOKO', 'KIRIM_KURIR'] &&
-             data.status in ['MENUNGGU_KONFIRMASI', 'DIPROSES', 'SIAP_DIAMBIL', 'DIKIRIM', 'SELESAI', 'DIBATALKAN'] &&
-             data.totalAmount is number && data.totalAmount >= 0 &&
-             data.items is list && data.items.size() > 0 && data.items.size() <= 200;
+      return data.keys().size() <= 32 &&
+             nonEmptyStr(data.get('orderCode', ''), 40) &&
+             nonEmptyStr(data.get('customerName', ''), 120) &&
+             data.get('customerWhatsapp', '') is string &&
+             data.get('customerWhatsapp', '').size() >= 6 &&
+             data.get('customerWhatsapp', '').size() <= 30 &&
+             data.get('fulfillmentType', '') in ['AMBIL_DI_TOKO', 'KIRIM_KURIR'] &&
+             data.get('status', '') in ['MENUNGGU_KONFIRMASI', 'DIPROSES', 'SIAP_DIAMBIL', 'DIKIRIM', 'SELESAI', 'DIBATALKAN'] &&
+             nonNegNum(data.get('totalAmount', -1), 10000000000) &&
+             optNonNegNum(data.get('subtotal', null), 10000000000) &&
+             optNonNegNum(data.get('deliveryFee', null), 100000000) &&
+             optNonNegNum(data.get('discount', null), 10000000000) &&
+             optStr(data.get('customerAddress', null), 500) &&
+             optStr(data.get('customerNote', null), 500) &&
+             data.get('items', null) is list &&
+             data.get('items', []).size() > 0 &&
+             data.get('items', []).size() <= 200;
     }
 
-    // Users collection (Kasir / Admin / Manager)
+    // =========================================================================
+    // ACTIVITY LOG VALIDATOR
+    // =========================================================================
+    function isValidActivityLog(data) {
+      return data.keys().size() <= 18 &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             data.get('actionType', '') in ['DELETE_TRANSACTION', 'MANUAL_PRICE_EDIT', 'MANUAL_STOCK_ADJUSTMENT', 'EDIT_TRANSACTION', 'ITEM_RETURN'] &&
+             nonEmptyStr(data.get('actorId', ''), 128) &&
+             nonEmptyStr(data.get('actorName', ''), 120) &&
+             data.get('actorRole', '') in ['ADMIN', 'STORE_MANAGER', 'KARYAWAN'] &&
+             data.get('targetType', '') in ['TRANSACTION', 'PRODUCT', 'CART_ITEM', 'STOCK_OPNAME'] &&
+             nonEmptyStr(data.get('targetId', ''), 128) &&
+             nonEmptyStr(data.get('targetLabel', ''), 240) &&
+             nonEmptyStr(data.get('summary', ''), 600) &&
+             optStr(data.get('oldValue', null), 300) &&
+             optStr(data.get('newValue', null), 300) &&
+             optStr(data.get('deltaValue', null), 200) &&
+             optBoundedNum(data.get('numericDelta', null), -10000000000, 10000000000) &&
+             optStr(data.get('reason', null), 500) &&
+             optStr(data.get('invoiceNumber', null), 80) &&
+             optStr(data.get('productId', null), 128) &&
+             optMap(data.get('metadata', null), 20);
+    }
+
+    // =========================================================================
+    // RECEIPT EMAIL QUEUE VALIDATOR (Firebase Trigger Email Extension Schema)
+    // =========================================================================
+    function isValidMail(data) {
+      return data.keys().hasAll(['to', 'message']) &&
+             data.keys().hasOnly(['id', 'to', 'message', 'metadata', 'createdAt']) &&
+             !('delivery' in data) &&
+             data.to is list &&
+             data.to.size() >= 1 &&
+             data.to.size() <= 5 &&
+             data.to[0] is string &&
+             data.to[0].size() >= 5 &&
+             data.to[0].size() <= 160 &&
+             data.to[0].matches('^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$') &&
+             data.message is map &&
+             data.message.keys().hasAll(['subject', 'text']) &&
+             data.message.keys().hasOnly(['subject', 'text', 'html']) &&
+             nonEmptyStr(data.message.get('subject', ''), 200) &&
+             nonEmptyStr(data.message.get('text', ''), 20000) &&
+             optStr(data.message.get('html', null), 60000) &&
+             optMap(data.get('metadata', null), 16) &&
+             optNonNegNum(data.get('createdAt', null), 10000000000000);
+    }
+
+    // =========================================================================
+    // COLLECTION MATCH RULES
+    // =========================================================================
+
+    // Users (Kasir / Store Manager / Admin PIN profiles)
     match /users/{userId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(userId);
+      allow create, update: if isValidDocId(userId) && isValidUser(request.resource.data);
+      allow delete: if isValidDocId(userId);
     }
 
-    // Categories collection
+    // Product Categories
     match /categories/{categoryId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(categoryId);
+      allow create, update: if isValidDocId(categoryId) && isValidCategory(request.resource.data);
+      allow delete: if isValidDocId(categoryId);
     }
 
-    // Products collection
+    // Products Inventory
     match /products/{productId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(productId);
+      allow create, update: if isValidDocId(productId) && isValidProduct(request.resource.data);
+      allow delete: if isValidDocId(productId);
     }
 
-    // Customers collection
+    // Customers & Loyalty Balances
     match /customers/{customerId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(customerId);
+      allow create, update: if isValidDocId(customerId) && isValidCustomer(request.resource.data);
+      allow delete: if isValidDocId(customerId);
     }
 
-    // Customer categories collection
+    // Customer Categories
     match /customer_categories/{catId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(catId);
+      allow create, update: if isValidDocId(catId) && isValidCustomerCategory(request.resource.data);
+      allow delete: if isValidDocId(catId);
     }
 
-    // Transactions collection
+    // Sales Transactions (Financial Audit Trail: invoiceNumber immutable on update)
     match /transactions/{transactionId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(transactionId);
+      allow create: if isValidDocId(transactionId) && isValidTransaction(request.resource.data);
+      allow update: if isValidDocId(transactionId) &&
+                       isValidTransaction(request.resource.data) &&
+                       request.resource.data.invoiceNumber == resource.data.invoiceNumber;
+      allow delete: if isValidDocId(transactionId);
     }
 
-    // Suppliers collection
+    // Suppliers
     match /suppliers/{supplierId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(supplierId);
+      allow create, update: if isValidDocId(supplierId) && isValidSupplier(request.resource.data);
+      allow delete: if isValidDocId(supplierId);
     }
 
-    // Attendances collection
+    // Employee Attendance Shifts
     match /attendances/{attendanceId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(attendanceId);
+      allow create, update: if isValidDocId(attendanceId) && isValidAttendance(request.resource.data);
+      allow delete: if isValidDocId(attendanceId);
     }
 
-    // Stock Opname collection
+    // Stock Opname Audit Sessions (sessionNumber & date immutable once created)
     match /stock_opnames/{opnameId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(opnameId);
+      allow create: if isValidDocId(opnameId) && isValidStockOpname(request.resource.data);
+      allow update: if isValidDocId(opnameId) &&
+                       isValidStockOpname(request.resource.data) &&
+                       request.resource.data.sessionNumber == resource.data.sessionNumber;
+      allow delete: if isValidDocId(opnameId);
     }
 
-    // Purchases / Restock Orders collection
+    // Restock Purchases / POs
     match /purchases/{purchaseId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(purchaseId);
+      allow create, update: if isValidDocId(purchaseId) && isValidPurchase(request.resource.data);
+      allow delete: if isValidDocId(purchaseId);
     }
 
-    // Cashflows (Pengeluaran & Pemasukan)
+    // Cashflow Records (Expenses & Misc Income)
     match /cashflows/{cashflowId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(cashflowId);
+      allow create, update: if isValidDocId(cashflowId) && isValidCashflow(request.resource.data);
+      allow delete: if isValidDocId(cashflowId);
     }
 
-    // Store settings collection
+    // Store Configuration Singleton (only store_config writable, non-deletable)
     match /settings/{settingId} {
-      allow read, write: if true;
+      allow read: if isValidDocId(settingId);
+      allow create, update: if settingId == 'store_config' && isValidStoreSettings(request.resource.data);
+      allow delete: if false;
     }
 
-    // Online storefront orders collection
+    // Online Storefront Orders (Immutable orderCode & totalAmount once placed)
     match /online_orders/{orderId} {
-      allow read: if true;
-      allow create, update: if isValidOnlineOrder(request.resource.data);
-      allow delete: if true;
+      allow read: if isValidDocId(orderId);
+      allow create: if isValidDocId(orderId) &&
+                       isValidOnlineOrder(request.resource.data) &&
+                       request.resource.data.status == 'MENUNGGU_KONFIRMASI';
+      allow update: if isValidDocId(orderId) &&
+                       isValidOnlineOrder(request.resource.data) &&
+                       request.resource.data.orderCode == resource.data.orderCode &&
+                       request.resource.data.totalAmount == resource.data.totalAmount;
+      allow delete: if isValidDocId(orderId);
+    }
+
+    // Employee Sensitive Actions Audit Trail (Immutable log entries)
+    match /activity_logs/{logId} {
+      allow read: if isValidDocId(logId);
+      allow create: if isValidDocId(logId) && isValidActivityLog(request.resource.data);
+      allow update: if false;
+      allow delete: if isValidDocId(logId);
+    }
+
+    // Digital Receipt Email Dispatch Queue (Immutable client queue for Firebase Trigger Email)
+    match /mail/{mailId} {
+      allow read: if isValidDocId(mailId);
+      allow create: if isValidDocId(mailId) && isValidMail(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // Default Deny Catch-All for any unrecognized path or subcollection
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

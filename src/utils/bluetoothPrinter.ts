@@ -116,34 +116,100 @@ export function generateEscPosBytes(
   pushLine(divider);
 
   // 4. Items List
-  transaction.items.forEach((item) => {
-    // Product Name (can wrap if long, with variant if present)
-    const displayName = item.selectedVariant ? `${item.productName} (${item.selectedVariant})` : item.productName;
-    pushLine(displayName);
+  let totalWithdrawalNominal = 0;
+  let totalWithdrawalAdminFee = 0;
+  let hasWithdrawalItem = false;
 
-    // Details: "  2 PCS x Rp 15.000" and total "Rp 30.000"
-    const leftDetail = `  ${item.quantity} ${item.unitName} x ${formatRupiah(item.unitPrice)}`;
-    const rightTotal = formatRupiah(item.totalAmount);
-    pushLine(formatTwoCols(leftDetail, rightTotal));
+  // Helper to print label + value safely within thermal line width
+  const pushTwoColsSafe = (leftLabel: string, rightValue: string, bold: boolean = false) => {
+    if (bold) push(ESC, 0x45, 0x01);
+    if (leftLabel.length + rightValue.length + 1 <= maxChars) {
+      pushLine(formatTwoCols(leftLabel, rightValue));
+    } else {
+      pushLine(leftLabel);
+      pushLine(formatTwoCols('', rightValue));
+    }
+    if (bold) push(ESC, 0x45, 0x00);
+  };
+
+  transaction.items.forEach((item) => {
+    const isCashWithdrawalItem =
+      Boolean(item.isCashWithdrawal) ||
+      (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+    const qty = Math.max(1, item.quantity || 1);
+    const hasCustomBreakdown = isCashWithdrawalItem || (item.adminFee || 0) > 0;
+
+    if (hasCustomBreakdown) {
+      const principalPerUnit =
+        item.principalAmount !== undefined
+          ? Math.max(0, item.principalAmount)
+          : isCashWithdrawalItem
+          ? Math.max(0, item.costPrice !== undefined ? item.costPrice : item.unitPrice - (item.adminFee || 0))
+          : Math.max(0, item.unitPrice - (item.adminFee || 0));
+      const adminFeePerUnit =
+        item.adminFee !== undefined
+          ? Math.max(0, item.adminFee)
+          : Math.max(0, item.unitPrice - principalPerUnit);
+
+      const lineNominalTotal = qty * principalPerUnit;
+      const lineAdminTotal = qty * adminFeePerUnit;
+
+      if (isCashWithdrawalItem) {
+        hasWithdrawalItem = true;
+        totalWithdrawalNominal += lineNominalTotal;
+      }
+      totalWithdrawalAdminFee += lineAdminTotal;
+
+      // Primary item row: 'Tarik Tunai' (or product name) with nominal tarik
+      const primaryTitle = isCashWithdrawalItem
+        ? item.selectedVariant
+          ? `Tarik Tunai (${item.selectedVariant})`
+          : 'Tarik Tunai'
+        : item.selectedVariant
+        ? `${item.productName} (${item.selectedVariant})`
+        : item.productName;
+      pushLine(primaryTitle);
+
+      const primaryQtyDetail = `  ${qty} ${item.unitName} x ${formatRupiah(principalPerUnit)}`;
+      pushTwoColsSafe(primaryQtyDetail, formatRupiah(lineNominalTotal));
+
+      // Separate line for Biaya Admin
+      const adminQtyDetail = `  Biaya Admin${qty > 1 ? ` (${qty}x)` : ''}`;
+      pushTwoColsSafe(adminQtyDetail, formatRupiah(lineAdminTotal));
+    } else {
+      // Standard catalog / service product row
+      const displayName = item.selectedVariant ? `${item.productName} (${item.selectedVariant})` : item.productName;
+      pushLine(displayName);
+
+      const leftDetail = `  ${item.quantity} ${item.unitName} x ${formatRupiah(item.unitPrice)}`;
+      const rightTotal = formatRupiah(item.totalAmount);
+      pushTwoColsSafe(leftDetail, rightTotal);
+    }
   });
 
   // Divider
   pushLine(divider);
 
   // 5. Financial Summary
-  pushLine(formatTwoCols('Subtotal:', formatRupiah(transaction.subtotal)));
+  if (hasWithdrawalItem && totalWithdrawalNominal > 0) {
+    pushTwoColsSafe('Total Nominal Tarik:', formatRupiah(totalWithdrawalNominal), true);
+  }
+
+  if (totalWithdrawalAdminFee > 0) {
+    pushTwoColsSafe('Biaya Admin:', formatRupiah(totalWithdrawalAdminFee));
+  }
+
+  pushTwoColsSafe('Subtotal:', formatRupiah(transaction.subtotal));
 
   if (transaction.pointsDiscountAmount > 0) {
-    pushLine(formatTwoCols(`Diskon Poin (${transaction.pointsUsed} pts):`, `-${formatRupiah(transaction.pointsDiscountAmount)}`));
+    pushTwoColsSafe(`Diskon Poin (${transaction.pointsUsed} pts):`, `-${formatRupiah(transaction.pointsDiscountAmount)}`);
   }
   if (transaction.discount > 0) {
-    pushLine(formatTwoCols('Diskon Tambahan:', `-${formatRupiah(transaction.discount)}`));
+    pushTwoColsSafe('Diskon Tambahan:', `-${formatRupiah(transaction.discount)}`);
   }
 
   // Total (Bold)
-  push(ESC, 0x45, 0x01); // Bold ON
-  pushLine(formatTwoCols('TOTAL AKHIR:', formatRupiah(transaction.finalAmount)));
-  push(ESC, 0x45, 0x00); // Bold OFF
+  pushTwoColsSafe('TOTAL AKHIR:', formatRupiah(transaction.finalAmount), true);
 
   // Divider
   pushLine(doubleDivider);
@@ -280,40 +346,9 @@ let activeBluetoothDevice: any = null;
 let activeCharacteristic: any = null;
 
 /**
- * Connects directly to a Bluetooth thermal printer via Web Bluetooth API
+ * Discovers a writable GATT characteristic from a connected Bluetooth GATT server
  */
-export async function connectBluetoothDevice(): Promise<{ name: string }> {
-  if (!isWebBluetoothSupported()) {
-    throw new Error('Web Bluetooth tidak didukung pada browser ini. Gunakan Google Chrome di Android/Desktop atau cetak via RawBT / Driver Sistem.');
-  }
-
-  if (!isBluetoothAllowedByPolicy()) {
-    throw new PrinterPolicyError('bluetooth');
-  }
-
-  const nav = navigator as any;
-
-  // Request Bluetooth Device (catch Permissions-Policy SecurityError gracefully)
-  let device: any;
-  try {
-    device = await nav.bluetooth.requestDevice({
-      acceptAllDevices: true,
-      optionalServices: PRINTER_SERVICES,
-    });
-  } catch (err: any) {
-    if (isPrinterPolicyError(err)) {
-      throw new PrinterPolicyError('bluetooth');
-    }
-    throw err;
-  }
-
-  if (!device.gatt) {
-    throw new Error('Perangkat Bluetooth tidak memiliki GATT server.');
-  }
-
-  const server = await device.gatt.connect();
-
-  // Try finding writable characteristic across common services
+async function findWritableCharacteristic(server: any): Promise<any> {
   let writeChar: any = null;
 
   for (const serviceUuid of PRINTER_SERVICES) {
@@ -351,6 +386,107 @@ export async function connectBluetoothDevice(): Promise<{ name: string }> {
     }
   }
 
+  return writeChar;
+}
+
+/**
+ * Attempts to silently reconnect to a previously permitted saved Bluetooth printer
+ * via navigator.bluetooth.getDevices() without triggering a browser pairing dialog.
+ */
+export async function reconnectSavedBluetoothDevice(
+  preferredDeviceName?: string
+): Promise<{ name: string } | null> {
+  if (!isWebBluetoothSupported() || !isBluetoothAllowedByPolicy()) {
+    return null;
+  }
+
+  const nav = navigator as any;
+  if (!nav.bluetooth || typeof nav.bluetooth.getDevices !== 'function') {
+    return null;
+  }
+
+  try {
+    const devices: any[] = await nav.bluetooth.getDevices();
+    if (!Array.isArray(devices) || devices.length === 0) {
+      return null;
+    }
+
+    const normalizedPref = (preferredDeviceName || '').trim().toLowerCase();
+    const sortedDevices = [...devices].sort((a, b) => {
+      if (!normalizedPref) return 0;
+      const aName = String(a?.name || '').toLowerCase();
+      const bName = String(b?.name || '').toLowerCase();
+      const aExact = aName === normalizedPref ? 2 : aName.includes(normalizedPref) ? 1 : 0;
+      const bExact = bName === normalizedPref ? 2 : bName.includes(normalizedPref) ? 1 : 0;
+      return bExact - aExact;
+    });
+
+    for (const device of sortedDevices) {
+      if (!device?.gatt) continue;
+      if (normalizedPref) {
+        const devName = String(device?.name || '').toLowerCase();
+        if (!devName || (!devName.includes(normalizedPref) && !normalizedPref.includes(devName))) {
+          // Only try non-matching devices if there was no match at all? Better to skip if user explicitly saved another printer name, unless only 1 permitted device exists.
+          if (sortedDevices.length > 1) continue;
+        }
+      }
+
+      try {
+        const server = device.gatt.connected ? device.gatt : await device.gatt.connect();
+        const writeChar = await findWritableCharacteristic(server);
+        if (writeChar) {
+          activeBluetoothDevice = device;
+          activeCharacteristic = writeChar;
+          return { name: device.name || preferredDeviceName || 'Printer Bluetooth' };
+        }
+      } catch {
+        // Device unreachable / powered off; continue checking next saved device
+      }
+    }
+  } catch (err) {
+    if (isPrinterPolicyError(err)) {
+      throw new PrinterPolicyError('bluetooth');
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Connects directly to a Bluetooth thermal printer via Web Bluetooth API
+ */
+export async function connectBluetoothDevice(): Promise<{ name: string }> {
+  if (!isWebBluetoothSupported()) {
+    throw new Error('Web Bluetooth tidak didukung pada browser ini. Gunakan Google Chrome di Android/Desktop atau cetak via RawBT / Driver Sistem.');
+  }
+
+  if (!isBluetoothAllowedByPolicy()) {
+    throw new PrinterPolicyError('bluetooth');
+  }
+
+  const nav = navigator as any;
+
+  // Request Bluetooth Device (catch Permissions-Policy SecurityError gracefully)
+  let device: any;
+  try {
+    device = await nav.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: PRINTER_SERVICES,
+    });
+  } catch (err: any) {
+    if (isPrinterPolicyError(err)) {
+      throw new PrinterPolicyError('bluetooth');
+    }
+    throw err;
+  }
+
+  if (!device.gatt) {
+    throw new Error('Perangkat Bluetooth tidak memiliki GATT server.');
+  }
+
+  const server = await device.gatt.connect();
+  const writeChar = await findWritableCharacteristic(server);
+
   if (!writeChar) {
     throw new Error('Tidak ditemukan karakteristik cetak pada printer Bluetooth yang dipilih.');
   }
@@ -362,7 +498,8 @@ export async function connectBluetoothDevice(): Promise<{ name: string }> {
 }
 
 /**
- * Sends ESC/POS byte commands in chunks to the connected Bluetooth thermal printer
+ * Sends ESC/POS byte commands in chunks to the connected Bluetooth thermal printer.
+ * Automatically attempts silent reconnection to the saved Bluetooth printer before prompting.
  */
 export async function printDirectBluetooth(
   transaction: Transaction,
@@ -370,7 +507,10 @@ export async function printDirectBluetooth(
   paperSize: PaperSize = '58mm'
 ): Promise<void> {
   if (!activeCharacteristic || !activeBluetoothDevice?.gatt?.connected) {
-    await connectBluetoothDevice();
+    const reconnected = await reconnectSavedBluetoothDevice(storeSettings.printerDeviceName);
+    if (!reconnected) {
+      await connectBluetoothDevice();
+    }
   }
 
   if (!activeCharacteristic) {

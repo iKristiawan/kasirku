@@ -85,6 +85,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   const [phone, setPhone] = useState('');
   const [whatsapp, setWhatsapp] = useState('');
   const [sameAsPhone, setSameAsPhone] = useState(true);
+  const [email, setEmail] = useState('');
   const [address, setAddress] = useState('');
   const [customerCategory, setCustomerCategory] = useState<string>('REGULER');
   const [isMember, setIsMember] = useState<boolean>(false);
@@ -363,6 +364,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       name: name.trim(),
       phone: phone.trim(),
       whatsapp: sameAsPhone ? phone.trim() : (whatsapp.trim() || phone.trim()),
+      email: email.trim().toLowerCase() || undefined,
       address: address.trim(),
       customerCategory: customerCategory.trim() || 'REGULER',
       isMember,
@@ -374,6 +376,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     setName('');
     setPhone('');
     setWhatsapp('');
+    setEmail('');
     setAddress('');
     setCustomerCategory('REGULER');
     setIsMember(false);
@@ -700,6 +703,19 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                     className="w-full p-2.5 rounded-xl border border-slate-300 text-xs md:text-sm font-mono focus:border-sky-500 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">
+                  Alamat Email Pelanggan (Opsional - untuk Struk Email)
+                </label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="Contoh: pelanggan@email.com"
+                  className="w-full p-2.5 rounded-xl border border-slate-300 text-xs md:text-sm focus:border-sky-500 focus:outline-none"
+                />
               </div>
 
               <div>

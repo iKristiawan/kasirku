@@ -21,11 +21,17 @@ import {
   Star,
   Send,
   Edit3,
-  MessageSquare
+  MessageSquare,
+  Mail
 } from 'lucide-react';
 import { Transaction, StoreSettings, Customer } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateTime, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import {
+  sendReceiptEmailViaFirebase,
+  subscribeMailDeliveryStatus,
+  FirebaseMailDeliveryState,
+} from '../utils/firebaseSync';
 import { 
   PaperSize, 
   isWebBluetoothSupported, 
@@ -59,6 +65,12 @@ interface ReceiptModalProps {
       comment?: string;
       channel?: 'RECEIPT_MODAL' | 'DIGITAL_LINK';
     }
+  ) => void;
+  onSaveReceiptEmail?: (
+    transactionId: string,
+    email: string,
+    customerId?: string,
+    saveToCustomerProfile?: boolean
   ) => void;
 }
 
@@ -99,6 +111,7 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   onAutoPrintHandled,
   isDigitalLinkMode = false,
   onRateTransaction,
+  onSaveReceiptEmail,
 }) => {
   // Thermal paper roll size selection: '58mm' (Mobile Bluetooth) or '80mm' (Desktop)
   const [paperSize, setPaperSize] = useState<PaperSize>(storeSettings.printerPaperWidth || '58mm');
@@ -126,6 +139,19 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   const [isEditingRating, setIsEditingRating] = useState<boolean>(false);
   const [ratingSavedToast, setRatingSavedToast] = useState<boolean>(false);
   const [copiedDigitalLink, setCopiedDigitalLink] = useState<boolean>(false);
+
+  // Dynamic Customer Email Receipt states (Firebase Trigger Email)
+  const [recipientEmail, setRecipientEmail] = useState<string>('');
+  const [saveEmailToCustomer, setSaveEmailToCustomer] = useState<boolean>(true);
+  const [isSendingEmail, setIsSendingEmail] = useState<boolean>(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [emailDispatchStatus, setEmailDispatchStatus] = useState<{
+    mailId: string;
+    toEmail: string;
+    state: FirebaseMailDeliveryState;
+    error?: string;
+    sentAt: number;
+  } | null>(null);
 
   const autoWaAnchorRef = useRef<HTMLAnchorElement>(null);
   const autoTriggeredTxIdRef = useRef<string | null>(null);
@@ -198,6 +224,15 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       setIsEditingRating(!transaction.customerRating);
       setRatingSavedToast(false);
       setCopiedDigitalLink(false);
+      const initialEmail =
+        transaction.receiptEmailSentTo ||
+        transaction.customerEmail ||
+        matchedCustomer?.email ||
+        '';
+      setRecipientEmail(initialEmail);
+      setSaveEmailToCustomer(Boolean(matchedCustomer && !matchedCustomer.email));
+      setEmailError(null);
+      setEmailDispatchStatus(null);
     } else if (!isOpen) {
       autoTriggeredTxIdRef.current = null;
       autoPrintTriggeredTxIdRef.current = null;
@@ -206,8 +241,36 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       setCopiedWaText(false);
       setRatingSavedToast(false);
       setCopiedDigitalLink(false);
+      setIsSendingEmail(false);
+      setEmailError(null);
+      setEmailDispatchStatus(null);
     }
-  }, [isOpen, transaction?.id, transaction?.customerRating, storeSettings.printerPaperWidth]);
+  }, [
+    isOpen,
+    transaction?.id,
+    transaction?.customerRating,
+    transaction?.customerEmail,
+    transaction?.receiptEmailSentTo,
+    matchedCustomer?.email,
+    storeSettings.printerPaperWidth,
+  ]);
+
+  // Subscribe to Firebase Trigger Email `delivery.state` once a mail doc is queued
+  useEffect(() => {
+    if (!isOpen || !emailDispatchStatus?.mailId) return;
+    const unsubscribe = subscribeMailDeliveryStatus(emailDispatchStatus.mailId, (update) => {
+      setEmailDispatchStatus((prev) =>
+        prev && prev.mailId === update.mailId
+          ? {
+              ...prev,
+              state: update.state,
+              error: update.error,
+            }
+          : prev
+      );
+    });
+    return () => unsubscribe();
+  }, [isOpen, emailDispatchStatus?.mailId]);
 
   // Auto-Print Receipt immediately after successful payment if enabled in Settings
   useEffect(() => {
@@ -457,8 +520,12 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
     transaction.items.forEach((item) => {
       const varStr = item.selectedVariant ? ` (${item.selectedVariant})` : '';
       itemLines.push(`${item.productName}${varStr}`);
+      const hasFeeDetail = (item.adminFee || 0) > 0 && item.principalAmount !== undefined;
+      const feeSuffix = hasFeeDetail
+        ? ` [Nominal ${formatRupiah(item.principalAmount || 0)} + Admin ${formatRupiah(item.adminFee || 0)}]`
+        : '';
       itemLines.push(
-        `  ${item.quantity} ${item.unitName} x ${formatRupiah(item.unitPrice)} = ${formatRupiah(item.totalAmount)}`
+        `  ${item.quantity} ${item.unitName} x ${formatRupiah(item.unitPrice)} = ${formatRupiah(item.totalAmount)}${feeSuffix}`
       );
     });
 
@@ -615,6 +682,158 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
     }
     setCopiedDigitalLink(true);
     setTimeout(() => setCopiedDigitalLink(false), 2500);
+  };
+
+  const isValidEmailFormat = (value: string): boolean =>
+    /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim());
+
+  const escapeHtml = (unsafe: string): string =>
+    unsafe
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  const buildEmailReceiptHtml = (): string => {
+    const itemsRows = transaction.items
+      .map((item) => {
+        const variantPart = item.selectedVariant ? ` (${escapeHtml(item.selectedVariant)})` : '';
+        return `
+          <tr>
+            <td style="padding:8px 0;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;">
+              <strong>${escapeHtml(item.productName)}${variantPart}</strong><br/>
+              <span style="color:#64748b;font-size:12px;">${formatNumber(item.quantity)} ${escapeHtml(item.unitName)} &times; ${escapeHtml(formatRupiah(item.unitPrice))}</span>
+            </td>
+            <td style="padding:8px 0;border-bottom:1px solid #e2e8f0;text-align:right;font-family:monospace;font-weight:700;color:#0f172a;font-size:13px;">
+              ${escapeHtml(formatRupiah(item.totalAmount))}
+            </td>
+          </tr>
+        `;
+      })
+      .join('');
+
+    const discountRow =
+      transaction.discount > 0
+        ? `<tr><td style="padding:4px 0;color:#475569;">Diskon</td><td style="padding:4px 0;text-align:right;color:#059669;font-family:monospace;">-${escapeHtml(formatRupiah(transaction.discount))}</td></tr>`
+        : '';
+    const pointsRow =
+      transaction.pointsDiscountAmount > 0
+        ? `<tr><td style="padding:4px 0;color:#475569;">Potongan Poin (${formatNumber(transaction.pointsUsed)} Pts)</td><td style="padding:4px 0;text-align:right;color:#059669;font-family:monospace;">-${escapeHtml(formatRupiah(transaction.pointsDiscountAmount))}</td></tr>`
+        : '';
+    const pointsEarnedLine =
+      transaction.pointsEarned > 0
+        ? `<p style="margin:12px 0 0;padding:10px 12px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;color:#065f46;font-size:12px;"><strong>Poin Loyalitas Diperoleh:</strong> +${formatNumber(transaction.pointsEarned)} Poin</p>`
+        : '';
+    const noteLine = transaction.notes?.trim()
+      ? `<p style="margin:8px 0 0;color:#475569;font-size:12px;"><strong>Catatan:</strong> ${escapeHtml(transaction.notes.trim())}</p>`
+      : '';
+
+    return `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f8fafc;">
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:24px;">
+          <div style="border-bottom:2px solid #0f172a;padding-bottom:14px;margin-bottom:16px;">
+            <h2 style="margin:0;color:#0f172a;font-size:18px;">${escapeHtml(storeSettings.storeName)}</h2>
+            ${storeSettings.storeAddress ? `<p style="margin:4px 0 0;color:#64748b;font-size:12px;">${escapeHtml(storeSettings.storeAddress)}</p>` : ''}
+            ${storeSettings.storePhone ? `<p style="margin:2px 0 0;color:#64748b;font-size:12px;">Telp: ${escapeHtml(storeSettings.storePhone)}</p>` : ''}
+          </div>
+          <div style="font-size:12px;color:#334155;line-height:1.6;margin-bottom:16px;">
+            <div><strong>No. Nota:</strong> <span style="font-family:monospace;">${escapeHtml(transaction.invoiceNumber)}</span></div>
+            <div><strong>Waktu:</strong> ${escapeHtml(formatDateTime(transaction.timestamp))}</div>
+            <div><strong>Kasir:</strong> ${escapeHtml(transaction.cashierName)}</div>
+            <div><strong>Pelanggan:</strong> ${escapeHtml(transaction.customerName || 'Pelanggan Umum')}</div>
+          </div>
+          <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+            <tbody>${itemsRows}</tbody>
+          </table>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tbody>
+              <tr><td style="padding:4px 0;color:#475569;">Subtotal</td><td style="padding:4px 0;text-align:right;font-family:monospace;">${escapeHtml(formatRupiah(transaction.subtotal))}</td></tr>
+              ${discountRow}
+              ${pointsRow}
+              <tr><td style="padding:10px 0 4px;border-top:2px solid #0f172a;font-weight:700;font-size:15px;color:#0f172a;">TOTAL AKHIR</td><td style="padding:10px 0 4px;border-top:2px solid #0f172a;text-align:right;font-weight:800;font-size:15px;font-family:monospace;color:#0f172a;">${escapeHtml(formatRupiah(transaction.finalAmount))}</td></tr>
+              <tr><td style="padding:4px 0;color:#475569;">Metode Pembayaran</td><td style="padding:4px 0;text-align:right;font-weight:600;color:#0f172a;">${escapeHtml(String(transaction.paymentMethod || 'TUNAI').replace(/_/g, ' '))} (${escapeHtml(transaction.paymentStatus)})</td></tr>
+            </tbody>
+          </table>
+          ${noteLine}
+          ${pointsEarnedLine}
+          <p style="margin:18px 0 0;padding-top:12px;border-top:1px dashed #cbd5e1;text-align:center;color:#64748b;font-size:12px;">
+            ${escapeHtml(storeSettings.storeFooterReceipt || 'Terima kasih telah berbelanja!')}
+          </p>
+        </div>
+      </div>
+    `.trim();
+  };
+
+  const handleSendReceiptEmail = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!transaction || isSendingEmail) return;
+
+    const trimmedEmail = recipientEmail.trim().toLowerCase();
+    if (!trimmedEmail) {
+      sound.playError();
+      setEmailError('Masukkan alamat email pelanggan terlebih dahulu.');
+      return;
+    }
+    if (!isValidEmailFormat(trimmedEmail)) {
+      sound.playError();
+      setEmailError('Format email tidak valid. Contoh yang benar: pelanggan@domain.com');
+      return;
+    }
+
+    sound.playTap();
+    setEmailError(null);
+    setIsSendingEmail(true);
+
+    try {
+      const subject = `Struk Pembelian ${transaction.invoiceNumber} - ${storeSettings.storeName}`;
+      const textBody = whatsappMessage.replace(/\*/g, '');
+      const htmlBody = buildEmailReceiptHtml();
+
+      const mailId = await sendReceiptEmailViaFirebase({
+        toEmail: trimmedEmail,
+        subject,
+        textBody,
+        htmlBody,
+        transactionId: transaction.id,
+        invoiceNumber: transaction.invoiceNumber,
+        storeName: storeSettings.storeName,
+        customerName: transaction.customerName,
+        finalAmount: transaction.finalAmount,
+      });
+
+      onSaveReceiptEmail?.(
+        transaction.id,
+        trimmedEmail,
+        matchedCustomer?.id,
+        Boolean(matchedCustomer && saveEmailToCustomer)
+      );
+
+      sound.playSuccessChime();
+      setEmailDispatchStatus({
+        mailId,
+        toEmail: trimmedEmail,
+        state: 'QUEUED',
+        sentAt: Date.now(),
+      });
+    } catch (err) {
+      sound.playError();
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      let friendlyMessage = rawMessage;
+      try {
+        const parsed = JSON.parse(rawMessage) as { error?: string };
+        if (parsed?.error) friendlyMessage = parsed.error;
+      } catch {
+        // Not a JSON FirestoreErrorInfo payload
+      }
+      setEmailError(
+        friendlyMessage.includes('Mode Offline')
+          ? friendlyMessage
+          : `Gagal memicu email melalui Firebase: ${friendlyMessage}`
+      );
+    } finally {
+      setIsSendingEmail(false);
+    }
   };
 
   const activeStarValue = hoveredRating || selectedRating;
@@ -952,6 +1171,11 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
                       {formatRupiah(item.totalAmount)}
                     </span>
                   </div>
+                  {((item.adminFee || 0) > 0 || item.isCashWithdrawal) && item.principalAmount !== undefined && (
+                    <div className="text-[9.5px] text-slate-500 pl-1">
+                      Nominal: {formatRupiah(item.principalAmount)} + Biaya Admin: {formatRupiah(item.adminFee || 0)}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -1075,6 +1299,141 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
             {/* Thermal paper feeder cut margin */}
             <div className="thermal-paper-feed"></div>
           </div>
+          </div>
+
+          {/* Send Receipt via Email (Firebase Trigger Email - Hidden on Print) */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3 no-print">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <Mail className="w-4 h-4 text-sky-600 shrink-0" />
+                  <h4 className="text-xs font-extrabold text-slate-900">
+                    Kirim Struk via Email (Firebase)
+                  </h4>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Masukkan email pelanggan untuk mengirim ringkasan transaksi &amp; rincian item secara otomatis melalui antrean Firebase.
+                </p>
+              </div>
+              {transaction.receiptEmailSentTo && !emailDispatchStatus && (
+                <span className="px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-bold shrink-0">
+                  Pernah Terkirim
+                </span>
+              )}
+            </div>
+
+            <form onSubmit={handleSendReceiptEmail} className="space-y-2.5">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <div className="relative flex-1">
+                  <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="email"
+                    value={recipientEmail}
+                    onChange={(e) => {
+                      setRecipientEmail(e.target.value);
+                      if (emailError) setEmailError(null);
+                    }}
+                    placeholder="email.pelanggan@contoh.com"
+                    aria-label="Email pelanggan penerima struk"
+                    className="w-full pl-8 pr-3 py-2 rounded-xl border border-slate-300 bg-white text-xs font-medium text-slate-900 focus:border-sky-500 focus:outline-none"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSendingEmail}
+                  className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:bg-sky-300 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+                >
+                  {isSendingEmail ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                      <span>Mengirim...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-3.5 h-3.5 shrink-0" />
+                      <span>Kirim Email Struk</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {matchedCustomer && (
+                <div className="flex items-center justify-between gap-2 flex-wrap text-[11px]">
+                  <label className="inline-flex items-center gap-1.5 text-slate-600 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={saveEmailToCustomer}
+                      onChange={(e) => setSaveEmailToCustomer(e.target.checked)}
+                      className="rounded text-sky-600 focus:ring-sky-500"
+                    />
+                    <span>
+                      Simpan email ke profil <strong>{matchedCustomer.name}</strong>
+                    </span>
+                  </label>
+                  {matchedCustomer.email &&
+                    recipientEmail.trim().toLowerCase() !== matchedCustomer.email.toLowerCase() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setRecipientEmail(matchedCustomer.email || '');
+                          setEmailError(null);
+                        }}
+                        className="text-sky-700 hover:text-sky-600 font-semibold underline cursor-pointer"
+                      >
+                        Gunakan email profil ({matchedCustomer.email})
+                      </button>
+                    )}
+                </div>
+              )}
+            </form>
+
+            {emailError && (
+              <div className="px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-[11px] font-semibold flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span>{emailError}</span>
+              </div>
+            )}
+
+            {emailDispatchStatus && (
+              <div
+                className={`px-3 py-2.5 rounded-xl border text-[11px] flex items-start justify-between gap-2 ${
+                  emailDispatchStatus.state === 'ERROR'
+                    ? 'bg-rose-50 border-rose-200 text-rose-900'
+                    : emailDispatchStatus.state === 'SUCCESS'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                    : 'bg-sky-50 border-sky-200 text-sky-900'
+                }`}
+              >
+                <div className="flex items-start gap-2 min-w-0">
+                  {emailDispatchStatus.state === 'PROCESSING' ||
+                  emailDispatchStatus.state === 'PENDING' ? (
+                    <Loader2 className="w-4 h-4 text-sky-600 animate-spin shrink-0 mt-0.5" />
+                  ) : emailDispatchStatus.state === 'ERROR' ? (
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  ) : (
+                    <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  )}
+                  <div className="min-w-0">
+                    <div className="font-bold">
+                      {emailDispatchStatus.state === 'SUCCESS'
+                        ? `Email struk berhasil terkirim ke ${emailDispatchStatus.toEmail}`
+                        : emailDispatchStatus.state === 'ERROR'
+                        ? `Pengiriman email gagal ke ${emailDispatchStatus.toEmail}`
+                        : emailDispatchStatus.state === 'PROCESSING'
+                        ? `Sedang memproses pengiriman ke ${emailDispatchStatus.toEmail}...`
+                        : `Email struk dipicu via Firebase ke ${emailDispatchStatus.toEmail}`}
+                    </div>
+                    <p className="text-[10.5px] opacity-80 mt-0.5">
+                      {emailDispatchStatus.error
+                        ? emailDispatchStatus.error
+                        : `Nota ${transaction.invoiceNumber} tercatat di antrean email Firebase (${formatDateTime(emailDispatchStatus.sentAt)}).`}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Customer Satisfaction Star Rating Widget (Digital Receipt Page - Hidden on Print) */}

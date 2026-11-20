@@ -70,10 +70,25 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
     .filter((tx) => tx.paymentMethod === 'PIUTANG')
     .reduce((acc, tx) => acc + tx.finalAmount, 0);
 
+  const tarikTunaiCashOut = shiftTx.reduce((acc, tx) => {
+    const txOut = (tx.items || []).reduce((itemSum, item) => {
+      const isTarikTunai =
+        Boolean(item.isCashWithdrawal) ||
+        (Boolean(item.isQuickSale) && /tarik\s*tunai/i.test(item.productName || ''));
+      if (!isTarikTunai) return itemSum;
+      const principalPerUnit =
+        item.principalAmount !== undefined
+          ? Math.max(0, item.principalAmount)
+          : Math.max(0, item.costPrice || 0);
+      return itemSum + (item.quantity || 0) * principalPerUnit;
+    }, 0);
+    return acc + txOut;
+  }, 0);
+
   const grandTotalShift = cashTotal + qrisTotal + edcTotal + transferTotal + piutangTotal;
 
   // Cash drawer reconciliation
-  const expectedCashInDrawer = openingCashFloat + cashTotal;
+  const expectedCashInDrawer = openingCashFloat + cashTotal - tarikTunaiCashOut;
   const parsedPhysicalCash = parseFloat(countedPhysicalCash) || 0;
   const cashDiscrepancy = parsedPhysicalCash - expectedCashInDrawer;
 
@@ -182,6 +197,9 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
 
     printRow('Modal Awal (Float)', formatRupiah(openingCashFloat));
     printRow('Penerimaan Tunai', formatRupiah(cashTotal));
+    if (tarikTunaiCashOut > 0) {
+      printRow('Keluar Tarik Tunai', '-' + formatRupiah(tarikTunaiCashOut));
+    }
     printRow('Target Uang di Laci', formatRupiah(expectedCashInDrawer), true);
     printRow('Kas Fisik Aktual', formatRupiah(parsedPhysicalCash), true);
 
@@ -271,7 +289,8 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
       row(['Komponen Rekonsiliasi', 'Nominal (Rp)', 'Keterangan']),
       row(['Modal Awal Laci (Opening Float)', openingCashFloat, 'Kas awal shift']),
       row(['Penerimaan Tunai Shift', cashTotal, `${cashCount} transaksi tunai`]),
-      row(['Target Kas di Laci (Expected Cash)', expectedCashInDrawer, 'Modal Awal + Penerimaan Tunai']),
+      ...(tarikTunaiCashOut > 0 ? [row(['Pengurangan Kas (Tarik Tunai)', -tarikTunaiCashOut, 'Uang tunai diserahkan ke pelanggan'])] : []),
+      row(['Target Kas di Laci (Expected Cash)', expectedCashInDrawer, 'Modal Awal + Penerimaan Tunai - Tarik Tunai']),
       row(['Hitungan Kas Fisik Aktual (Counted Cash)', parsedPhysicalCash, 'Input fisik petugas']),
       row(['Selisih Kas (Discrepancy)', cashDiscrepancy, discrepancyStatus]),
       '',
@@ -506,9 +525,18 @@ export const ShiftSummaryModal: React.FC<ShiftSummaryModalProps> = ({
               </div>
             </div>
 
+            {tarikTunaiCashOut > 0 && (
+              <div className="p-2 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-between text-[11px] font-mono">
+                <span className="text-rose-800 font-semibold font-sans">Pengurangan Kas (Tarik Tunai):</span>
+                <span className="font-bold text-rose-700">-{formatRupiah(tarikTunaiCashOut)}</span>
+              </div>
+            )}
+
             <div className="pt-2 border-t border-amber-200/80 flex items-center justify-between font-mono">
               <div>
-                <span className="text-[10px] text-slate-500 block">Target di Laci (Modal + Tunai)</span>
+                <span className="text-[10px] text-slate-500 block">
+                  {tarikTunaiCashOut > 0 ? 'Target di Laci (Modal + Tunai - Tarik Tunai)' : 'Target di Laci (Modal + Tunai)'}
+                </span>
                 <span className="font-bold text-slate-800 text-xs">{formatRupiah(expectedCashInDrawer)}</span>
               </div>
 

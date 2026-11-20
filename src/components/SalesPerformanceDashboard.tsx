@@ -85,6 +85,7 @@ import { ChartThemeProvider, useChartTheme } from './ChartThemeContext';
 import { ChartThemeSelector } from './ChartThemeSelector';
 import { ShiftEfficiencyCard } from './ShiftEfficiencyCard';
 import { CategorySalesTargetEvaluationPanel } from './CategorySalesTargetEvaluationPanel';
+import { PiutangDueAlertBanner } from './PiutangDueAlertBanner';
 
 interface SalesPerformanceDashboardProps {
   transactions: Transaction[];
@@ -96,6 +97,8 @@ interface SalesPerformanceDashboardProps {
   attendances?: AttendanceRecord[];
   currentUserRole?: UserRole;
   storeName?: string;
+  bcaAccountNumber?: string;
+  bcaAccountName?: string;
   dailySalesGoal?: number;
   weeklySalesGoal?: number;
   monthlySalesGoal?: number;
@@ -103,6 +106,7 @@ interface SalesPerformanceDashboardProps {
   chartTheme?: ChartColorThemeConfig;
   onUpdateChartTheme?: (theme: ChartColorThemeConfig) => void;
   onOpenSettings?: () => void;
+  onNavigateToPiutang?: () => void;
   onSaveProducts?: (products: Product[]) => Promise<void> | void;
 }
 
@@ -122,11 +126,14 @@ const SalesPerformanceDashboardContent: React.FC<
   attendances = [],
   currentUserRole = 'ADMIN',
   storeName = 'KasirKu POS',
+  bcaAccountNumber,
+  bcaAccountName,
   dailySalesGoal = 5000000,
   weeklySalesGoal = 30000000,
   monthlySalesGoal = 120000000,
   categorySalesGoals = {},
   onOpenSettings,
+  onNavigateToPiutang,
   onSaveProducts,
 }) => {
   const { palette, isDefaultTheme } = useChartTheme();
@@ -2119,6 +2126,9 @@ const SalesPerformanceDashboardContent: React.FC<
       const ts = getCashflowLocalMs(c);
 
       if (c.type === 'PENGELUARAN') {
+        if (c.isCashWithdrawalOutflow || c.category === 'Tarik Tunai (Kas Keluar)') {
+          return;
+        }
         if (ts >= currentStart && ts <= currentEnd) {
           periodExpenses += amt;
           periodExpenseCount += 1;
@@ -2135,6 +2145,9 @@ const SalesPerformanceDashboardContent: React.FC<
           mtdExpenses += amt;
         }
       } else if (c.type === 'PEMASUKAN') {
+        if (c.isCashWithdrawalAdminProfit || c.category === 'Keuntungan Biaya Admin (Tarik Tunai)') {
+          return;
+        }
         if (ts >= currentStart && ts <= currentEnd) {
           periodOtherIncome += amt;
         }
@@ -2439,6 +2452,16 @@ const SalesPerformanceDashboardContent: React.FC<
 
   return (
     <div className="space-y-5 animate-dashboard-enter">
+      {/* Pengingat Otomatis Piutang Pelanggan Jatuh Tempo (<= 3 Hari ke Depan & Lewat Tempo) */}
+      <PiutangDueAlertBanner
+        transactions={transactions}
+        customers={customers}
+        storeName={storeName}
+        bcaAccountNumber={bcaAccountNumber}
+        bcaAccountName={bcaAccountName}
+        onNavigateToPiutang={onNavigateToPiutang}
+      />
+
       {/* Top Compact Responsive KPI & Shift Summary Grid (Tablet & Desktop Above-the-Fold Optimized) */}
       <div className="bg-white p-3 md:p-3.5 rounded-2xl border border-slate-200 shadow-2xs space-y-2.5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-100">
@@ -3610,7 +3633,7 @@ const SalesPerformanceDashboardContent: React.FC<
         onResetCategoryFilter={handleSelectAllCategories}
       />
 
-      {/* Grafik Garis Interaktif: Perbandingan Tren Total Pendapatan Harian 30 Hari Terakhir */}
+      {/* Grafik Area Recharts: Tren Penjualan Harian 30 Hari Terakhir */}
       <ThirtyDayRevenueTrendChart
         transactions={transactions}
         productMap={productMap}

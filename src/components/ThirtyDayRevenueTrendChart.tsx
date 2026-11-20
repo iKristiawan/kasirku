@@ -1,8 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import {
   ResponsiveContainer,
-  LineChart,
-  Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -269,15 +269,15 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className="text-sm md:text-base font-bold text-slate-900 flex items-center gap-2">
               <TrendingUp className="w-4 h-4 text-sky-600" />
-              <span>Tren Total Pendapatan Harian (30 Hari Terakhir)</span>
+              <span>Tren Penjualan Harian (30 Hari Terakhir)</span>
             </h3>
-            <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200 inline-flex items-center gap-1">
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200 inline-flex items-center gap-1 tabular-nums">
               <Calendar className="w-3 h-3" />
               <span>{rangeLabel}</span>
             </span>
             {hasPrev30dData && (
               <span
-                className={`px-2 py-0.5 rounded-lg text-[10px] font-bold inline-flex items-center gap-1 border ${
+                className={`px-2 py-0.5 rounded-md text-[10px] font-bold inline-flex items-center gap-1 border tabular-nums ${
                   isGrowthPositive
                     ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                     : 'bg-rose-50 text-rose-700 border-rose-200'
@@ -295,17 +295,17 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
               </span>
             )}
             {specificSelectedCategoryName ? (
-              <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
                 Kategori: {specificSelectedCategoryName}
               </span>
             ) : isCategoryFiltered ? (
-              <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
                 Terfilter: {activeCategoryCount}/{totalCategoriesCount} Kategori
               </span>
             ) : null}
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            Grafik garis interaktif untuk memantau pola musiman penjualan 30 hari terakhir dibandingkan dengan periode 30 hari sebelumnya ({prevRangeLabel}).
+            Grafik area interaktif tren penjualan harian selama 30 hari terakhir dibandingkan dengan periode 30 hari sebelumnya ({prevRangeLabel}).
           </p>
         </div>
 
@@ -413,7 +413,7 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
         </div>
       </div>
 
-      {/* Interactive Recharts Line Chart */}
+      {/* Interactive Recharts Area Chart */}
       <AnimatedChartStage
         filterKey={`trend-30d-${showPrev30d}-${showMovingAvg}-${activeCategoryCount}-${Array.from(hiddenCategorySet).join(',')}`}
         accent="sky"
@@ -442,12 +442,22 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
           <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-2 bg-slate-50 rounded-2xl border border-dashed border-slate-200 p-6">
             <TrendingUp className="w-8 h-8 text-slate-300" />
             <p className="text-xs font-bold text-slate-600">
-              Belum ada data transaksi dalam 30 hari terakhir untuk menampilkan pola tren musiman
+              Belum ada data transaksi dalam 30 hari terakhir untuk menampilkan grafik area tren penjualan
             </p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={dailyPoints} margin={{ top: 16, right: 16, left: 10, bottom: 8 }}>
+            <AreaChart data={dailyPoints} margin={{ top: 16, right: 16, left: 10, bottom: 8 }}>
+              <defs>
+                <linearGradient id="grad30dCurrent" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={palette.primary} stopOpacity={0.34} />
+                  <stop offset="95%" stopColor={palette.primary} stopOpacity={0.03} />
+                </linearGradient>
+                <linearGradient id="grad30dPrev" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={palette.neutral} stopOpacity={0.18} />
+                  <stop offset="95%" stopColor={palette.neutral} stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={palette.grid} />
               <XAxis
                 dataKey="dateLabel"
@@ -561,13 +571,15 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
               />
 
               {showPrev30d && (
-                <Line
+                <Area
                   type="monotone"
                   dataKey="previousRevenue"
                   name="30 Hari Sebelumnya"
                   stroke={palette.neutral}
                   strokeWidth={2}
                   strokeDasharray="5 4"
+                  fill="url(#grad30dPrev)"
+                  fillOpacity={1}
                   dot={false}
                   activeDot={{ r: 4, fill: palette.neutral, stroke: '#ffffff', strokeWidth: 2 }}
                   isAnimationActive={true}
@@ -577,12 +589,14 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
               )}
 
               {showMovingAvg && (
-                <Line
+                <Area
                   type="monotone"
                   dataKey="movingAvg7d"
                   name="Rata-rata Bergerak 7H (MA-7)"
                   stroke={palette.positive}
                   strokeWidth={2}
+                  fill="none"
+                  fillOpacity={0}
                   dot={false}
                   activeDot={{ r: 4, fill: palette.positive, stroke: '#ffffff', strokeWidth: 2 }}
                   isAnimationActive={true}
@@ -591,12 +605,14 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
                 />
               )}
 
-              <Line
+              <Area
                 type="monotone"
                 dataKey="currentRevenue"
                 name="Pendapatan Harian (30H Terakhir)"
                 stroke={palette.primary}
                 strokeWidth={2.75}
+                fill="url(#grad30dCurrent)"
+                fillOpacity={1}
                 isAnimationActive={true}
                 animationDuration={620}
                 animationEasing="ease-out"
@@ -620,7 +636,7 @@ export const ThirtyDayRevenueTrendChart: React.FC<ThirtyDayRevenueTrendChartProp
                 }}
                 activeDot={{ r: 6, fill: palette.primary, stroke: '#ffffff', strokeWidth: 2 }}
               />
-            </LineChart>
+            </AreaChart>
           </ResponsiveContainer>
         )}
       </AnimatedChartStage>
