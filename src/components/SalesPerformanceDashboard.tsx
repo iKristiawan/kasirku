@@ -55,9 +55,10 @@ import {
   Award,
   Wallet,
   Receipt,
-  Star
+  Star,
+  Minus
 } from 'lucide-react';
-import { Transaction, Product, ProductCategory, Supplier, UserRole, CashflowRecord, Customer, AttendanceRecord, ChartColorThemeConfig, CategorySalesGoal } from '../types/pos';
+import { Transaction, Product, ProductCategory, Supplier, UserRole, CashflowRecord, Customer, AttendanceRecord, ChartColorThemeConfig, CategorySalesGoal, RestockOrder, TaxAdjustment, TaxRecord, StoreSettings } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateTime, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { getCategoryColor } from '../utils/categoryColors';
@@ -67,12 +68,15 @@ import { FifoGrossProfitAuditPanel } from './FifoGrossProfitAuditPanel';
 import { BatchStockIntegrityPanel } from './BatchStockIntegrityPanel';
 import { CategoryTrendFilterBar } from './CategoryTrendFilterBar';
 import { GrossProfitMarginChart } from './GrossProfitMarginChart';
+import { CategoryProfitMarginChart } from './CategoryProfitMarginChart';
 import { TopProductsByMarginTable } from './TopProductsByMarginTable';
+import { CategorySalesPieChart } from './CategorySalesPieChart';
 import { CategoryStockPieChart } from './CategoryStockPieChart';
 import { GrossProfitByCategoryPanel } from './GrossProfitByCategoryPanel';
 import { HourlyTransactionChart } from './HourlyTransactionChart';
 import { WeeklyRevenueComparisonAreaChart } from './WeeklyRevenueComparisonAreaChart';
 import { ThirtyDayRevenueTrendChart } from './ThirtyDayRevenueTrendChart';
+import { ThirtyDayNetProfitLineChart } from './ThirtyDayNetProfitLineChart';
 import { PaymentMethodDonutChart } from './PaymentMethodDonutChart';
 import { ProductStockThresholdChart } from './ProductStockThresholdChart';
 import { StockRunwayProjectionCard } from './StockRunwayProjectionCard';
@@ -86,6 +90,10 @@ import { ChartThemeSelector } from './ChartThemeSelector';
 import { ShiftEfficiencyCard } from './ShiftEfficiencyCard';
 import { CategorySalesTargetEvaluationPanel } from './CategorySalesTargetEvaluationPanel';
 import { PiutangDueAlertBanner } from './PiutangDueAlertBanner';
+import { TaxDueAlertBanner } from './TaxDueAlertBanner';
+import { PkpThresholdAlertBanner } from './PkpThresholdAlertBanner';
+import { ProductVolumeMarginScatterChart } from './ProductVolumeMarginScatterChart';
+import { CrossBranchStockPanel } from './CrossBranchStockPanel';
 
 interface SalesPerformanceDashboardProps {
   transactions: Transaction[];
@@ -108,6 +116,13 @@ interface SalesPerformanceDashboardProps {
   onOpenSettings?: () => void;
   onNavigateToPiutang?: () => void;
   onSaveProducts?: (products: Product[]) => Promise<void> | void;
+  purchases?: RestockOrder[];
+  taxRecords?: TaxRecord[];
+  taxAdjustments?: TaxAdjustment[];
+  storeSettings?: StoreSettings;
+  onUpdateStoreSettings?: (nextSettings: StoreSettings) => void;
+  onNavigateToTax?: () => void;
+  currentUserName?: string;
 }
 
 type PeriodType = 'THIS_WEEK' | 'LAST_WEEK' | 'LAST_14_DAYS' | 'LAST_30_DAYS';
@@ -135,6 +150,13 @@ const SalesPerformanceDashboardContent: React.FC<
   onOpenSettings,
   onNavigateToPiutang,
   onSaveProducts,
+  purchases = [],
+  taxRecords = [],
+  taxAdjustments = [],
+  storeSettings,
+  onUpdateStoreSettings,
+  onNavigateToTax,
+  currentUserName,
 }) => {
   const { palette, isDefaultTheme } = useChartTheme();
   const [period, setPeriod] = useState<PeriodType>('THIS_WEEK');
@@ -1337,6 +1359,155 @@ const SalesPerformanceDashboardContent: React.FC<
     };
   }, [transactions, productMap, hiddenCategorySet]);
 
+  // Rata-rata Persentase Margin Keuntungan Kotor Seluruh Transaksi: Bulan Ini vs Bulan Sebelumnya
+  const monthlyGrossMarginComparison = useMemo(() => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth();
+
+    const curMonthStartMs = new Date(year, month, 1, 0, 0, 0, 0).getTime();
+    const curMonthEndMs = new Date(year, month + 1, 0, 23, 59, 59, 999).getTime();
+    const prevMonthStartMs = new Date(year, month - 1, 1, 0, 0, 0, 0).getTime();
+    const prevMonthEndMs = curMonthStartMs - 1;
+
+    const prevMonthRef = new Date(year, month - 1, 1);
+    const curMonthLabel = now.toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+    const prevMonthLabel = prevMonthRef.toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+    const curMonthShort = now.toLocaleDateString('id-ID', { month: 'short', year: 'numeric' });
+    const prevMonthShort = prevMonthRef.toLocaleDateString('id-ID', { month: 'short', year: 'numeric' });
+
+    const isFiltered = hiddenCategorySet.size > 0;
+
+    let curTxCount = 0;
+    let curMarginPercentSum = 0;
+    let curTotalRevenue = 0;
+    let curTotalCogs = 0;
+    let curLowMarginCount = 0;
+    let curHighMarginCount = 0;
+
+    let prevTxCount = 0;
+    let prevMarginPercentSum = 0;
+    let prevTotalRevenue = 0;
+    let prevTotalCogs = 0;
+
+    transactions.forEach((tx) => {
+      const ts = tx.timestamp;
+      const inCurMonth = ts >= curMonthStartMs && ts <= curMonthEndMs;
+      const inPrevMonth = ts >= prevMonthStartMs && ts <= prevMonthEndMs;
+      if (!inCurMonth && !inPrevMonth) return;
+
+      let txRev = 0;
+      let txCogs = 0;
+      let matched = false;
+
+      (tx.items || []).forEach((item) => {
+        const prod = productMap.get(item.productId);
+        if (isFiltered) {
+          const catName = (prod?.category || 'Umum').trim() || 'Umum';
+          if (hiddenCategorySet.has(catName)) return;
+        }
+        txRev += item.totalAmount || 0;
+        txCogs += getItemFifoCogs(item, prod);
+        matched = true;
+      });
+
+      if (!matched || txRev <= 0) return;
+
+      const txGrossProfit = txRev - txCogs;
+      const txMarginPercent = (txGrossProfit / txRev) * 100;
+
+      if (inCurMonth) {
+        curTxCount += 1;
+        curMarginPercentSum += txMarginPercent;
+        curTotalRevenue += txRev;
+        curTotalCogs += txCogs;
+        if (txMarginPercent < 15) curLowMarginCount += 1;
+        if (txMarginPercent >= 30) curHighMarginCount += 1;
+      } else if (inPrevMonth) {
+        prevTxCount += 1;
+        prevMarginPercentSum += txMarginPercent;
+        prevTotalRevenue += txRev;
+        prevTotalCogs += txCogs;
+      }
+    });
+
+    const curAvgTxMargin = curTxCount > 0 ? curMarginPercentSum / curTxCount : 0;
+    const prevAvgTxMargin = prevTxCount > 0 ? prevMarginPercentSum / prevTxCount : 0;
+
+    const curGrossProfit = curTotalRevenue - curTotalCogs;
+    const prevGrossProfit = prevTotalRevenue - prevTotalCogs;
+    const curWeightedMargin = curTotalRevenue > 0 ? (curGrossProfit / curTotalRevenue) * 100 : 0;
+    const prevWeightedMargin = prevTotalRevenue > 0 ? (prevGrossProfit / prevTotalRevenue) * 100 : 0;
+
+    const hasCurData = curTxCount > 0;
+    const hasPrevData = prevTxCount > 0;
+    const deltaPoints = hasCurData && hasPrevData ? curAvgTxMargin - prevAvgTxMargin : 0;
+    const weightedDeltaPoints = hasCurData && hasPrevData ? curWeightedMargin - prevWeightedMargin : 0;
+
+    let evaluationLabel = 'Belum Ada Transaksi';
+    let evaluationTone: 'POSITIVE' | 'NEUTRAL' | 'WARNING' = 'NEUTRAL';
+    let pricingGuidance = 'Belum ada data transaksi pada bulan ini untuk dievaluasi.';
+
+    if (hasCurData) {
+      if (hasPrevData) {
+        if (deltaPoints >= 1) {
+          evaluationLabel = 'Penetapan Harga Membaik';
+          evaluationTone = 'POSITIVE';
+          pricingGuidance = `Rata-rata margin per transaksi naik ${deltaPoints.toFixed(1)} poin vs ${prevMonthShort}.`;
+        } else if (deltaPoints <= -1) {
+          evaluationLabel = 'Margin Terkoreksi';
+          evaluationTone = 'WARNING';
+          pricingGuidance =
+            curLowMarginCount > 0
+              ? `Turun ${Math.abs(deltaPoints).toFixed(1)} poin; ${formatNumber(curLowMarginCount)} transaksi bermargin <15%.`
+              : `Turun ${Math.abs(deltaPoints).toFixed(1)} poin; tinjau diskon atau kenaikan HPP.`;
+        } else {
+          evaluationLabel = 'Penetapan Harga Stabil';
+          evaluationTone = 'NEUTRAL';
+          pricingGuidance = `Selisih ${deltaPoints >= 0 ? '+' : ''}${deltaPoints.toFixed(1)} poin terhadap ${prevMonthShort}.`;
+        }
+      } else if (curAvgTxMargin >= 25) {
+        evaluationLabel = 'Margin Sehat';
+        evaluationTone = 'POSITIVE';
+        pricingGuidance = `Rata-rata margin ${curAvgTxMargin.toFixed(1)}% pada ${formatNumber(curTxCount)} transaksi bulan ini.`;
+      } else if (curAvgTxMargin >= 15) {
+        evaluationLabel = 'Margin Moderat';
+        evaluationTone = 'NEUTRAL';
+        pricingGuidance = 'Pembanding bulan lalu belum tersedia; pantau HPP & diskon berkala.';
+      } else {
+        evaluationLabel = 'Perlu Evaluasi Harga';
+        evaluationTone = 'WARNING';
+        pricingGuidance = `${formatNumber(curLowMarginCount)} transaksi bulan ini berada di bawah margin 15%.`;
+      }
+    }
+
+    return {
+      curMonthLabel,
+      prevMonthLabel,
+      curMonthShort,
+      prevMonthShort,
+      curTxCount,
+      curAvgTxMargin,
+      curTotalRevenue,
+      curGrossProfit,
+      curWeightedMargin,
+      curLowMarginCount,
+      curHighMarginCount,
+      prevTxCount,
+      prevAvgTxMargin,
+      prevTotalRevenue,
+      prevGrossProfit,
+      prevWeightedMargin,
+      hasCurData,
+      hasPrevData,
+      deltaPoints,
+      weightedDeltaPoints,
+      evaluationLabel,
+      evaluationTone,
+      pricingGuidance,
+    };
+  }, [transactions, productMap, hiddenCategorySet]);
+
   // Metrik 'Persentase Pelanggan Kembali' (Returning Customer Rate) berdasarkan riwayat transaksi
   const returningCustomerMetrics = useMemo(() => {
     const isFiltered = hiddenCategorySet.size > 0;
@@ -2462,6 +2633,31 @@ const SalesPerformanceDashboardContent: React.FC<
         onNavigateToPiutang={onNavigateToPiutang}
       />
 
+      {/* Notifikasi Peringatan Jatuh Tempo Pajak Bulanan (H-7 sebelum tgl 15 / Lewat Tempo) */}
+      {(currentUserRole === 'ADMIN' || currentUserRole === 'STORE_MANAGER') && storeSettings && (
+        <TaxDueAlertBanner
+          transactions={transactions}
+          purchases={purchases}
+          taxRecords={taxRecords}
+          taxAdjustments={taxAdjustments}
+          storeSettings={storeSettings}
+          variant="DASHBOARD"
+          onNavigateToTax={onNavigateToTax}
+        />
+      )}
+
+      {/* Peringatan Otomatis Ambang Batas Omzet PKP (Rp 4,8 Miliar / Tahun) */}
+      {(currentUserRole === 'ADMIN' || currentUserRole === 'STORE_MANAGER') && storeSettings && (
+        <PkpThresholdAlertBanner
+          transactions={transactions}
+          purchases={purchases}
+          taxRecords={taxRecords}
+          taxAdjustments={taxAdjustments}
+          storeSettings={storeSettings}
+          onNavigateToTax={onNavigateToTax}
+        />
+      )}
+
       {/* Top Compact Responsive KPI & Shift Summary Grid (Tablet & Desktop Above-the-Fold Optimized) */}
       <div className="bg-white p-3 md:p-3.5 rounded-2xl border border-slate-200 shadow-2xs space-y-2.5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-100">
@@ -2922,6 +3118,189 @@ const SalesPerformanceDashboardContent: React.FC<
                 <span className="font-mono font-semibold text-slate-800 tabular-nums">
                   {formatNumber(customerRetentionMonthly.retainedTxTotal)} / {formatNumber(customerRetentionMonthly.totalMonthIdentifiedTx)} trx
                 </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Kartu Ringkasan Evaluasi Penetapan Harga: Rata-rata Margin Keuntungan Kotor Bulan Ini vs Bulan Lalu */}
+        <div
+          className={`p-3 md:p-3.5 rounded-xl border ${
+            !monthlyGrossMarginComparison.hasCurData
+              ? 'bg-slate-50/70 border-slate-200'
+              : monthlyGrossMarginComparison.evaluationTone === 'POSITIVE'
+              ? 'bg-gradient-to-r from-emerald-50/85 via-white to-sky-50/50 border-emerald-200'
+              : monthlyGrossMarginComparison.evaluationTone === 'WARNING'
+              ? 'bg-gradient-to-r from-amber-50/90 via-white to-rose-50/50 border-amber-200'
+              : 'bg-gradient-to-r from-slate-50/90 via-white to-sky-50/40 border-slate-200'
+          }`}
+        >
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:gap-4 items-center">
+            {/* Primary Average Gross Margin Figure */}
+            <div className="md:col-span-5 space-y-1">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5 text-[10.5px] font-extrabold uppercase tracking-wide text-slate-700">
+                  <Percent
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      monthlyGrossMarginComparison.evaluationTone === 'POSITIVE'
+                        ? 'text-emerald-600'
+                        : monthlyGrossMarginComparison.evaluationTone === 'WARNING'
+                        ? 'text-amber-600'
+                        : 'text-sky-600'
+                    }`}
+                  />
+                  <span>
+                    Rata-Rata Margin Kotor ({monthlyGrossMarginComparison.curMonthLabel})
+                  </span>
+                </div>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-extrabold border whitespace-nowrap ${
+                    !monthlyGrossMarginComparison.hasCurData
+                      ? 'bg-slate-100 text-slate-600 border-slate-200'
+                      : monthlyGrossMarginComparison.evaluationTone === 'POSITIVE'
+                      ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                      : monthlyGrossMarginComparison.evaluationTone === 'WARNING'
+                      ? 'bg-amber-100 text-amber-800 border-amber-200'
+                      : 'bg-sky-100 text-sky-800 border-sky-200'
+                  }`}
+                >
+                  {monthlyGrossMarginComparison.evaluationTone === 'POSITIVE' ? (
+                    <TrendingUp className="w-3 h-3 shrink-0" />
+                  ) : monthlyGrossMarginComparison.evaluationTone === 'WARNING' ? (
+                    <TrendingDown className="w-3 h-3 shrink-0" />
+                  ) : (
+                    <Minus className="w-3 h-3 shrink-0" />
+                  )}
+                  <span>{monthlyGrossMarginComparison.evaluationLabel}</span>
+                </span>
+              </div>
+
+              <div className="flex items-baseline gap-2.5 flex-wrap">
+                <span
+                  className={`text-2xl md:text-[26px] font-black font-mono tabular-nums tracking-tight leading-none ${
+                    !monthlyGrossMarginComparison.hasCurData
+                      ? 'text-slate-400'
+                      : monthlyGrossMarginComparison.curAvgTxMargin >= 0
+                      ? 'text-slate-900'
+                      : 'text-rose-700'
+                  }`}
+                >
+                  {monthlyGrossMarginComparison.curAvgTxMargin.toFixed(1)}%
+                </span>
+
+                <span className="text-xs font-mono font-semibold text-slate-600 tabular-nums">
+                  rata-rata {formatNumber(monthlyGrossMarginComparison.curTxCount)} trx
+                </span>
+
+                {monthlyGrossMarginComparison.hasCurData &&
+                  monthlyGrossMarginComparison.hasPrevData && (
+                    <span
+                      className={`inline-flex items-center gap-0.5 text-[11px] font-mono font-bold tabular-nums ${
+                        monthlyGrossMarginComparison.deltaPoints >= 0
+                          ? 'text-emerald-700'
+                          : 'text-rose-700'
+                      }`}
+                    >
+                      {monthlyGrossMarginComparison.deltaPoints >= 0 ? (
+                        <ArrowUpRight className="w-3.5 h-3.5 shrink-0" />
+                      ) : (
+                        <ArrowDownRight className="w-3.5 h-3.5 shrink-0" />
+                      )}
+                      <span>
+                        {monthlyGrossMarginComparison.deltaPoints >= 0 ? '+' : ''}
+                        {monthlyGrossMarginComparison.deltaPoints.toFixed(1)} pts vs{' '}
+                        {monthlyGrossMarginComparison.prevMonthShort}
+                      </span>
+                    </span>
+                  )}
+              </div>
+
+              <div className="text-[11px] text-slate-600 flex items-center gap-1.5 flex-wrap">
+                <span>{monthlyGrossMarginComparison.pricingGuidance}</span>
+                {isCategoryFiltered && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-amber-700 font-semibold">
+                      Sesuai filter {activeCategoryCount} kategori aktif
+                    </span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Hairline-Divided Comparison & Pricing Diagnostic Columns */}
+            <div className="md:col-span-7 grid grid-cols-1 sm:grid-cols-3 gap-3 md:border-l md:border-slate-200/80 md:pl-4">
+              {/* Previous Month Comparison */}
+              <div className="space-y-0.5">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                  Bulan Lalu ({monthlyGrossMarginComparison.prevMonthShort})
+                </div>
+                <div className="text-sm md:text-base font-black font-mono text-slate-900 tabular-nums">
+                  {monthlyGrossMarginComparison.hasPrevData
+                    ? `${monthlyGrossMarginComparison.prevAvgTxMargin.toFixed(1)}%`
+                    : '—'}
+                </div>
+                <div className="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                  {monthlyGrossMarginComparison.hasPrevData
+                    ? `${formatNumber(monthlyGrossMarginComparison.prevTxCount)} trx · Laba ${formatRupiah(monthlyGrossMarginComparison.prevGrossProfit)}`
+                    : `Belum ada transaksi ${monthlyGrossMarginComparison.prevMonthShort}`}
+                </div>
+              </div>
+
+              {/* Weighted Margin vs Gross Profit */}
+              <div className="space-y-0.5 sm:border-l sm:border-slate-200/75 sm:pl-3">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                  Margin Agregat (FIFO)
+                </div>
+                <div className="text-sm md:text-base font-black font-mono text-slate-900 tabular-nums flex items-baseline gap-1.5">
+                  <span>{monthlyGrossMarginComparison.curWeightedMargin.toFixed(1)}%</span>
+                  {monthlyGrossMarginComparison.hasCurData &&
+                    monthlyGrossMarginComparison.hasPrevData && (
+                      <span
+                        className={`text-[10px] font-bold ${
+                          monthlyGrossMarginComparison.weightedDeltaPoints >= 0
+                            ? 'text-emerald-700'
+                            : 'text-rose-700'
+                        }`}
+                      >
+                        ({monthlyGrossMarginComparison.weightedDeltaPoints >= 0 ? '+' : ''}
+                        {monthlyGrossMarginComparison.weightedDeltaPoints.toFixed(1)} pts)
+                      </span>
+                    )}
+                </div>
+                <div className="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                  Laba {formatRupiah(monthlyGrossMarginComparison.curGrossProfit)} /{' '}
+                  {formatRupiah(monthlyGrossMarginComparison.curTotalRevenue)}
+                </div>
+              </div>
+
+              {/* Pricing Spread Diagnostics */}
+              <div className="space-y-0.5 sm:border-l sm:border-slate-200/75 sm:pl-3">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                  Sebaran Margin Transaksi
+                </div>
+                <div className="text-sm md:text-base font-black font-mono tabular-nums text-slate-900">
+                  {formatNumber(monthlyGrossMarginComparison.curHighMarginCount)}{' '}
+                  <span className="text-[11px] font-sans font-semibold text-emerald-700">
+                    ≥30%
+                  </span>
+                  <span className="text-slate-300 mx-1.5">/</span>
+                  {formatNumber(monthlyGrossMarginComparison.curLowMarginCount)}{' '}
+                  <span
+                    className={`text-[11px] font-sans font-semibold ${
+                      monthlyGrossMarginComparison.curLowMarginCount > 0
+                        ? 'text-amber-700'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    &lt;15%
+                  </span>
+                </div>
+                <div className="text-[10px] text-slate-500 truncate">
+                  {monthlyGrossMarginComparison.curLowMarginCount > 0
+                    ? 'Tinjau produk atau diskon bermargin tipis'
+                    : 'Tidak ada transaksi margin tipis (<15%)'}
+                </div>
               </div>
             </div>
           </div>
@@ -3636,6 +4015,19 @@ const SalesPerformanceDashboardContent: React.FC<
       {/* Grafik Area Recharts: Tren Penjualan Harian 30 Hari Terakhir */}
       <ThirtyDayRevenueTrendChart
         transactions={transactions}
+        productMap={productMap}
+        hiddenCategorySet={hiddenCategorySet}
+        totalCategoriesCount={categoryList.length}
+        activeCategoryCount={activeCategoryCount}
+        isCategoryFiltered={isCategoryFiltered}
+        specificSelectedCategoryName={specificSelectedCategoryName}
+        onResetCategoryFilter={handleSelectAllCategories}
+      />
+
+      {/* Grafik Garis Recharts: Tren Profit Bersih Harian 30 Hari Terakhir */}
+      <ThirtyDayNetProfitLineChart
+        transactions={transactions}
+        cashflows={cashflows}
         productMap={productMap}
         hiddenCategorySet={hiddenCategorySet}
         totalCategoriesCount={categoryList.length}
@@ -4702,6 +5094,27 @@ const SalesPerformanceDashboardContent: React.FC<
       </div>
       </ChartFullscreenShell>
 
+      {/* Dedicated Category Profit Margin % & Profitability Visualization */}
+      <CategoryProfitMarginChart
+        transactions={transactions}
+        products={products}
+        categories={categories}
+        productMap={productMap}
+        currentStart={currentStart}
+        currentEnd={currentEnd}
+        previousStart={previousStart}
+        previousEnd={previousEnd}
+        periodLabel={periodLabel}
+        previousLabel={previousLabel}
+        compareWithPrevious={compareWithPrevious}
+        hiddenCategorySet={hiddenCategorySet}
+        totalCategoriesCount={categoryList.length}
+        activeCategoryCount={activeCategoryCount}
+        isCategoryFiltered={isCategoryFiltered}
+        specificSelectedCategoryName={specificSelectedCategoryName}
+        onResetCategoryFilter={handleSelectAllCategories}
+      />
+
       {/* Gross Profit Margin % Component */}
       <GrossProfitMarginChart
         transactions={transactions}
@@ -4935,6 +5348,23 @@ const SalesPerformanceDashboardContent: React.FC<
         </AnimatedChartStage>
       </div>
       </ChartFullscreenShell>
+
+      {/* Distribusi Total Penjualan per Kategori Produk (Interactive Recharts Pie Chart) */}
+      <CategorySalesPieChart
+        transactions={transactions}
+        products={products}
+        categories={categories}
+        productMap={productMap}
+        currentStart={currentStart}
+        currentEnd={currentEnd}
+        periodLabel={periodLabel}
+        hiddenCategorySet={hiddenCategorySet}
+        totalCategoriesCount={categoryList.length}
+        activeCategoryCount={activeCategoryCount}
+        isCategoryFiltered={isCategoryFiltered}
+        specificSelectedCategoryName={specificSelectedCategoryName}
+        onResetCategoryFilter={handleSelectAllCategories}
+      />
 
       {/* 30-Day Gross Profit Margin Trend Line Chart per Category */}
       <ChartFullscreenShell
@@ -5591,6 +6021,21 @@ const SalesPerformanceDashboardContent: React.FC<
         onResetCategoryFilter={handleSelectAllCategories}
       />
 
+      {/* Scatter Plot Korelasi Volume Penjualan vs Margin Keuntungan per Produk */}
+      <ProductVolumeMarginScatterChart
+        transactions={transactions}
+        productMap={productMap}
+        currentStart={currentStart}
+        currentEnd={currentEnd}
+        periodLabel={periodLabel}
+        hiddenCategorySet={hiddenCategorySet}
+        totalCategoriesCount={categoryList.length}
+        activeCategoryCount={activeCategoryCount}
+        isCategoryFiltered={isCategoryFiltered}
+        specificSelectedCategoryName={specificSelectedCategoryName}
+        onResetCategoryFilter={handleSelectAllCategories}
+      />
+
       {/* Grafik Level Stok Produk & Garis Penanda Batas Minimum (Threshold Reorder) */}
       <div id="stock-threshold-chart-section">
         <ProductStockThresholdChart
@@ -5605,6 +6050,15 @@ const SalesPerformanceDashboardContent: React.FC<
         />
       </div>
 
+      {/* Pengecekan Stok Silang Antar Unit Toko & Koordinasi Mutasi Stok */}
+      <CrossBranchStockPanel
+        products={products}
+        storeSettings={storeSettings}
+        onUpdateStoreSettings={onUpdateStoreSettings}
+        onSaveProducts={onSaveProducts}
+        requestedByName={currentUserName}
+      />
+
       {/* Komposisi Stok Produk Berdasarkan Kategori (Interactive Pie Chart) */}
       <CategoryStockPieChart
         products={products}
@@ -5617,13 +6071,16 @@ const SalesPerformanceDashboardContent: React.FC<
         onResetCategoryFilter={handleSelectAllCategories}
       />
 
-      {/* Grafik Donut: Distribusi Metode Pembayaran (Cash, QRIS, Transfer, EDC, Piutang) */}
+      {/* Grafik Donut & Tabel Breakdown: Distribusi Metode Pembayaran (Cash, QRIS, Transfer, EDC, Piutang) */}
       <PaymentMethodDonutChart
         transactions={transactions}
         productMap={productMap}
         currentStart={currentStart}
         currentEnd={currentEnd}
+        previousStart={previousStart}
+        previousEnd={previousEnd}
         periodLabel={periodLabel}
+        previousLabel={previousLabel}
         hiddenCategorySet={hiddenCategorySet}
         totalCategoriesCount={categoryList.length}
         activeCategoryCount={activeCategoryCount}

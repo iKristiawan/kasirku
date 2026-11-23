@@ -10,6 +10,7 @@ import {
 import { formatDateTime, formatNumber, formatRupiah } from './formatters';
 import { getItemFifoCogs } from './fifoUtils';
 import { getLocalDateKey } from './adminLowStockAlert';
+import { buildStoreContactLine, drawPdfStoreHeader } from './pdfLogoHelper';
 
 const MONTH_NAMES_FULL_ID = [
   'Januari',
@@ -350,13 +351,13 @@ export function computeMonthlyStockMovementData(params: {
   };
 }
 
-export function generateMonthlyStockMovementPdf(params: {
+export async function generateMonthlyStockMovementPdf(params: {
   data: MonthlyStockMovementSummaryData;
   storeSettings?: StoreSettings;
   auditorName?: string;
   categoryFilter?: string;
   onlyWithMovement?: boolean;
-}): { doc: jsPDF; filename: string } {
+}): Promise<{ doc: jsPDF; filename: string }> {
   const {
     data,
     storeSettings,
@@ -369,35 +370,21 @@ export function generateMonthlyStockMovementPdf(params: {
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
   const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
-  const storeAddress = storeSettings?.storeAddress || '';
-  const storePhone = storeSettings?.storePhone || '';
+  const contactLine = buildStoreContactLine(storeSettings);
   const printedAt = formatDateTime(Date.now());
 
-  // Header Banner
-  doc.setFillColor(15, 23, 42);
-  doc.rect(0, 0, pageWidth, 26, 'F');
-
-  doc.setFontSize(14);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(255, 255, 255);
-  doc.text(`LAPORAN AUDIT PERGERAKAN STOK BULANAN`, 14, 11);
-
-  doc.setFontSize(9.5);
-  doc.setFont('helvetica', 'normal');
-  doc.setTextColor(186, 230, 253);
-  doc.text(
-    `${storeTitle.toUpperCase()}${storeAddress ? ' • ' + storeAddress : ''}${storePhone ? ' • Telp: ' + storePhone : ''}`,
-    14,
-    17
-  );
-
-  doc.setFontSize(8.5);
-  doc.setTextColor(226, 232, 240);
-  doc.text(
-    `Periode Audit: ${data.monthLabel} (${data.monthKey})  |  Filter Kategori: ${categoryFilter}  |  Dicetak: ${printedAt} oleh ${auditorName}`,
-    14,
-    22.5
-  );
+  const { bannerHeight } = await drawPdfStoreHeader({
+    doc,
+    title: 'LAPORAN AUDIT PERGERAKAN STOK BULANAN',
+    subtitle: `${storeTitle.toUpperCase()} · Periode Audit: ${data.monthLabel} (${data.monthKey})`,
+    contactLine: contactLine || `Filter Kategori: ${categoryFilter}`,
+    rightTopText: `Dicetak: ${printedAt}`,
+    rightBottomText: `Auditor: ${auditorName} · Kategori: ${categoryFilter}`,
+    storeSettings,
+    bannerColor: [15, 23, 42],
+    accentStripeColor: [2, 132, 199],
+    bannerHeight: 28,
+  });
 
   // KPI Audit Summary Grid Table
   const opnameSign = data.totalOpnameNetUnits > 0 ? '+' : '';
@@ -405,7 +392,7 @@ export function generateMonthlyStockMovementPdf(params: {
   const netSign = data.totalNetMovementUnits > 0 ? '+' : '';
 
   autoTable(doc, {
-    startY: 30,
+    startY: bannerHeight + 4,
     head: [
       [
         'TOTAL STOK MASUK (PO SELESAI)',

@@ -21,7 +21,8 @@ import {
   Clock,
   History,
   Printer,
-  Bluetooth
+  Bluetooth,
+  WifiOff
 } from 'lucide-react';
 import { PaymentMethod, Customer, StoreSettings, CustomPaymentMethod, PaymentMethodType } from '../types/pos';
 import { DEFAULT_PAYMENT_METHODS } from '../utils/mockData';
@@ -46,6 +47,7 @@ interface PaymentModalProps {
   tierDiscountPercent?: number;
   isAdmin?: boolean;
   defaultBackdated?: boolean;
+  isOfflineMode?: boolean;
   onConfirmPayment: (paymentData: {
     paymentMethod: PaymentMethod;
     cashPaid?: number;
@@ -89,6 +91,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
   tierDiscountPercent = 0,
   isAdmin = false,
   defaultBackdated = false,
+  isOfflineMode = false,
   onConfirmPayment,
   onOpenCustomerModal,
 }) => {
@@ -1585,6 +1588,20 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
                 />
               </button>
             </div>
+
+            {(isOfflineMode || storeSettings.manualOfflineMode || (typeof navigator !== 'undefined' && navigator.onLine === false)) && (
+              <div className="mt-3 p-2.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex items-center gap-2.5 text-xs">
+                <div className="w-7 h-7 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+                  <WifiOff className="w-4 h-4" />
+                </div>
+                <div className="min-w-0 leading-snug">
+                  <span className="font-bold">Mode Offline Aktif:</span>{' '}
+                  <span className="text-amber-800">
+                    Transaksi tetap diproses, disimpan aman di perangkat, dan masuk antrean sinkronisasi otomatis ke server saat internet kembali stabil.
+                  </span>
+                </div>
+              </div>
+            )}
 
             {/* Bottom Confirmation Bar */}
             <div className="pt-4 mt-3 border-t border-slate-200 flex items-center justify-between gap-3">

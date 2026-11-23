@@ -42,10 +42,30 @@ import {
   CalendarDays,
   ShieldCheck,
   Flame,
-  Trash2
+  Trash2,
+  Layers,
+  Wrench,
+  ChevronDown,
+  ChevronUp,
+  RefreshCw
 } from 'lucide-react';
-import { Product, Supplier, User, UserRole, StockOpnameRecord, StockOpnameItem, StoreSettings, Transaction, RestockOrder } from '../types/pos';
-import { formatRupiah, formatNumber, formatWhatsAppUrl } from '../utils/formatters';
+import {
+  BalanceSheetEntry,
+  CashflowRecord,
+  Product,
+  Supplier,
+  TaxAdjustment,
+  TaxRecord,
+  User,
+  UserRole,
+  StockOpnameRecord,
+  StockOpnameItem,
+  StockOpnameBatchDetail,
+  StoreSettings,
+  Transaction,
+  RestockOrder,
+} from '../types/pos';
+import { formatRupiah, formatNumber, formatWhatsAppUrl, formatDateOnly } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { TouchKeypadModal } from './TouchKeypadModal';
 import { InventoryHealthWidget } from './InventoryHealthWidget';
@@ -53,6 +73,9 @@ import { StockTurnoverHeatmap } from './StockTurnoverHeatmap';
 import { StockTurnRateModule } from './StockTurnRateModule';
 import { TopBottomMovingProductsChart } from './TopBottomMovingProductsChart';
 import { ExpiringClearanceModule } from './ExpiringClearanceModule';
+import { MonthlyStockMovementModal } from './MonthlyStockMovementModal';
+import { BatchHppSummarySection } from './BatchHppSummarySection';
+import { BatchIntegrityCheckReport, runBatchIntegrityCheck } from '../utils/batchIntegrity';
 import { analyzeStockTurnRate, TurnoverSpeedCategory } from '../utils/stockTurnRate';
 import {
   computeMonthlyStockMovementData,
@@ -60,6 +83,9 @@ import {
   getCurrentMonthKey,
   shiftMonthKey,
 } from '../utils/monthlyStockMovementPdf';
+import { exportStockAndProfitLossPdf } from '../utils/balanceSheetUtils';
+import { INITIAL_STORE_SETTINGS } from '../utils/mockData';
+import { addStandardPdfFooters, buildStoreContactLine, drawPdfStoreHeader } from '../utils/pdfLogoHelper';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
 
@@ -73,6 +99,14 @@ interface StockReportViewProps {
   storeSettings?: StoreSettings;
   transactions?: Transaction[];
   purchases?: RestockOrder[];
+  cashflows?: CashflowRecord[];
+  taxRecords?: TaxRecord[];
+  taxAdjustments?: TaxAdjustment[];
+  balanceSheetEntries?: BalanceSheetEntry[];
+  batchIntegrityReport?: BatchIntegrityCheckReport;
+  openVerifyStockNonce?: number;
+  onRecheckBatchIntegrity?: () => BatchIntegrityCheckReport | void;
+  onAutoFixAllBatchIntegrity?: () => number | void;
   onUpdateStock: (productId: string, newStock: number, reason?: string) => void;
   onUpdateProduct?: (updatedProduct: Product) => void;
   onBulkUpdateStock: (
@@ -123,6 +157,14 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   storeSettings,
   transactions = [],
   purchases = [],
+  cashflows = [],
+  taxRecords = [],
+  taxAdjustments = [],
+  balanceSheetEntries = [],
+  batchIntegrityReport,
+  openVerifyStockNonce = 0,
+  onRecheckBatchIntegrity,
+  onAutoFixAllBatchIntegrity,
   onUpdateStock,
   onUpdateProduct,
   onBulkUpdateStock,
@@ -131,8 +173,8 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   onNavigateToSuppliers,
   onInitiateRestockForProduct,
 }) => {
-  // Navigation Tabs: 'MONITORING' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'
-  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'>('MONITORING');
+  // Navigation Tabs: 'MONITORING' | 'BATCH_HPP' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'
+  const [activeSubTab, setActiveSubTab] = useState<'MONITORING' | 'BATCH_HPP' | 'STOCK_HEATMAP' | 'TURNOVER' | 'MONTHLY_AUDIT' | 'OPNAME_SESSION' | 'OPNAME_HISTORY' | 'FORECASTING' | 'REORDER_REPORT' | 'EXPIRY_TRACKER'>('MONITORING');
 
   // Stock Turn Rate & Liquidation states
   const [turnoverLookbackDays, setTurnoverLookbackDays] = useState<30 | 60 | 90>(90);
@@ -144,11 +186,22 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   const [auditCategoryFilter, setAuditCategoryFilter] = useState<string>('SEMUA');
   const [auditOnlyWithMovement, setAuditOnlyWithMovement] = useState<boolean>(false);
   const [auditSearch, setAuditSearch] = useState<string>('');
+  const [isMonthlyMovementModalOpen, setIsMonthlyMovementModalOpen] = useState<boolean>(false);
 
   // Verify Stock utility states
   const [showVerifyStockPanel, setShowVerifyStockPanel] = useState<boolean>(false);
   const [verifyShowOnlyIssues, setVerifyShowOnlyIssues] = useState<boolean>(true);
   const [verifyFeedbackMsg, setVerifyFeedbackMsg] = useState<string | null>(null);
+  const [isExportingOwnerPdf, setIsExportingOwnerPdf] = useState<boolean>(false);
+  const [ownerPdfNotice, setOwnerPdfNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (openVerifyStockNonce > 0) {
+      setActiveSubTab('MONITORING');
+      setShowVerifyStockPanel(true);
+      setVerifyShowOnlyIssues(true);
+    }
+  }, [openVerifyStockNonce]);
 
   // Optimal Reorder Quantity Report states
   const [reorderLookbackDays, setReorderLookbackDays] = useState<30 | 60 | 90>(30);
@@ -610,45 +663,27 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   }, [demandForecastingList, forecastingUrgency, deferredForecastingSearch]);
 
   // =========================================================================
-  // VERIFY STOCK UTILITY (Negative Batches, Negative Stock, Total vs Batch Mismatch)
+  // VERIFY STOCK UTILITY (Negative Batches, Negative Stock, Total vs Batch Mismatch, Cost)
   // =========================================================================
   const stockVerification = useMemo(() => {
-    const results = physicalProducts.map((p) => {
-      const batches = p.batches || [];
-      const negativeBatches = batches.filter((b) => (b.remainingQuantity || 0) < 0);
-      const hasNegativeTotal = p.stockInBaseUnit < 0;
-      const hasBatches = batches.length > 0;
-      const batchSum = batches.reduce((acc, b) => acc + (b.remainingQuantity || 0), 0);
-      const discrepancy = hasBatches ? p.stockInBaseUnit - batchSum : 0;
-      const hasBatchMismatch = hasBatches && Math.abs(discrepancy) > 0.0001;
-      const hasIssue = negativeBatches.length > 0 || hasNegativeTotal || hasBatchMismatch;
-
-      return {
-        product: p,
-        hasBatches,
-        batchCount: batches.length,
-        batchSum,
-        negativeBatches,
-        hasNegativeTotal,
-        hasBatchMismatch,
-        discrepancy,
-        hasIssue,
-      };
-    });
-
-    const resultMap = new Map(results.map((r) => [r.product.id, r]));
-    const issueItems = results.filter((r) => r.hasIssue);
-    const negativeBatchCount = results.filter((r) => r.negativeBatches.length > 0 || r.hasNegativeTotal).length;
-    const mismatchCount = results.filter((r) => r.hasBatchMismatch).length;
+    const report =
+      batchIntegrityReport ??
+      runBatchIntegrityCheck(physicalProducts, { source: 'MANUAL' });
+    const resultMap = new Map(report.results.map((r) => [r.product.id, r]));
+    const negativeBatchCount = report.results.filter(
+      (r) => r.negativeBatches.length > 0 || r.hasNegativeTotal
+    ).length;
 
     return {
-      results,
+      report,
+      results: report.results,
       resultMap,
-      issueItems,
+      issueItems: report.issueItems,
       negativeBatchCount,
-      mismatchCount,
+      mismatchCount: report.mismatchProductsCount,
+      negativeCostCount: report.negativeCostProductsCount,
     };
-  }, [physicalProducts]);
+  }, [batchIntegrityReport, physicalProducts]);
 
   // =========================================================================
   // OPTIMAL REORDER QUANTITY REPORT (Historical Transaction Demand + Variability)
@@ -867,28 +902,32 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  // Export Stock Report to PDF using jsPDF
-  // Export Stock Report to PDF using jsPDF
-  const handleExportStockPdf = () => {
+  // Export Stock Report to PDF using jsPDF (with Store Logo)
+  const handleExportStockPdf = async () => {
     sound.playTap();
-    const doc = new jsPDF({ orientation: 'landscape' });
-    const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
-    const storeAddr = storeSettings?.storeAddress || '';
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+    const effectiveSettings = storeSettings || INITIAL_STORE_SETTINGS;
+    const storeTitle = effectiveSettings.storeName || 'KasirKu Tablet POS';
+    const contactLine = buildStoreContactLine(effectiveSettings);
     const dateStr = new Date().toLocaleDateString('id-ID', { dateStyle: 'full' });
 
     if (activeSubTab === 'FORECASTING') {
-      // 1. Export Demand Forecasting & Restock Plan
-      doc.setFontSize(16);
-      doc.setTextColor(79, 70, 229); // Indigo 600
-      doc.text(`LAPORAN PROYEKSI DEMAND FORECASTING & RESTOCK - ${storeTitle.toUpperCase()}`, 14, 15);
-
-      doc.setFontSize(8.5);
-      doc.setTextColor(100, 116, 139);
-      doc.text(`Waktu Cetak: ${dateStr} | Toko: ${storeTitle} ${storeAddr ? '• ' + storeAddr : ''}`, 14, 21);
-
       const criticalCount = demandForecastingList.filter(f => f.urgency === 'CRITICAL_ZERO' || f.urgency === 'CRITICAL_MIN').length;
       const warningCount = demandForecastingList.filter(f => f.urgency === 'DUE_SOON_3D' || f.urgency === 'WARNING_7D').length;
       const totalEstimatedBudget = filteredForecastingList.reduce((acc, f) => acc + (f.recommendedReorderQty * f.product.costPrice), 0);
+
+      const { bannerHeight } = await drawPdfStoreHeader({
+        doc,
+        title: 'LAPORAN PROYEKSI DEMAND FORECASTING & RESTOCK',
+        subtitle: storeTitle.toUpperCase(),
+        contactLine,
+        rightTopText: `Dicetak: ${dateStr}`,
+        rightBottomText: `Kritis: ${criticalCount} · Est. Restock: ${formatRupiah(totalEstimatedBudget)}`,
+        storeSettings: effectiveSettings,
+        bannerColor: [49, 46, 129],
+        accentStripeColor: [99, 102, 241],
+        bannerHeight: 28,
+      });
 
       const getUrgencyText = (u: string) => {
         switch (u) {
@@ -900,10 +939,12 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         }
       };
 
+      doc.setFontSize(8.2);
+      doc.setTextColor(71, 85, 105);
       doc.text(
-        `Filter Urgensi: ${forecastingUrgency} | Kritis: ${criticalCount} Item | Menipis Segera: ${warningCount} Item | Total Estimasi Anggaran Restock: ${formatRupiah(totalEstimatedBudget)}`,
+        `Filter Urgensi: ${forecastingUrgency} | Item Kritis: ${criticalCount} | Menipis Segera: ${warningCount} | Estimasi Anggaran Restock: ${formatRupiah(totalEstimatedBudget)}`,
         14,
-        26
+        bannerHeight + 5
       );
 
       const tableData = filteredForecastingList.map((item, idx) => {
@@ -925,7 +966,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       });
 
       autoTable(doc, {
-        startY: 31,
+        startY: bannerHeight + 8,
         head: [
           [
             'No',
@@ -958,36 +999,31 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         },
       });
 
-      const finalY = (doc as any).lastAutoTable?.finalY || 40;
-      doc.setFontSize(8);
-      doc.setTextColor(100, 116, 139);
-      doc.text(
-        `* Analisis Proyeksi Kebutuhan Stok Berdasarkan Riwayat Penjualan 30 Hari Terakhir - KasirKu Tablet POS.`,
-        14,
-        finalY + 8
-      );
-
-      const filename = `laporan-demand-forecasting-${new Date().toISOString().slice(0, 10)}.pdf`;
-      doc.save(filename);
+      addStandardPdfFooters(doc, `${storeTitle} — Analisis Demand Forecasting Stok 30 Hari Terakhir`);
+      doc.save(`laporan-demand-forecasting-${new Date().toISOString().slice(0, 10)}.pdf`);
     } else if (activeSubTab === 'REORDER_REPORT') {
-      doc.setFontSize(16);
-      doc.setTextColor(14, 116, 144);
-      doc.text(`LAPORAN OPTIMAL REORDER QUANTITY (HISTORIS ${reorderLookbackDays} HARI) - ${storeTitle.toUpperCase()}`, 14, 15);
-
-      doc.setFontSize(8.5);
-      doc.setTextColor(100, 116, 139);
-      doc.text(
-        `Waktu Cetak: ${dateStr} | Lead Time: ${reorderLeadTimeDays}h | Siklus Order: ${reorderCycleDays}h | Buffer Aman: ${reorderSafetyDays}h`,
-        14,
-        21
-      );
-
       const needCount = filteredOptimalReorderList.filter((r) => r.needsReorder).length;
       const totalModalPo = filteredOptimalReorderList.reduce((acc, r) => acc + r.estimatedOrderCost, 0);
+
+      const { bannerHeight } = await drawPdfStoreHeader({
+        doc,
+        title: `LAPORAN OPTIMAL REORDER QUANTITY (${reorderLookbackDays} HARI)`,
+        subtitle: storeTitle.toUpperCase(),
+        contactLine,
+        rightTopText: `SKU Perlu Order: ${needCount}`,
+        rightBottomText: `Est. Biaya PO: ${formatRupiah(totalModalPo)}`,
+        storeSettings: effectiveSettings,
+        bannerColor: [14, 116, 144],
+        accentStripeColor: [6, 182, 212],
+        bannerHeight: 28,
+      });
+
+      doc.setFontSize(8.2);
+      doc.setTextColor(71, 85, 105);
       doc.text(
-        `SKU Perlu Reorder: ${needCount} Item | Estimasi Total Anggaran Order Supplier: ${formatRupiah(totalModalPo)}`,
+        `Dicetak: ${dateStr} | Lead Time: ${reorderLeadTimeDays}h | Siklus Order: ${reorderCycleDays}h | Buffer Aman: ${reorderSafetyDays}h`,
         14,
-        26
+        bannerHeight + 5
       );
 
       const tableData = filteredOptimalReorderList.map((r, idx) => [
@@ -1005,7 +1041,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       ]);
 
       autoTable(doc, {
-        startY: 31,
+        startY: bannerHeight + 8,
         head: [
           [
             'No',
@@ -1028,54 +1064,78 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         alternateRowStyles: { fillColor: [248, 250, 252] },
       });
 
+      addStandardPdfFooters(doc, `${storeTitle} — Laporan Optimal Reorder Supplier`);
       doc.save(`laporan-optimal-reorder-${new Date().toISOString().slice(0, 10)}.pdf`);
     } else if (activeSubTab === 'MONTHLY_AUDIT') {
-      generateMonthlyStockMovementPdf({
+      await generateMonthlyStockMovementPdf({
         data: monthlyAuditData,
-        storeSettings,
+        storeSettings: effectiveSettings,
         auditorName: currentUser.name,
         categoryFilter: auditCategoryFilter,
         onlyWithMovement: auditOnlyWithMovement,
       });
     } else {
-      // 2. Export Standard Stock Inventory & Valuation Report
-      doc.setFontSize(16);
-      doc.setTextColor(15, 23, 42);
-      doc.text(`LAPORAN INVENTARIS & VALUASI STOK GUDANG - ${storeTitle.toUpperCase()}`, 14, 15);
+      // Standard Stock Inventory & Valuation Report (with Store Logo + Summary KPI Strip)
+      const outZeroCount = physicalProducts.filter((p) => p.stockInBaseUnit <= 0).length;
+      const { bannerHeight } = await drawPdfStoreHeader({
+        doc,
+        title: 'LAPORAN INVENTARIS & VALUASI STOK GUDANG',
+        subtitle: storeTitle.toUpperCase(),
+        contactLine,
+        rightTopText: `Dicetak: ${dateStr}`,
+        rightBottomText: `Penanggung Jawab: ${currentUser.name}`,
+        storeSettings: effectiveSettings,
+        bannerColor: [15, 23, 42],
+        accentStripeColor: [2, 132, 199],
+        bannerHeight: 28,
+      });
 
-      doc.setFontSize(8.5);
-      doc.setTextColor(100, 116, 139);
-      doc.text(`Waktu Cetak: ${dateStr} | Toko: ${storeTitle} ${storeAddr ? '• ' + storeAddr : ''}`, 14, 21);
+      const kpiY = bannerHeight + 4;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const boxW = (pageWidth - 28 - 9) / 4;
+      const summaryCards = [
+        { label: 'TOTAL VALUASI ASET (MODAL)', value: formatRupiah(totalValuation), bg: [240, 249, 255], txt: [3, 105, 161] },
+        { label: 'TOTAL SKU FISIK AKTIF', value: `${formatNumber(physicalProducts.length)} Item`, bg: [248, 250, 252], txt: [15, 23, 42] },
+        { label: 'STOK MENIPIS / KRITIS', value: `${formatNumber(lowStockProducts.length)} Item`, bg: [255, 247, 237], txt: [180, 83, 9] },
+        { label: 'STOK HABIS (0)', value: `${formatNumber(outZeroCount)} Item`, bg: [254, 242, 242], txt: [185, 28, 28] },
+      ];
+      summaryCards.forEach((c, idx) => {
+        const x = 14 + idx * (boxW + 3);
+        doc.setFillColor(c.bg[0], c.bg[1], c.bg[2]);
+        doc.setDrawColor(226, 232, 240);
+        doc.roundedRect(x, kpiY, boxW, 13.5, 1.8, 1.8, 'FD');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7);
+        doc.setTextColor(100, 116, 139);
+        doc.text(c.label, x + 3, kpiY + 4.8);
+        doc.setFontSize(9.5);
+        doc.setTextColor(c.txt[0], c.txt[1], c.txt[2]);
+        doc.text(c.value, x + 3, kpiY + 10.5);
+      });
 
-      doc.text(
-        `Total Valuasi Aset: ${formatRupiah(totalValuation)} | Total SKU: ${products.length} Item | Perlu Restock: ${lowStockProducts.length}`,
-        14,
-        26
-      );
-
-      const tableData = products.map((prod, idx) => {
+      const tableData = physicalProducts.map((prod, idx) => {
         const isLow = prod.stockInBaseUnit <= prod.minStockAlert;
         const isZero = prod.stockInBaseUnit <= 0;
         const statusText = isZero ? 'HABIS (0)' : isLow ? 'MENIPIS' : 'AMAN';
         return [
           (idx + 1).toString(),
-          prod.barcode,
+          prod.sku || prod.barcode,
           prod.name,
           prod.category,
           `${formatNumber(prod.stockInBaseUnit)} ${prod.baseUnit}`,
           `${formatNumber(prod.minStockAlert)} ${prod.baseUnit}`,
           formatRupiah(prod.costPrice),
-          formatRupiah(prod.stockInBaseUnit * prod.costPrice),
+          formatRupiah(Math.round(prod.stockInBaseUnit * prod.costPrice)),
           statusText,
         ];
       });
 
       autoTable(doc, {
-        startY: 31,
+        startY: kpiY + 17,
         head: [
           [
             'No',
-            'Barcode / SKU',
+            'SKU / Barcode',
             'Nama Produk',
             'Kategori',
             'Sisa Stok',
@@ -1090,29 +1150,62 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         headStyles: {
           fillColor: [15, 23, 42],
           textColor: 255,
-          fontSize: 8.5,
+          fontSize: 8.2,
           fontStyle: 'bold',
         },
         styles: {
-          fontSize: 8,
-          cellPadding: 2.5,
+          fontSize: 7.8,
+          cellPadding: 2.2,
+        },
+        columnStyles: {
+          0: { halign: 'center', cellWidth: 10 },
+          4: { halign: 'right' },
+          5: { halign: 'right' },
+          6: { halign: 'right', font: 'courier' },
+          7: { halign: 'right', font: 'courier', fontStyle: 'bold' },
+          8: { halign: 'center', fontStyle: 'bold' },
         },
         alternateRowStyles: {
           fillColor: [248, 250, 252],
         },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 8) {
+            const val = String(data.cell.raw || '');
+            if (val.startsWith('HABIS')) data.cell.styles.textColor = [190, 18, 60];
+            else if (val === 'MENIPIS') data.cell.styles.textColor = [180, 83, 9];
+            else data.cell.styles.textColor = [4, 120, 87];
+          }
+        },
       });
 
-      const finalY = (doc as any).lastAutoTable?.finalY || 40;
-      doc.setFontSize(8.5);
-      doc.setTextColor(100, 116, 139);
-      doc.text(
-        `* Laporan Inventaris Stok Digital Resmi KasirKu Tablet POS.`,
-        14,
-        finalY + 8
-      );
+      addStandardPdfFooters(doc, `${storeTitle} — Laporan Inventaris & Valuasi Stok Resmi (${dateStr})`);
+      doc.save(`laporan-stok-${new Date().toISOString().slice(0, 10)}.pdf`);
+    }
+    sound.playSuccessChime();
+  };
 
-      const filename = `laporan-stok-${new Date().toISOString().slice(0, 10)}.pdf`;
-      doc.save(filename);
+  const handleExportStockAndPnlOwnerPdf = async () => {
+    if (isExportingOwnerPdf) return;
+    sound.playTap();
+    setIsExportingOwnerPdf(true);
+    setOwnerPdfNotice(null);
+    try {
+      const { filename } = await exportStockAndProfitLossPdf({
+        periodMonth: auditMonthKey || getCurrentMonthKey(),
+        transactions,
+        products,
+        purchases,
+        cashflows,
+        taxRecords,
+        taxAdjustments,
+        manualEntries: balanceSheetEntries,
+        storeSettings: storeSettings || INITIAL_STORE_SETTINGS,
+        preparedBy: currentUser.name || 'Manajer Gudang',
+      });
+      sound.playSuccessChime();
+      setOwnerPdfNotice(`PDF Laporan Stok & Laba Rugi (${filename}) berhasil diunduh.`);
+    } finally {
+      setIsExportingOwnerPdf(false);
     }
   };
 
@@ -1147,8 +1240,14 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
     };
   }>({});
 
+  // Multi-Batch Opname state: { [productId]: { [batchId]: number | '' } }
+  const [batchCounts, setBatchCounts] = useState<Record<string, Record<string, number | ''>>>({});
+  const [expandedOpnameProducts, setExpandedOpnameProducts] = useState<Record<string, boolean>>({});
+  const [expandAllBatches, setExpandAllBatches] = useState<boolean>(false);
+
   const [opnameSearch, setOpnameSearch] = useState<string>('');
-  const [opnameCategory, setOpnameCategory] = useState<string>('SEMUA');
+  // Empty array = semua kategori; non-empty = multi-kategori dalam satu sesi
+  const [selectedOpnameCategories, setSelectedOpnameCategories] = useState<string[]>([]);
   const [opnameStatusFilter, setOpnameStatusFilter] = useState<'ALL' | 'DISCREPANT' | 'COUNTED' | 'UNCOUNTED'>('ALL');
   const [isConfirmModalOpen, setIsConfirmModalOpen] = useState<boolean>(false);
   const [opnameResponsibleUserId, setOpnameResponsibleUserId] = useState<string>(currentUser.id);
@@ -1179,18 +1278,69 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   // Role validation
   const canExecuteAdjustment = currentUserRole === 'ADMIN' || currentUserRole === 'STORE_MANAGER';
 
-  // Opname session computations
+  // Unique category list (excluding 'SEMUA') with SKU & batch metrics
+  const opnameCategoryStats = useMemo(() => {
+    const map = new Map<string, { skuCount: number; batchCount: number }>();
+    physicalProducts.forEach((p) => {
+      const prev = map.get(p.category) || { skuCount: 0, batchCount: 0 };
+      map.set(p.category, {
+        skuCount: prev.skuCount + 1,
+        batchCount: prev.batchCount + (p.batches?.length || 0),
+      });
+    });
+    return Array.from(map.entries()).map(([name, stat]) => ({ name, ...stat }));
+  }, [physicalProducts]);
+
+  // Opname session computations (supports both SKU-level and Multi-Batch level counting)
   const opnameEntries = useMemo(() => {
     return physicalProducts.map((product) => {
       const entry = physicalCounts[product.id];
-      const hasCount = entry && entry.physicalCount !== '';
-      const physicalVal = hasCount ? Number(entry.physicalCount) : product.stockInBaseUnit;
-      const difference = hasCount ? physicalVal - product.stockInBaseUnit : 0;
-      const differenceValue = difference * product.costPrice;
-      const isDiscrepant = hasCount && difference !== 0;
+      const batches = Array.isArray(product.batches) ? product.batches : [];
+      const pBatchCounts = batchCounts[product.id] || {};
+      const hasBatchLevelCount =
+        batches.length > 0 &&
+        Object.values(pBatchCounts).some((v) => v !== '' && v !== undefined);
+
+      let batchDetails: StockOpnameBatchDetail[] | undefined;
+      let hasCount = Boolean(entry && entry.physicalCount !== '');
+      let physicalVal = hasCount ? Number(entry.physicalCount) : product.stockInBaseUnit;
+      let difference = hasCount ? physicalVal - product.stockInBaseUnit : 0;
+      let differenceValue = difference * product.costPrice;
+
+      if (hasBatchLevelCount) {
+        hasCount = true;
+        batchDetails = batches.map((b) => {
+          const rawVal = pBatchCounts[b.id];
+          const systemQty = b.remainingQuantity || 0;
+          const physicalQty =
+            rawVal !== '' && rawVal !== undefined ? Math.max(0, Number(rawVal)) : systemQty;
+          const bDiff = physicalQty - systemQty;
+          const unitCost = b.costPrice ?? product.costPrice;
+          return {
+            batchId: b.id,
+            batchNumber: b.batchNumber || b.id,
+            costPrice: unitCost,
+            systemQty,
+            physicalQty,
+            difference: bDiff,
+            differenceValue: bDiff * unitCost,
+          };
+        });
+        physicalVal = batchDetails.reduce((s, d) => s + d.physicalQty, 0);
+        difference = physicalVal - product.stockInBaseUnit;
+        differenceValue = batchDetails.reduce((s, d) => s + d.differenceValue, 0);
+      }
+
+      const isDiscrepant =
+        hasCount &&
+        (difference !== 0 ||
+          Boolean(batchDetails && batchDetails.some((b) => b.difference !== 0)));
 
       return {
         product,
+        batches,
+        hasBatchLevelCount,
+        batchDetails,
         hasCount,
         physicalVal,
         difference,
@@ -1200,28 +1350,52 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         notes: entry?.notes || '',
       };
     });
-  }, [physicalProducts, physicalCounts]);
+  }, [physicalProducts, physicalCounts, batchCounts]);
+
+  // Scope products for active opname (filtered by selected categories, regardless of search/status)
+  const scopedOpnameEntries = useMemo(() => {
+    if (selectedOpnameCategories.length === 0) return opnameEntries;
+    const catSet = new Set(selectedOpnameCategories);
+    return opnameEntries.filter((e) => catSet.has(e.product.category));
+  }, [opnameEntries, selectedOpnameCategories]);
 
   // Filtered opname rows
   const filteredOpnameRows = useMemo(() => {
-    return opnameEntries.filter((item) => {
+    const q = opnameSearch.trim().toLowerCase();
+    return scopedOpnameEntries.filter((item) => {
       if (opnameStatusFilter === 'DISCREPANT' && !item.isDiscrepant) return false;
       if (opnameStatusFilter === 'COUNTED' && !item.hasCount) return false;
       if (opnameStatusFilter === 'UNCOUNTED' && item.hasCount) return false;
 
-      const matchCat = opnameCategory === 'SEMUA' || item.product.category === opnameCategory;
-      const matchSearch =
-        item.product.name.toLowerCase().includes(opnameSearch.toLowerCase()) ||
-        item.product.barcode.toLowerCase().includes(opnameSearch.toLowerCase()) ||
-        item.product.baseUnit.toLowerCase().includes(opnameSearch.toLowerCase());
+      if (!q) return true;
+      const matchProduct =
+        item.product.name.toLowerCase().includes(q) ||
+        item.product.barcode.toLowerCase().includes(q) ||
+        item.product.category.toLowerCase().includes(q) ||
+        item.product.baseUnit.toLowerCase().includes(q);
+      const matchBatch = item.batches.some((b) =>
+        (b.batchNumber || '').toLowerCase().includes(q)
+      );
 
-      return matchCat && matchSearch;
+      return matchProduct || matchBatch;
     });
-  }, [opnameEntries, opnameStatusFilter, opnameCategory, opnameSearch]);
+  }, [scopedOpnameEntries, opnameStatusFilter, opnameSearch]);
 
-  // Metrics for active opname session
+  // Metrics for active opname session (counts all entered items across selected/all categories)
   const countedItemsCount = useMemo(() => {
     return opnameEntries.filter((e) => e.hasCount).length;
+  }, [opnameEntries]);
+
+  const multiBatchCountedCount = useMemo(() => {
+    return opnameEntries.filter((e) => e.hasBatchLevelCount).length;
+  }, [opnameEntries]);
+
+  const countedCategoriesList = useMemo(() => {
+    const cats = new Set<string>();
+    opnameEntries.forEach((e) => {
+      if (e.hasCount) cats.add(e.product.category);
+    });
+    return Array.from(cats);
   }, [opnameEntries]);
 
   const discrepantItems = useMemo(() => {
@@ -1237,7 +1411,42 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
   }, [discrepantItems]);
 
   // Session Handlers
+  const toggleOpnameCategory = (category: string) => {
+    sound.playTap();
+    setSelectedOpnameCategories((prev) =>
+      prev.includes(category) ? prev.filter((c) => c !== category) : [...prev, category]
+    );
+  };
+
+  const toggleProductBatchExpand = (productId: string) => {
+    sound.playTap();
+    setExpandedOpnameProducts((prev) => ({
+      ...prev,
+      [productId]: !(prev[productId] ?? expandAllBatches),
+    }));
+  };
+
+  const handleToggleExpandAllBatches = () => {
+    sound.playTap();
+    const next = !expandAllBatches;
+    setExpandAllBatches(next);
+    const updated: Record<string, boolean> = {};
+    filteredOpnameRows.forEach((r) => {
+      if (r.batches.length > 0) updated[r.product.id] = next;
+    });
+    setExpandedOpnameProducts(updated);
+  };
+
   const handlePhysicalCountChange = (productId: string, valStr: string) => {
+    // Clearing/overriding SKU level resets explicit per-batch inputs if user clears field
+    if (valStr === '') {
+      setBatchCounts((prev) => {
+        if (!prev[productId]) return prev;
+        const next = { ...prev };
+        delete next[productId];
+        return next;
+      });
+    }
     setPhysicalCounts((prev) => {
       const old = prev[productId] || { physicalCount: '', reason: 'Sesuai', notes: '' };
       if (valStr === '') {
@@ -1260,6 +1469,69 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         [productId]: { ...old, physicalCount: num, reason: newReason },
       };
     });
+  };
+
+  const handleBatchCountChange = (productId: string, batchId: string, valStr: string) => {
+    const prod = products.find((p) => p.id === productId);
+    if (!prod) return;
+    const batches = prod.batches || [];
+
+    const parsedVal: number | '' = valStr === '' ? '' : Math.max(0, parseInt(valStr, 10) || 0);
+
+    setBatchCounts((prev) => {
+      const prevProdBatches = { ...(prev[productId] || {}) };
+      prevProdBatches[batchId] = parsedVal;
+
+      const hasAnyBatchVal = Object.values(prevProdBatches).some(
+        (v) => v !== '' && v !== undefined
+      );
+
+      // Compute synced SKU total immediately
+      if (hasAnyBatchVal) {
+        const syncedTotal = batches.reduce((sum, b) => {
+          const bVal = prevProdBatches[b.id];
+          return (
+            sum +
+            (bVal !== '' && bVal !== undefined
+              ? Math.max(0, Number(bVal))
+              : b.remainingQuantity || 0)
+          );
+        }, 0);
+
+        setPhysicalCounts((pcPrev) => {
+          const old = pcPrev[productId] || { physicalCount: '', reason: 'Sesuai', notes: '' };
+          const diff = syncedTotal - prod.stockInBaseUnit;
+          let newReason = old.reason;
+          if (diff === 0 && (old.reason === '' || old.reason === 'Barang Rusak / Kadaluarsa' || old.reason === 'Hilang / Selisih Kasir')) {
+            newReason = 'Sesuai';
+          } else if (diff !== 0 && old.reason === 'Sesuai') {
+            newReason = diff < 0 ? 'Barang Rusak / Kadaluarsa' : 'Bonus Supplier Belum Dicatat';
+          }
+          return {
+            ...pcPrev,
+            [productId]: { ...old, physicalCount: syncedTotal, reason: newReason },
+          };
+        });
+      }
+
+      return {
+        ...prev,
+        [productId]: prevProdBatches,
+      };
+    });
+  };
+
+  const handleStepBatchCount = (productId: string, batchId: string, step: number) => {
+    sound.playTap();
+    const prod = products.find((p) => p.id === productId);
+    const batch = prod?.batches?.find((b) => b.id === batchId);
+    const currentRaw = batchCounts[productId]?.[batchId];
+    const current =
+      currentRaw !== '' && currentRaw !== undefined
+        ? Number(currentRaw)
+        : batch?.remainingQuantity || 0;
+    const nextVal = Math.max(0, current + step);
+    handleBatchCountChange(productId, batchId, String(nextVal));
   };
 
   const handleStepCount = (productId: string, step: number) => {
@@ -1304,27 +1576,45 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
     });
   };
 
-  // Helper: Autofill all products with their system stock
+  // Helper: Autofill scoped products (or all if no category selected) & their batches with system stock
   const handleAutofillAllWithSystem = () => {
     sound.playTap();
-    const updated: typeof physicalCounts = {};
-    products.forEach((p) => {
-      updated[p.id] = {
-        physicalCount: p.stockInBaseUnit,
-        reason: 'Sesuai',
-        notes: '',
-      };
+    const targetEntries = scopedOpnameEntries;
+    setPhysicalCounts((prev) => {
+      const next = { ...prev };
+      targetEntries.forEach(({ product }) => {
+        next[product.id] = {
+          physicalCount: product.stockInBaseUnit,
+          reason: 'Sesuai',
+          notes: next[product.id]?.notes || '',
+        };
+      });
+      return next;
     });
-    setPhysicalCounts(updated);
+    setBatchCounts((prev) => {
+      const next = { ...prev };
+      targetEntries.forEach(({ product, batches }) => {
+        if (batches.length > 0) {
+          const bMap: Record<string, number | ''> = {};
+          batches.forEach((b) => {
+            bMap[b.id] = b.remainingQuantity || 0;
+          });
+          next[product.id] = bMap;
+        }
+      });
+      return next;
+    });
   };
 
-  // Helper: Clear all counts
+  // Helper: Clear all counts (including multi-batch inputs)
   const handleResetSessionCounts = () => {
     sound.playTap();
     setPhysicalCounts({});
+    setBatchCounts({});
+    setExpandedOpnameProducts({});
   };
 
-  // Apply Mass Stock Opname Adjustment
+  // Apply Mass Stock Opname Adjustment (Multi-Category & Multi-Batch)
   const handleConfirmMassAdjustment = () => {
     if (!canExecuteAdjustment) {
       sound.playError();
@@ -1334,18 +1624,20 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
 
     sound.playSuccessChime();
 
-    // 1. Build adjustments list for items that have been counted
+    // 1. Build adjustments list & StockOpnameItem[] for counted products
     const adjustments: { productId: string; newStock: number }[] = [];
     const auditedItemsRecord: StockOpnameItem[] = [];
+    const categorySet = new Set<string>(selectedOpnameCategories);
 
     opnameEntries.forEach((entry) => {
       if (entry.hasCount) {
+        categorySet.add(entry.product.category);
         adjustments.push({
           productId: entry.product.id,
           newStock: entry.physicalVal,
         });
 
-        auditedItemsRecord.push({
+        const itemPayload: StockOpnameItem = {
           productId: entry.product.id,
           productName: entry.product.name,
           category: entry.product.category,
@@ -1357,7 +1649,11 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
           differenceValue: entry.differenceValue,
           reason: entry.reason,
           notes: entry.notes,
-        });
+        };
+        if (entry.batchDetails && entry.batchDetails.length > 0) {
+          itemPayload.batchDetails = entry.batchDetails;
+        }
+        auditedItemsRecord.push(itemPayload);
       }
     });
 
@@ -1366,9 +1662,13 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       return;
     }
 
-    // 2. Build full StockOpnameRecord with selected User Penanggung Jawab
+    // 2. Build full StockOpnameRecord with multi-category & multi-batch metadata
     const chosenResponsible =
       availableResponsibleUsers.find((u) => u.id === opnameResponsibleUserId) || currentUser;
+    const auditedCategories = Array.from(categorySet);
+    const isMultiBatchMode =
+      auditedItemsRecord.some((it) => it.batchDetails && it.batchDetails.length > 0) ||
+      auditedCategories.length > 1;
 
     const newSessionRecord: StockOpnameRecord = {
       id: 'so_' + Date.now(),
@@ -1382,6 +1682,8 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
       totalDifferenceValue: totalFinancialVariance,
       generalReason: sessionGeneralReason,
       notes: sessionNotes,
+      auditedCategories,
+      auditMode: isMultiBatchMode ? 'MULTI_BATCH' : 'SKU',
       items: auditedItemsRecord,
     };
 
@@ -1391,6 +1693,10 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
     // 4. Close modal, reset session inputs, and navigate to History
     setIsConfirmModalOpen(false);
     setPhysicalCounts({});
+    setBatchCounts({});
+    setExpandedOpnameProducts({});
+    setExpandAllBatches(false);
+    setSelectedOpnameCategories([]);
     setSessionNotes('');
     setSessionDocNumber(generateDefaultSessionNumber());
     setActiveSubTab('OPNAME_HISTORY');
@@ -1486,6 +1792,21 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             >
               <BarChart3 className="w-3.5 h-3.5 text-sky-600" />
               <span>Monitoring Stok</span>
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playTap();
+                setActiveSubTab('BATCH_HPP');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                activeSubTab === 'BATCH_HPP'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Layers className={`w-3.5 h-3.5 ${activeSubTab === 'BATCH_HPP' ? 'text-sky-400' : 'text-indigo-600'}`} />
+              <span>HPP per Batch</span>
             </button>
 
             <button
@@ -1632,6 +1953,19 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             </button>
 
             <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setIsMonthlyMovementModalOpen(true);
+              }}
+              className="px-3 py-2 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-200 text-xs font-bold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              title="Buka modal ringkasan pergerakan stok In/Out bulanan untuk audit fisik"
+            >
+              <Package className="w-3.5 h-3.5 text-sky-600" />
+              <span>Ringkasan In/Out</span>
+            </button>
+
+            <button
               onClick={handleExportStockPdf}
               className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-2xs ml-1 cursor-pointer"
               title="Unduh Arsip Laporan Stok Digital (.PDF)"
@@ -1753,6 +2087,30 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </button>
 
                 <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setIsMonthlyMovementModalOpen(true);
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-200 font-bold text-xs flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Tampilkan modal ringkasan pergerakan stok masuk/keluar bulanan untuk audit fisik"
+                >
+                  <Package className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Ringkasan In/Out Bulanan</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportStockAndPnlOwnerPdf}
+                  disabled={isExportingOwnerPdf}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 text-white font-bold text-xs flex items-center gap-1.5 transition-colors shadow-2xs cursor-pointer whitespace-nowrap shrink-0"
+                  title="Ekspor PDF gabungan Laporan Stok Gudang & Ringkasan Laba Rugi dengan Logo Toko untuk Pemilik Bisnis"
+                >
+                  <FileDown className="w-3.5 h-3.5 text-emerald-200" />
+                  <span>{isExportingOwnerPdf ? 'Menyusun PDF...' : 'PDF Stok & Laba Rugi'}</span>
+                </button>
+
+                <button
                   onClick={handleExportStockPdf}
                   className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center gap-1.5 transition-colors shadow-2xs cursor-pointer"
                   title="Ekspor Arsip Digital Laporan Stok ke PDF (jsPDF)"
@@ -1796,6 +2154,23 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               </div>
             </div>
 
+            {ownerPdfNotice && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 font-medium">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{ownerPdfNotice}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOwnerPdfNotice(null)}
+                  className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+                  aria-label="Tutup notifikasi PDF"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
             {/* Verify Stock Audit Panel */}
             {showVerifyStockPanel && (
               <div
@@ -1817,20 +2192,75 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                       <ShieldAlert className="w-5 h-5" />
                     </div>
                     <div>
-                      <h4 className="text-sm font-black text-slate-900">
-                        Hasil Verifikasi Integritas Stok &amp; Batch FIFO
-                      </h4>
-                      <p className="text-xs text-slate-600">
-                        Memeriksa {stockVerification.results.length} SKU fisik untuk stok batch negatif, total stok negatif, atau selisih antara total stok produk dan jumlah seluruh batch.
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h4 className="text-sm font-black text-slate-900">
+                          Hasil Verifikasi Integritas Stok &amp; Batch FIFO
+                        </h4>
+                        <span className="px-2 py-0.5 rounded-md bg-white/80 border border-slate-200 text-[10px] font-bold text-slate-600">
+                          {stockVerification.report.source === 'STARTUP'
+                            ? 'Startup Otomatis'
+                            : stockVerification.report.source === 'CLOUD_SYNC'
+                            ? 'Sinkronisasi Cloud'
+                            : stockVerification.report.source === 'POST_OPNAME'
+                            ? 'Pasca Opname'
+                            : 'Pemeriksaan Manual'}
+                          {' · '}
+                          {new Date(stockVerification.report.checkedAt).toLocaleTimeString('id-ID', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-600 mt-0.5">
+                        Memeriksa {stockVerification.results.length} SKU fisik ({formatNumber(stockVerification.report.totalBatchesScanned)} batch FIFO) terhadap stok batch negatif, HPP negatif, atau selisih stok produk vs jumlah batch.
                       </p>
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                    {onRecheckBatchIntegrity && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          const nextRep = onRecheckBatchIntegrity();
+                          if (nextRep && nextRep.criticalIssuesCount === 0) {
+                            setVerifyFeedbackMsg('Pemeriksaan ulang selesai: seluruh stok & batch FIFO valid (0 masalah).');
+                          } else if (nextRep) {
+                            setVerifyFeedbackMsg(`Pemeriksaan ulang mendeteksi ${nextRep.criticalIssuesCount} produk bermasalah.`);
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-white border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer flex items-center gap-1.5 whitespace-nowrap"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Cek Ulang Integritas</span>
+                      </button>
+                    )}
+
+                    {stockVerification.issueItems.length > 0 && onAutoFixAllBatchIntegrity && canExecuteAdjustment && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playSuccessChime();
+                          const fixedCount = onAutoFixAllBatchIntegrity() || 0;
+                          if (fixedCount > 0) {
+                            setVerifyFeedbackMsg(
+                              `${fixedCount} produk bermasalah telah diperbaiki otomatis (batch negatif dinolkan & total stok disinkronkan ke batch FIFO).`
+                            );
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer flex items-center gap-1.5 whitespace-nowrap shadow-2xs"
+                      >
+                        <Wrench className="w-3.5 h-3.5" />
+                        <span>Perbaiki Otomatis Semua</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={() => setVerifyShowOnlyIssues((v) => !v)}
-                      className="px-3 py-1.5 rounded-xl bg-white border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      className="px-3 py-1.5 rounded-xl bg-white border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer whitespace-nowrap"
                     >
                       {verifyShowOnlyIssues
                         ? `Tampilkan Semua (${stockVerification.results.length})`
@@ -1847,7 +2277,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </div>
 
                 {/* Mini Verification Counters */}
-                <div className="grid grid-cols-3 gap-2 text-xs">
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
                   <div className="p-2.5 rounded-xl bg-white border border-slate-200">
                     <div className="text-[10px] font-bold text-slate-400 uppercase">Total SKU Diperiksa</div>
                     <div className="text-base font-black font-mono text-slate-900">
@@ -1864,6 +2294,12 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                     <div className="text-[10px] font-bold text-rose-600 uppercase">Mismatch Stok vs Batch</div>
                     <div className="text-base font-black font-mono text-rose-700">
                       {formatNumber(stockVerification.mismatchCount)} SKU
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-amber-200">
+                    <div className="text-[10px] font-bold text-amber-700 uppercase">HPP Batch Negatif</div>
+                    <div className="text-base font-black font-mono text-amber-700">
+                      {formatNumber(stockVerification.negativeCostCount)} SKU
                     </div>
                   </div>
                 </div>
@@ -1885,7 +2321,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                         <CheckCircle2 className="w-8 h-8 text-emerald-600 mx-auto" />
                         <p className="text-sm font-black text-emerald-900">Semua Stok Terverifikasi Bersih!</p>
                         <p className="text-xs text-slate-500">
-                          Tidak ditemukan stok batch negatif ataupun ketidakcocokan antara total stok produk dan penjumlahan batch.
+                          Tidak ditemukan stok batch negatif, HPP negatif, ataupun ketidakcocokan antara total stok produk dan penjumlahan batch.
                         </p>
                       </div>
                     );
@@ -1954,6 +2390,11 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                                       {r.product.baseUnit}
                                     </span>
                                   )}
+                                  {r.hasNegativeCost && (
+                                    <span className="px-1.5 py-0.5 rounded bg-amber-600 text-white text-[10px] font-black">
+                                      HPP Batch Negatif ({r.negativeCostBatches.length})
+                                    </span>
+                                  )}
                                   {!r.hasIssue && (
                                     <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-bold">
                                       Cocok &amp; Valid
@@ -1963,7 +2404,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                               </td>
                               <td className="py-2.5 px-3 text-right">
                                 <div className="flex items-center justify-end gap-1.5">
-                                  {r.hasBatchMismatch && r.batchSum >= 0 && (
+                                  {r.hasBatchMismatch && r.batchSum >= 0 && r.negativeBatches.length === 0 && (
                                     <button
                                       type="button"
                                       onClick={() => {
@@ -1977,7 +2418,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                                           `Stok "${r.product.name}" disinkronkan ke total batch (${formatNumber(r.batchSum)} ${r.product.baseUnit}).`
                                         );
                                       }}
-                                      className="px-2 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10.5px] font-bold cursor-pointer"
+                                      className="px-2 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10.5px] font-bold cursor-pointer whitespace-nowrap"
                                     >
                                       Samakan ke Batch ({formatNumber(r.batchSum)})
                                     </button>
@@ -2036,6 +2477,15 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
               }}
             />
 
+            {/* Batch Acquisition Cost (HPP) Visualization Summary */}
+            <BatchHppSummarySection
+              products={products}
+              onSelectProductForStock={(prod) => {
+                setSearch(prod.name);
+                setActiveSubTab('MONITORING');
+              }}
+            />
+
             {/* 30-Day Expiring Products Clearance & Promo Module */}
             <ExpiringClearanceModule
               products={products}
@@ -2086,7 +2536,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                     Perlu Restock Segera
                   </span>
                   {lowStockProducts.length > 0 && (
-                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+                    <span className="w-2 h-2 rounded-full bg-amber-500"></span>
                   )}
                 </div>
                 <div className="text-xl md:text-2xl font-black text-amber-700 font-mono mt-1 flex items-baseline gap-1.5">
@@ -2338,9 +2788,9 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                             key={p.id} 
                             className={`hover:bg-slate-50/80 transition-colors ${
                               hasVerifyIssue
-                                ? 'bg-rose-100/90 border-l-4 border-l-rose-600 ring-1 ring-rose-300'
+                                ? 'bg-rose-100/90 ring-1 ring-inset ring-rose-300'
                                 : isDepletingCritical
-                                ? 'bg-rose-50/80 border-l-4 border-l-rose-600 ring-1 ring-rose-200/90 shadow-2xs'
+                                ? 'bg-rose-50/80 ring-1 ring-inset ring-rose-200/90 shadow-2xs'
                                 : isZero
                                 ? 'bg-rose-50/30'
                                 : isLow
@@ -2604,6 +3054,21 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
         )}
 
         {/* =================================================================== */}
+        {/* SUBTAB: RINGKASAN BIAYA PEROLEHAN (HPP) PER BATCH                   */}
+        {/* =================================================================== */}
+        {activeSubTab === 'BATCH_HPP' && (
+          <div className="space-y-4 animate-in fade-in duration-150">
+            <BatchHppSummarySection
+              products={products}
+              onSelectProductForStock={(prod) => {
+                setSearch(prod.name);
+                setActiveSubTab('MONITORING');
+              }}
+            />
+          </div>
+        )}
+
+        {/* =================================================================== */}
         {/* SUBTAB 2: SESI STOCK OPNAME (HITUNG FISIK & PENYESUAIAN MASSAL)    */}
         {/* =================================================================== */}
         {activeSubTab === 'OPNAME_SESSION' && (
@@ -2612,12 +3077,15 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
                 <div>
-                  <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <h3 className="text-base font-bold text-slate-900 flex items-center gap-2 flex-wrap">
                     <ClipboardCheck className="w-5 h-5 text-sky-600" />
-                    <span>Lembar Kerja Stock Opname (Hitung Fisik Berkala)</span>
+                    <span>Lembar Kerja Multi-Batch Stock Opname</span>
+                    <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-800 border border-indigo-200 text-[10px] font-bold uppercase">
+                      Multi-Kategori &amp; Per-Batch FIFO
+                    </span>
                   </h3>
-                  <p className="text-xs text-slate-500">
-                    Masukkan hasil hitungan fisik di toko/gudang. Sistem otomatis menghitung selisih kuantitas dan nilai rupiah.
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Pilih satu atau lebih kategori sekaligus dalam satu nomor referensi sesi ({sessionDocNumber}), lalu hitung stok total SKU maupun rincian tiap batch FIFO.
                   </p>
                 </div>
 
@@ -2692,9 +3160,79 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                     type="text"
                     value={sessionNotes}
                     onChange={(e) => setSessionNotes(e.target.value)}
-                    placeholder="Contoh: Audit etalase depan & gudang belakang"
+                    placeholder="Contoh: Audit multi-kategori gudang A & B"
                     className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:border-sky-500"
                   />
+                </div>
+              </div>
+
+              {/* Multi-Category Scope Selector inside the same Opname Session */}
+              <div className="pt-3 border-t border-slate-100 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Cakupan Kategori Audit Sekaligus:</span>
+                    </span>
+                    <span className="text-[11px] font-mono font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md border border-indigo-200">
+                      {selectedOpnameCategories.length === 0
+                        ? `Semua Kategori (${opnameCategoryStats.length})`
+                        : `${selectedOpnameCategories.length} Kategori Terpilih`}
+                      {' · '}
+                      {scopedOpnameEntries.length} SKU
+                      {' · '}
+                      {scopedOpnameEntries.reduce((s, e) => s + e.batches.length, 0)} Batch
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    {selectedOpnameCategories.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setSelectedOpnameCategories([]);
+                        }}
+                        className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold cursor-pointer"
+                      >
+                        Tampilkan Semua Kategori
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setSelectedOpnameCategories(opnameCategoryStats.map((c) => c.name));
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-[11px] font-bold cursor-pointer"
+                    >
+                      Pilih Semua ({opnameCategoryStats.length})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {opnameCategoryStats.map((cat) => {
+                    const isSelected = selectedOpnameCategories.includes(cat.name);
+                    return (
+                      <button
+                        key={cat.name}
+                        type="button"
+                        onClick={() => toggleOpnameCategory(cat.name)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                          isSelected
+                            ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                            : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                        }`}
+                      >
+                        {isSelected && <Check className="w-3 h-3 text-sky-400" />}
+                        <span>{cat.name}</span>
+                        <span className={`font-mono text-[10px] ${isSelected ? 'text-slate-300' : 'text-slate-400'}`}>
+                          ({cat.skuCount} SKU{cat.batchCount > 0 ? ` · ${cat.batchCount}B` : ''})
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -2717,10 +3255,12 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </div>
                 <div className="text-xl md:text-2xl font-black text-slate-900 font-mono mt-1 flex items-baseline gap-1">
                   <span>{countedItemsCount}</span>
-                  <span className="text-xs text-slate-400 font-normal">/ {products.length} SKU</span>
+                  <span className="text-xs text-slate-400 font-normal">/ {scopedOpnameEntries.length} SKU</span>
                 </div>
                 <div className="text-[10px] text-slate-500 mt-0.5">
-                  {countedItemsCount === products.length ? 'Semua SKU telah diinput' : `${products.length - countedItemsCount} item belum dihitung`}
+                  {multiBatchCountedCount > 0
+                    ? `${multiBatchCountedCount} SKU mode per-batch FIFO`
+                    : `${countedCategoriesList.length || selectedOpnameCategories.length || 0} kategori aktif`}
                 </div>
               </div>
 
@@ -2770,7 +3310,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   {totalFinancialVariance > 0 ? `+${formatRupiah(totalFinancialVariance)}` : formatRupiah(totalFinancialVariance)}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-0.5">
-                  Dihitung dari harga modal beli barang
+                  Akurat berdasarkan HPP batch terkait
                 </div>
               </div>
             </div>
@@ -2785,7 +3325,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                     type="text"
                     value={opnameSearch}
                     onChange={(e) => setOpnameSearch(e.target.value)}
-                    placeholder="Cari nama barang atau barcode di lembar hitung fisik..."
+                    placeholder="Cari nama barang, barcode, kategori, atau nomor batch FIFO..."
                     className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs md:text-sm text-slate-900 focus:outline-none focus:border-sky-500"
                   />
                 </div>
@@ -2794,18 +3334,32 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
+                    onClick={handleToggleExpandAllBatches}
+                    className={`px-3 py-2 rounded-xl text-xs font-bold transition-colors border flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                      expandAllBatches
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border-indigo-200'
+                    }`}
+                    title="Buka / tutup rincian hitung fisik per batch FIFO untuk semua produk ber-batch"
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>{expandAllBatches ? 'Tutup Semua Batch' : 'Buka Semua Batch FIFO'}</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={handleAutofillAllWithSystem}
-                    className="px-3 py-2 bg-sky-50 hover:bg-sky-100 text-sky-800 rounded-xl text-xs font-bold transition-colors border border-sky-200 flex items-center gap-1.5 shadow-2xs"
-                    title="Isi otomatis hitungan fisik dengan stok sistem saat ini agar Anda hanya perlu mengubah barang yang berselisih"
+                    className="px-3 py-2 bg-sky-50 hover:bg-sky-100 text-sky-800 rounded-xl text-xs font-bold transition-colors border border-sky-200 flex items-center gap-1.5 shadow-2xs cursor-pointer whitespace-nowrap"
+                    title="Isi otomatis hitungan fisik SKU & batch sesuai stok sistem agar hanya selisih yang perlu diubah"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-sky-600" />
-                    <span>Samakan Semua dengan Sistem</span>
+                    <span>Samakan Kategori Terpilih</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={handleResetSessionCounts}
-                    className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-colors border border-slate-200 flex items-center gap-1.5"
+                    className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-colors border border-slate-200 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
                     title="Kosongkan semua angka hitungan fisik"
                   >
                     <RotateCcw className="w-3.5 h-3.5 text-slate-600" />
@@ -2814,14 +3368,14 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </div>
               </div>
 
-              {/* Filter Tabs & Category Dropdown */}
+              {/* Filter Tabs & Scope Indicator */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-slate-100">
                 <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
                   {[
-                    { id: 'ALL', label: `Semua Produk (${products.length})` },
+                    { id: 'ALL', label: `Produk Cakupan (${scopedOpnameEntries.length})` },
                     { id: 'DISCREPANT', label: `Berselisih (${discrepantItems.length})` },
                     { id: 'COUNTED', label: `Sudah Dihitung (${countedItemsCount})` },
-                    { id: 'UNCOUNTED', label: `Belum Diisi (${products.length - countedItemsCount})` },
+                    { id: 'UNCOUNTED', label: `Belum Diisi (${scopedOpnameEntries.filter((e) => !e.hasCount).length})` },
                   ].map((tab) => (
                     <button
                       key={tab.id}
@@ -2842,19 +3396,8 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   ))}
                 </div>
 
-                <div className="flex items-center gap-2 self-end sm:self-auto">
-                  <span className="text-xs text-slate-500 font-medium">Kategori:</span>
-                  <select
-                    value={opnameCategory}
-                    onChange={(e) => setOpnameCategory(e.target.value)}
-                    className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-900 focus:outline-none focus:border-sky-500"
-                  >
-                    {categories.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
+                <div className="text-[11px] text-slate-500 font-medium">
+                  Menampilkan <strong className="text-slate-800">{filteredOpnameRows.length}</strong> SKU
                 </div>
               </div>
             </div>
@@ -2866,7 +3409,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   <thead className="bg-slate-50 text-slate-600 uppercase text-[11px] font-bold border-b border-slate-200 tracking-wider">
                     <tr>
                       <th className="py-3 px-3 w-8 text-center">#</th>
-                      <th className="py-3 px-4 min-w-[200px]">Nama Produk & SKU</th>
+                      <th className="py-3 px-4 min-w-[220px]">Nama Produk, Batch &amp; SKU</th>
                       <th className="py-3 px-3">Satuan</th>
                       <th className="py-3 px-3">Harga Modal</th>
                       <th className="py-3 px-3 text-center">Stok Sistem</th>
@@ -2883,182 +3426,353 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                     {filteredOpnameRows.length === 0 ? (
                       <tr>
                         <td colSpan={10} className="py-10 text-center text-slate-400">
-                          Tidak ada produk sesuai filter yang dipilih.
+                          Tidak ada produk sesuai filter atau kategori yang dipilih.
                         </td>
                       </tr>
                     ) : (
                       filteredOpnameRows.map((entry, idx) => {
-                        const { product, hasCount, physicalVal, difference, differenceValue, isDiscrepant, reason, notes } = entry;
+                        const {
+                          product,
+                          batches,
+                          hasBatchLevelCount,
+                          batchDetails,
+                          hasCount,
+                          physicalVal,
+                          difference,
+                          differenceValue,
+                          isDiscrepant,
+                          reason,
+                          notes,
+                        } = entry;
                         const isZeroSystem = product.stockInBaseUnit <= 0;
+                        const hasBatches = batches.length > 0;
+                        const isExpanded = hasBatches && (expandedOpnameProducts[product.id] ?? expandAllBatches);
 
                         return (
-                          <tr
-                            key={product.id}
-                            className={`hover:bg-slate-50/80 transition-colors ${
-                              isDiscrepant
-                                ? difference < 0
-                                  ? 'bg-rose-50/30'
-                                  : 'bg-emerald-50/30'
-                                : hasCount
-                                ? 'bg-slate-50/40'
-                                : ''
-                            }`}
-                          >
-                            {/* Number */}
-                            <td className="py-3 px-3 text-center text-slate-400 font-mono text-xs">
-                              {idx + 1}
-                            </td>
+                          <React.Fragment key={product.id}>
+                            <tr
+                              className={`hover:bg-slate-50/80 transition-colors ${
+                                isDiscrepant
+                                  ? difference < 0
+                                    ? 'bg-rose-50/30'
+                                    : 'bg-emerald-50/30'
+                                  : hasCount
+                                  ? 'bg-slate-50/40'
+                                  : ''
+                              }`}
+                            >
+                              {/* Number */}
+                              <td className="py-3 px-3 text-center text-slate-400 font-mono text-xs">
+                                {idx + 1}
+                              </td>
 
-                            {/* Product Info */}
-                            <td className="py-3 px-4">
-                              <div className="font-bold text-slate-900">{product.name}</div>
-                              <div className="text-[11px] text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
-                                <span>SKU: {product.barcode}</span>
-                                <span>·</span>
-                                <span className="bg-slate-100 text-slate-600 px-1.5 py-0.2 rounded text-[10px] font-sans">
-                                  {product.category}
+                              {/* Product Info + Batch Toggle */}
+                              <td className="py-3 px-4">
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                                  <span>{product.name}</span>
+                                  {hasBatchLevelCount && (
+                                    <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9.5px] font-black uppercase">
+                                      Per-Batch Aktif
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-400 font-mono flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                  <span>SKU: {product.barcode}</span>
+                                  <span>·</span>
+                                  <span className="bg-slate-100 text-slate-600 px-1.5 py-0.2 rounded text-[10px] font-sans">
+                                    {product.category}
+                                  </span>
+                                  {hasBatches && (
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleProductBatchExpand(product.id)}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-[10px] font-sans font-bold cursor-pointer"
+                                    >
+                                      <Layers className="w-3 h-3" />
+                                      <span>{batches.length} Batch FIFO</span>
+                                      {isExpanded ? (
+                                        <ChevronUp className="w-3 h-3" />
+                                      ) : (
+                                        <ChevronDown className="w-3 h-3" />
+                                      )}
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+
+                              {/* Base Unit */}
+                              <td className="py-3 px-3 font-mono font-bold text-slate-700">
+                                {product.baseUnit}
+                              </td>
+
+                              {/* Cost Price */}
+                              <td className="py-3 px-3 font-mono text-slate-600">
+                                {formatRupiah(product.costPrice)}
+                              </td>
+
+                              {/* System Stock */}
+                              <td className="py-3 px-3 text-center font-mono">
+                                <span className={`px-2.5 py-1 rounded-lg font-bold ${
+                                  isZeroSystem ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-800'
+                                }`}>
+                                  {formatNumber(product.stockInBaseUnit)}
                                 </span>
-                              </div>
-                            </td>
+                              </td>
 
-                            {/* Base Unit */}
-                            <td className="py-3 px-3 font-mono font-bold text-slate-700">
-                              {product.baseUnit}
-                            </td>
+                              {/* Physical Input (Interactive) */}
+                              <td className="py-2.5 px-4 bg-sky-50/30 border-x border-sky-100">
+                                {hasBatchLevelCount ? (
+                                  <div className="text-center space-y-0.5">
+                                    <div className="inline-flex items-center justify-center px-3 py-1 rounded-lg bg-indigo-50 border border-indigo-200 font-mono font-black text-sm text-indigo-900">
+                                      {formatNumber(physicalVal)}
+                                    </div>
+                                    <div className="text-[10px] font-semibold text-indigo-700">
+                                      Total {batches.length} batch
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center gap-1 justify-center">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleStepCount(product.id, -1)}
+                                      className="w-7 h-7 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center shrink-0 active:scale-95"
+                                      title="Kurang 1"
+                                    >
+                                      <Minus className="w-3.5 h-3.5" />
+                                    </button>
 
-                            {/* Cost Price */}
-                            <td className="py-3 px-3 font-mono text-slate-600">
-                              {formatRupiah(product.costPrice)}
-                            </td>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        sound.playTap();
+                                        const currentVal = physicalCounts[product.id]?.physicalCount !== '' && physicalCounts[product.id]?.physicalCount !== undefined
+                                          ? Number(physicalCounts[product.id].physicalCount)
+                                          : product.stockInBaseUnit;
+                                        setActiveKeypad({
+                                          title: 'Hitung Fisik (Stock Opname)',
+                                          subtitle: `${product.name} (${product.barcode})`,
+                                          initialValue: currentVal,
+                                          unitName: product.baseUnit,
+                                          onConfirm: (val) => handlePhysicalCountChange(product.id, String(val)),
+                                        });
+                                      }}
+                                      className={`w-20 text-center py-1.5 px-2 rounded-lg font-mono font-black text-sm border focus:outline-none cursor-pointer transition-all active:scale-95 ${
+                                        hasCount
+                                          ? isDiscrepant
+                                            ? difference < 0
+                                              ? 'border-rose-400 bg-rose-50/80 text-rose-800'
+                                              : 'border-emerald-400 bg-emerald-50/80 text-emerald-800'
+                                            : 'border-slate-300 bg-white text-slate-900'
+                                          : 'border-dashed border-slate-300 bg-white text-slate-400'
+                                      }`}
+                                      title="Sentuh untuk Input via Numpad Layar Sentuh Tablet"
+                                    >
+                                      {physicalCounts[product.id]?.physicalCount !== undefined && physicalCounts[product.id]?.physicalCount !== ''
+                                        ? physicalCounts[product.id].physicalCount
+                                        : <span className="text-slate-400 font-normal">{product.stockInBaseUnit}</span>}
+                                    </button>
 
-                            {/* System Stock */}
-                            <td className="py-3 px-3 text-center font-mono">
-                              <span className={`px-2.5 py-1 rounded-lg font-bold ${
-                                isZeroSystem ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-800'
-                              }`}>
-                                {formatNumber(product.stockInBaseUnit)}
-                              </span>
-                            </td>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleStepCount(product.id, 1)}
+                                      className="w-7 h-7 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center shrink-0 active:scale-95"
+                                      title="Tambah 1"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
 
-                            {/* Physical Input (Interactive) */}
-                            <td className="py-2.5 px-4 bg-sky-50/30 border-x border-sky-100">
-                              <div className="flex items-center gap-1 justify-center">
-                                <button
-                                  type="button"
-                                  onClick={() => handleStepCount(product.id, -1)}
-                                  className="w-7 h-7 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center shrink-0 active:scale-95"
-                                  title="Kurang 1"
-                                >
-                                  <Minus className="w-3.5 h-3.5" />
-                                </button>
+                              {/* Discrepancy Badge */}
+                              <td className="py-3 px-3 text-center">
+                                {!hasCount ? (
+                                  <span className="text-[10px] text-slate-400 italic">Belum diisi</span>
+                                ) : difference === 0 ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
+                                    <Check className="w-3 h-3 text-slate-500" />
+                                    <span>0 Cocok</span>
+                                  </span>
+                                ) : difference < 0 ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 font-mono">
+                                    <TrendingDown className="w-3 h-3 text-rose-600" />
+                                    <span>{difference} {product.baseUnit}</span>
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-mono">
+                                    <span>+{difference} {product.baseUnit}</span>
+                                  </span>
+                                )}
+                              </td>
 
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    sound.playTap();
-                                    const currentVal = physicalCounts[product.id]?.physicalCount !== '' && physicalCounts[product.id]?.physicalCount !== undefined
-                                      ? Number(physicalCounts[product.id].physicalCount)
-                                      : product.stockInBaseUnit;
-                                    setActiveKeypad({
-                                      title: 'Hitung Fisik (Stock Opname)',
-                                      subtitle: `${product.name} (${product.barcode})`,
-                                      initialValue: currentVal,
-                                      unitName: product.baseUnit,
-                                      onConfirm: (val) => handlePhysicalCountChange(product.id, String(val)),
-                                    });
-                                  }}
-                                  className={`w-20 text-center py-1.5 px-2 rounded-lg font-mono font-black text-sm border focus:outline-none cursor-pointer transition-all active:scale-95 ${
-                                    hasCount
-                                      ? isDiscrepant
-                                        ? difference < 0
-                                          ? 'border-rose-400 bg-rose-50/80 text-rose-800'
-                                          : 'border-emerald-400 bg-emerald-50/80 text-emerald-800'
-                                        : 'border-slate-300 bg-white text-slate-900'
-                                      : 'border-dashed border-slate-300 bg-white text-slate-400'
+                              {/* Difference Value in Rupiah */}
+                              <td className="py-3 px-3 text-right font-mono font-bold">
+                                {!hasCount ? (
+                                  <span className="text-slate-300">-</span>
+                                ) : difference === 0 && differenceValue === 0 ? (
+                                  <span className="text-slate-400">Rp 0</span>
+                                ) : differenceValue < 0 ? (
+                                  <span className="text-rose-600">{formatRupiah(differenceValue)}</span>
+                                ) : (
+                                  <span className="text-emerald-600">+{formatRupiah(differenceValue)}</span>
+                                )}
+                              </td>
+
+                              {/* Reason Selector */}
+                              <td className="py-2.5 px-4">
+                                <select
+                                  value={reason}
+                                  disabled={!hasCount || !isDiscrepant}
+                                  onChange={(e) => handleReasonChange(product.id, e.target.value)}
+                                  className={`w-full py-1.5 px-2.5 rounded-lg border text-xs focus:outline-none ${
+                                    !hasCount || !isDiscrepant
+                                      ? 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
+                                      : 'bg-white border-amber-300 text-amber-900 font-medium focus:border-amber-500'
                                   }`}
-                                  title="Sentuh untuk Input via Numpad Layar Sentuh Tablet"
                                 >
-                                  {physicalCounts[product.id]?.physicalCount !== undefined && physicalCounts[product.id]?.physicalCount !== ''
-                                    ? physicalCounts[product.id].physicalCount
-                                    : <span className="text-slate-400 font-normal">{product.stockInBaseUnit}</span>}
-                                </button>
+                                  {REASON_PRESETS.map((r) => (
+                                    <option key={r} value={r}>
+                                      {r}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
 
-                                <button
-                                  type="button"
-                                  onClick={() => handleStepCount(product.id, 1)}
-                                  className="w-7 h-7 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center shrink-0 active:scale-95"
-                                  title="Tambah 1"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
+                              {/* Row Notes */}
+                              <td className="py-2.5 px-4">
+                                <input
+                                  type="text"
+                                  value={notes}
+                                  onChange={(e) => handleNotesChange(product.id, e.target.value)}
+                                  placeholder="Keterangan..."
+                                  className="w-full py-1.5 px-2.5 rounded-lg border border-slate-200 text-xs bg-white focus:outline-none focus:border-sky-500"
+                                />
+                              </td>
+                            </tr>
 
-                            {/* Discrepancy Badge */}
-                            <td className="py-3 px-3 text-center">
-                              {!hasCount ? (
-                                <span className="text-[10px] text-slate-400 italic">Belum diisi</span>
-                              ) : difference === 0 ? (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
-                                  <Check className="w-3 h-3 text-slate-500" />
-                                  <span>0 Cocok</span>
-                                </span>
-                              ) : difference < 0 ? (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 font-mono">
-                                  <TrendingDown className="w-3 h-3 text-rose-600" />
-                                  <span>{difference} {product.baseUnit}</span>
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-mono">
-                                  <span>+{difference} {product.baseUnit}</span>
-                                </span>
-                              )}
-                            </td>
+                            {/* Expandable Multi-Batch Sub-Rows */}
+                            {isExpanded &&
+                              batches.map((batch) => {
+                                const rawVal = batchCounts[product.id]?.[batch.id];
+                                const batchEntered = rawVal !== '' && rawVal !== undefined;
+                                const sysQty = batch.remainingQuantity || 0;
+                                const physQty = batchEntered ? Number(rawVal) : sysQty;
+                                const bDetail = batchDetails?.find((d) => d.batchId === batch.id);
+                                const bDiff = batchEntered ? physQty - sysQty : (bDetail?.difference || 0);
+                                const unitCost = batch.costPrice ?? product.costPrice;
+                                const bDiffVal = bDiff * unitCost;
 
-                            {/* Difference Value in Rupiah */}
-                            <td className="py-3 px-3 text-right font-mono font-bold">
-                              {!hasCount ? (
-                                <span className="text-slate-300">-</span>
-                              ) : difference === 0 ? (
-                                <span className="text-slate-400">Rp 0</span>
-                              ) : difference < 0 ? (
-                                <span className="text-rose-600">{formatRupiah(differenceValue)}</span>
-                              ) : (
-                                <span className="text-emerald-600">+{formatRupiah(differenceValue)}</span>
-                              )}
-                            </td>
-
-                            {/* Reason Selector */}
-                            <td className="py-2.5 px-4">
-                              <select
-                                value={reason}
-                                disabled={!hasCount || difference === 0}
-                                onChange={(e) => handleReasonChange(product.id, e.target.value)}
-                                className={`w-full py-1.5 px-2.5 rounded-lg border text-xs focus:outline-none ${
-                                  !hasCount || difference === 0
-                                    ? 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
-                                    : 'bg-white border-amber-300 text-amber-900 font-medium focus:border-amber-500'
-                                }`}
-                              >
-                                {REASON_PRESETS.map((r) => (
-                                  <option key={r} value={r}>
-                                    {r}
-                                  </option>
-                                ))}
-                              </select>
-                            </td>
-
-                            {/* Row Notes */}
-                            <td className="py-2.5 px-4">
-                              <input
-                                type="text"
-                                value={notes}
-                                onChange={(e) => handleNotesChange(product.id, e.target.value)}
-                                placeholder="Keterangan..."
-                                className="w-full py-1.5 px-2.5 rounded-lg border border-slate-200 text-xs bg-white focus:outline-none focus:border-sky-500"
-                              />
-                            </td>
-                          </tr>
+                                return (
+                                  <tr
+                                    key={`${product.id}_${batch.id}`}
+                                    className="bg-indigo-50/40 text-xs border-b border-indigo-100/70"
+                                  >
+                                    <td className="py-2 px-3 text-center text-indigo-400 font-mono">
+                                      ↳
+                                    </td>
+                                    <td className="py-2 px-4 pl-7">
+                                      <div className="font-mono font-bold text-indigo-950 flex items-center gap-1.5 flex-wrap">
+                                        <span>Batch: {batch.batchNumber || batch.id}</span>
+                                        {batch.expiryDate && (
+                                          <span className="px-1.5 py-0.2 rounded bg-white border border-slate-200 text-[10px] font-normal text-slate-600">
+                                            Exp: {formatDateOnly(batch.expiryDate)}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 mt-0.5">
+                                        Masuk: {formatDateOnly(batch.receivedAt)} · Awal: {formatNumber(batch.initialQuantity)} {product.baseUnit}
+                                      </div>
+                                    </td>
+                                    <td className="py-2 px-3 font-mono text-slate-500">
+                                      {product.baseUnit}
+                                    </td>
+                                    <td className="py-2 px-3 font-mono font-semibold text-slate-700">
+                                      {formatRupiah(unitCost)}
+                                    </td>
+                                    <td className="py-2 px-3 text-center font-mono">
+                                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 font-bold text-slate-700">
+                                        {formatNumber(sysQty)}
+                                      </span>
+                                    </td>
+                                    <td className="py-2 px-4 bg-indigo-50/70 border-x border-indigo-100">
+                                      <div className="flex items-center gap-1 justify-center">
+                                        <button
+                                          type="button"
+                                          onClick={() => handleStepBatchCount(product.id, batch.id, -1)}
+                                          className="w-6 h-6 rounded-md bg-white border border-indigo-200 hover:bg-indigo-50 text-indigo-800 font-bold flex items-center justify-center shrink-0 cursor-pointer"
+                                          title="Kurang 1 batch"
+                                        >
+                                          <Minus className="w-3 h-3" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            sound.playTap();
+                                            setActiveKeypad({
+                                              title: `Hitung Batch ${batch.batchNumber || batch.id}`,
+                                              subtitle: `${product.name} · HPP ${formatRupiah(unitCost)}/${product.baseUnit}`,
+                                              initialValue: physQty,
+                                              unitName: product.baseUnit,
+                                              onConfirm: (val) =>
+                                                handleBatchCountChange(product.id, batch.id, String(val)),
+                                            });
+                                          }}
+                                          className={`w-16 text-center py-1 px-1.5 rounded-md font-mono font-black text-xs border cursor-pointer ${
+                                            batchEntered
+                                              ? bDiff !== 0
+                                                ? bDiff < 0
+                                                  ? 'border-rose-400 bg-rose-50 text-rose-800'
+                                                  : 'border-emerald-400 bg-emerald-50 text-emerald-800'
+                                                : 'border-indigo-400 bg-white text-indigo-950'
+                                              : 'border-dashed border-indigo-300 bg-white text-slate-400'
+                                          }`}
+                                          title="Sentuh untuk ubah stok fisik batch ini"
+                                        >
+                                          {batchEntered ? rawVal : sysQty}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleStepBatchCount(product.id, batch.id, 1)}
+                                          className="w-6 h-6 rounded-md bg-white border border-indigo-200 hover:bg-indigo-50 text-indigo-800 font-bold flex items-center justify-center shrink-0 cursor-pointer"
+                                          title="Tambah 1 batch"
+                                        >
+                                          <Plus className="w-3 h-3" />
+                                        </button>
+                                      </div>
+                                    </td>
+                                    <td className="py-2 px-3 text-center font-mono text-[11px] font-bold">
+                                      {!batchEntered && !hasBatchLevelCount ? (
+                                        <span className="text-slate-400 italic">-</span>
+                                      ) : bDiff === 0 ? (
+                                        <span className="text-slate-500">0</span>
+                                      ) : bDiff < 0 ? (
+                                        <span className="text-rose-600">
+                                          {bDiff} {product.baseUnit}
+                                        </span>
+                                      ) : (
+                                        <span className="text-emerald-600">
+                                          +{bDiff} {product.baseUnit}
+                                        </span>
+                                      )}
+                                    </td>
+                                    <td className="py-2 px-3 text-right font-mono text-[11px] font-bold">
+                                      {!batchEntered && !hasBatchLevelCount ? (
+                                        <span className="text-slate-300">-</span>
+                                      ) : bDiffVal === 0 ? (
+                                        <span className="text-slate-400">Rp 0</span>
+                                      ) : bDiffVal < 0 ? (
+                                        <span className="text-rose-600">{formatRupiah(bDiffVal)}</span>
+                                      ) : (
+                                        <span className="text-emerald-600">+{formatRupiah(bDiffVal)}</span>
+                                      )}
+                                    </td>
+                                    <td colSpan={2} className="py-2 px-4 text-[10.5px] text-indigo-700/80">
+                                      Audit FIFO batch individu (HPP {formatRupiah(unitCost)})
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                          </React.Fragment>
                         );
                       })
                     )}
@@ -3071,12 +3785,28 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
             <div className="sticky bottom-4 z-20 bg-slate-900 text-white p-4 rounded-2xl shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 border border-slate-800">
               <div className="space-y-0.5">
                 <div className="text-xs text-slate-400 font-medium">
-                  Ringkasan Penyesuaian Sesi Ini:
+                  Ringkasan Penyesuaian Sesi ({sessionDocNumber}):
                 </div>
                 <div className="text-sm font-bold flex items-center gap-3 flex-wrap">
                   <span>
                     Diperiksa: <strong>{countedItemsCount}</strong> SKU
                   </span>
+                  {countedCategoriesList.length > 0 && (
+                    <>
+                      <span>·</span>
+                      <span className="text-sky-300">
+                        {countedCategoriesList.length} Kategori
+                      </span>
+                    </>
+                  )}
+                  {multiBatchCountedCount > 0 && (
+                    <>
+                      <span>·</span>
+                      <span className="text-indigo-300">
+                        {multiBatchCountedCount} SKU Per-Batch
+                      </span>
+                    </>
+                  )}
                   <span>·</span>
                   <span className={discrepantItems.length > 0 ? 'text-amber-400' : 'text-emerald-400'}>
                     Selisih: <strong>{discrepantItems.length}</strong> SKU ({totalDiscrepantUnits > 0 ? `+${totalDiscrepantUnits}` : totalDiscrepantUnits} unit)
@@ -3099,7 +3829,7 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   className={`px-5 py-2.5 rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-2 ${
                     countedItemsCount === 0 || !canExecuteAdjustment
                       ? 'bg-slate-700 text-slate-400 cursor-not-allowed opacity-60'
-                      : 'bg-emerald-600 hover:bg-emerald-500 text-white active:scale-95 shadow-emerald-900/40'
+                      : 'bg-emerald-600 hover:bg-emerald-500 text-white active:scale-95 shadow-emerald-900/40 cursor-pointer'
                   }`}
                   title={!canExecuteAdjustment ? 'Hanya Store Manager & Admin' : 'Terapkan penyesuaian stok massal'}
                 >
@@ -3176,6 +3906,11 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                           <span className="text-[10px] bg-sky-50 text-sky-800 font-bold px-2 py-0.5 rounded-md border border-sky-200">
                             {record.generalReason}
                           </span>
+                          {record.auditMode === 'MULTI_BATCH' && (
+                            <span className="text-[10px] bg-indigo-50 text-indigo-800 font-bold px-2 py-0.5 rounded-md border border-indigo-200">
+                              Multi-Batch FIFO
+                            </span>
+                          )}
                         </div>
 
                         <div className="text-xs text-slate-600 flex items-center gap-3 flex-wrap">
@@ -3201,6 +3936,20 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                             Varians: {record.totalDifferenceValue > 0 ? `+${formatRupiah(record.totalDifferenceValue)}` : formatRupiah(record.totalDifferenceValue)}
                           </span>
                         </div>
+
+                        {record.auditedCategories && record.auditedCategories.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-1 text-[10px]">
+                            <span className="text-slate-500 font-semibold">Kategori Audit:</span>
+                            {record.auditedCategories.map((cat) => (
+                              <span
+                                key={cat}
+                                className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 font-medium"
+                              >
+                                {cat}
+                              </span>
+                            ))}
+                          </div>
+                        )}
 
                         {record.notes && (
                           <div className="text-[11px] text-slate-500 bg-slate-50 p-2 rounded-xl italic border border-slate-100">
@@ -4160,15 +4909,15 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => {
-                    sound.playSuccessChime();
-                    generateMonthlyStockMovementPdf({
+                  onClick={async () => {
+                    await generateMonthlyStockMovementPdf({
                       data: monthlyAuditData,
-                      storeSettings,
+                      storeSettings: storeSettings || INITIAL_STORE_SETTINGS,
                       auditorName: currentUser.name,
                       categoryFilter: auditCategoryFilter,
                       onlyWithMovement: auditOnlyWithMovement,
                     });
+                    sound.playSuccessChime();
                   }}
                   className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center gap-2 shadow-sm whitespace-nowrap shrink-0 cursor-pointer transition-colors self-start lg:self-auto"
                 >
@@ -4552,6 +5301,17 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   <span className="text-slate-500">Alasan:</span>{' '}
                   <strong className="text-slate-800">{sessionGeneralReason}</strong>
                 </div>
+                <div className="col-span-2">
+                  <span className="text-slate-500">Kategori Diaudit:</span>{' '}
+                  <strong className="text-slate-800">
+                    {Array.from(new Set([...selectedOpnameCategories, ...countedCategoriesList])).join(', ') || 'Semua'}
+                  </strong>
+                  {multiBatchCountedCount > 0 && (
+                    <span className="ml-2 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[10px] font-bold">
+                      {multiBatchCountedCount} SKU Per-Batch
+                    </span>
+                  )}
+                </div>
               </div>
 
               {/* User Penanggung Jawab Selector */}
@@ -4602,10 +5362,21 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {discrepantItems.map(({ product, physicalVal, difference, differenceValue, reason }) => (
+                        {discrepantItems.map(({ product, physicalVal, difference, differenceValue, reason, batchDetails }) => (
                           <tr key={product.id} className="hover:bg-slate-50">
                             <td className="p-2 font-bold text-slate-800">
-                              {product.name}
+                              <div>{product.name}</div>
+                              {batchDetails && batchDetails.length > 0 && (
+                                <div className="mt-1 space-y-0.5 font-normal text-[10px] font-mono text-indigo-800">
+                                  {batchDetails
+                                    .filter((bd) => bd.difference !== 0)
+                                    .map((bd) => (
+                                      <div key={bd.batchId}>
+                                        • {bd.batchNumber}: {bd.systemQty}→{bd.physicalQty} ({bd.difference > 0 ? `+${bd.difference}` : bd.difference})
+                                      </div>
+                                    ))}
+                                </div>
+                              )}
                             </td>
                             <td className="p-2 text-center font-mono">
                               {product.stockInBaseUnit} → <strong>{physicalVal}</strong> {product.baseUnit}
@@ -4724,8 +5495,19 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                 </div>
                 <div>
                   <span className="text-slate-500 block">Jenis Pemeriksaan</span>
-                  <strong className="text-slate-900">{selectedHistoricalOpname.generalReason}</strong>
+                  <strong className="text-slate-900">
+                    {selectedHistoricalOpname.generalReason}
+                    {selectedHistoricalOpname.auditMode === 'MULTI_BATCH' ? ' (Multi-Batch)' : ''}
+                  </strong>
                 </div>
+                {selectedHistoricalOpname.auditedCategories && selectedHistoricalOpname.auditedCategories.length > 0 && (
+                  <div className="col-span-2 sm:col-span-4 pt-1 border-t border-slate-200/70">
+                    <span className="text-slate-500">Kategori Diaudit: </span>
+                    <strong className="text-slate-800">
+                      {selectedHistoricalOpname.auditedCategories.join(', ')}
+                    </strong>
+                  </div>
+                )}
               </div>
 
               {selectedHistoricalOpname.notes && (
@@ -4741,40 +5523,69 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
                   <thead className="bg-slate-100 text-slate-700 font-bold border-b border-slate-200 uppercase text-[10px]">
                     <tr>
                       <th className="p-2 w-8 text-center">#</th>
-                      <th className="p-2">Nama Barang & SKU</th>
+                      <th className="p-2">Nama Barang &amp; Batch</th>
                       <th className="p-2 text-center">Satuan</th>
                       <th className="p-2 text-right">Modal (@)</th>
                       <th className="p-2 text-center">Stok Sistem</th>
                       <th className="p-2 text-center">Stok Fisik</th>
                       <th className="p-2 text-center">Selisih</th>
                       <th className="p-2 text-right">Nilai Selisih</th>
-                      <th className="p-2">Alasan & Catatan</th>
+                      <th className="p-2">Alasan &amp; Catatan</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {selectedHistoricalOpname.items.map((item, i) => (
-                      <tr key={i} className="hover:bg-slate-50/50">
-                        <td className="p-2 text-center text-slate-400 font-mono text-[11px]">{i + 1}</td>
-                        <td className="p-2 font-bold text-slate-900">{item.productName}</td>
-                        <td className="p-2 text-center font-mono">{item.baseUnit}</td>
-                        <td className="p-2 text-right font-mono">{formatRupiah(item.costPrice)}</td>
-                        <td className="p-2 text-center font-mono">{formatNumber(item.systemStock)}</td>
-                        <td className="p-2 text-center font-mono font-bold bg-slate-50">{formatNumber(item.physicalStock)}</td>
-                        <td className="p-2 text-center font-mono font-bold">
-                          <span className={item.difference < 0 ? 'text-rose-600' : item.difference > 0 ? 'text-emerald-600' : 'text-slate-500'}>
-                            {item.difference > 0 ? `+${item.difference}` : item.difference}
-                          </span>
-                        </td>
-                        <td className="p-2 text-right font-mono font-bold">
-                          <span className={item.differenceValue < 0 ? 'text-rose-600' : item.differenceValue > 0 ? 'text-emerald-600' : 'text-slate-400'}>
-                            {item.differenceValue > 0 ? `+${formatRupiah(item.differenceValue)}` : formatRupiah(item.differenceValue)}
-                          </span>
-                        </td>
-                        <td className="p-2 text-[11px] text-slate-700">
-                          <span className="font-medium text-slate-900">{item.reason}</span>
-                          {item.notes && <span className="text-slate-500 block italic">{item.notes}</span>}
-                        </td>
-                      </tr>
+                      <React.Fragment key={i}>
+                        <tr className="hover:bg-slate-50/50">
+                          <td className="p-2 text-center text-slate-400 font-mono text-[11px]">{i + 1}</td>
+                          <td className="p-2 font-bold text-slate-900">
+                            <div>{item.productName}</div>
+                            <div className="text-[10px] font-normal text-slate-500">{item.category}</div>
+                          </td>
+                          <td className="p-2 text-center font-mono">{item.baseUnit}</td>
+                          <td className="p-2 text-right font-mono">{formatRupiah(item.costPrice)}</td>
+                          <td className="p-2 text-center font-mono">{formatNumber(item.systemStock)}</td>
+                          <td className="p-2 text-center font-mono font-bold bg-slate-50">{formatNumber(item.physicalStock)}</td>
+                          <td className="p-2 text-center font-mono font-bold">
+                            <span className={item.difference < 0 ? 'text-rose-600' : item.difference > 0 ? 'text-emerald-600' : 'text-slate-500'}>
+                              {item.difference > 0 ? `+${item.difference}` : item.difference}
+                            </span>
+                          </td>
+                          <td className="p-2 text-right font-mono font-bold">
+                            <span className={item.differenceValue < 0 ? 'text-rose-600' : item.differenceValue > 0 ? 'text-emerald-600' : 'text-slate-400'}>
+                              {item.differenceValue > 0 ? `+${formatRupiah(item.differenceValue)}` : formatRupiah(item.differenceValue)}
+                            </span>
+                          </td>
+                          <td className="p-2 text-[11px] text-slate-700">
+                            <span className="font-medium text-slate-900">{item.reason}</span>
+                            {item.notes && <span className="text-slate-500 block italic">{item.notes}</span>}
+                          </td>
+                        </tr>
+                        {item.batchDetails &&
+                          item.batchDetails.map((bd) => (
+                            <tr key={`${i}_${bd.batchId}`} className="bg-indigo-50/30 text-[10.5px]">
+                              <td className="p-1.5 text-center text-indigo-400 font-mono">↳</td>
+                              <td className="p-1.5 pl-4 font-mono font-semibold text-indigo-950">
+                                Batch {bd.batchNumber}
+                              </td>
+                              <td className="p-1.5 text-center font-mono text-slate-500">{item.baseUnit}</td>
+                              <td className="p-1.5 text-right font-mono text-slate-600">{formatRupiah(bd.costPrice)}</td>
+                              <td className="p-1.5 text-center font-mono text-slate-600">{formatNumber(bd.systemQty)}</td>
+                              <td className="p-1.5 text-center font-mono font-bold text-indigo-950">{formatNumber(bd.physicalQty)}</td>
+                              <td className="p-1.5 text-center font-mono font-bold">
+                                <span className={bd.difference < 0 ? 'text-rose-600' : bd.difference > 0 ? 'text-emerald-600' : 'text-slate-500'}>
+                                  {bd.difference > 0 ? `+${bd.difference}` : bd.difference}
+                                </span>
+                              </td>
+                              <td className="p-1.5 text-right font-mono font-bold">
+                                <span className={bd.differenceValue < 0 ? 'text-rose-600' : bd.differenceValue > 0 ? 'text-emerald-600' : 'text-slate-400'}>
+                                  {bd.differenceValue > 0 ? `+${formatRupiah(bd.differenceValue)}` : formatRupiah(bd.differenceValue)}
+                                </span>
+                              </td>
+                              <td className="p-1.5 text-slate-500">Audit Per-Batch FIFO</td>
+                            </tr>
+                          ))}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
@@ -5420,6 +6231,19 @@ export const StockReportView: React.FC<StockReportViewProps> = ({
           }}
         />
       )}
+      {/* Monthly Stock Movement Audit Modal (In / Out / Opname) */}
+      <MonthlyStockMovementModal
+        isOpen={isMonthlyMovementModalOpen}
+        onClose={() => setIsMonthlyMovementModalOpen(false)}
+        products={products}
+        purchases={purchases}
+        transactions={transactions}
+        stockOpnames={stockOpnames}
+        storeSettings={storeSettings}
+        auditorName={currentUser?.name || 'Admin Gudang'}
+        initialMonthKey={auditMonthKey}
+        onStartOpnameSession={() => setActiveSubTab('OPNAME_SESSION')}
+      />
     </div>
   );
 };

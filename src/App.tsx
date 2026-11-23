@@ -10,7 +10,12 @@ import {
   TrendingUp,
   Printer,
   Bluetooth,
-  RotateCcw
+  RotateCcw,
+  WifiOff,
+  RefreshCw,
+  HardDrive,
+  CheckCircle2,
+  ShieldAlert
 } from 'lucide-react';
 import { 
   User, 
@@ -39,7 +44,14 @@ import {
   EmployeeActivityLog,
   TransactionReturnItem,
   TransactionReturnRecord,
-  TransactionAuditLogEntry
+  TransactionAuditLogEntry,
+  TaxConfig,
+  TaxRecord,
+  TaxAuditCategory,
+  TaxAuditChangeItem,
+  TaxAuditLog,
+  TaxAdjustment,
+  BalanceSheetEntry,
 } from './types/pos';
 import { 
   DEFAULT_ADMIN_USER,
@@ -78,10 +90,30 @@ import { StockReportView } from './components/StockReportView';
 import { DailyProfitLossView } from './components/DailyProfitLossView';
 import { MonthlySalesReportView } from './components/MonthlySalesReportView';
 import { SalesPerformanceDashboard } from './components/SalesPerformanceDashboard';
+import { SalesReportView } from './components/SalesReportView';
 import { FinanceView } from './components/FinanceView';
 import { FifoReconciliationModal } from './components/FifoReconciliationModal';
 import { OnlineStorefrontPage } from './components/OnlineStorefrontPage';
 import { OnlineOrdersManagementView } from './components/OnlineOrdersManagementView';
+import { EmployeeActivityView } from './components/EmployeeActivityView';
+import { TaxManagementView } from './components/TaxManagementView';
+import { BalanceSheetView } from './components/BalanceSheetView';
+import { GoogleDriveBackupPanel } from './components/GoogleDriveBackupPanel';
+import { OfflineQueueModal } from './components/OfflineQueueModal';
+import { BackgroundSyncProgressIndicator } from './components/BackgroundSyncProgressIndicator';
+import { SyncHealthDashboardView } from './components/SyncHealthDashboardView';
+import { SyncActivityLogView } from './components/SyncActivityLogView';
+import { buildFullBackupPayload } from './utils/backupPayload';
+import { resolveProductDiscount } from './utils/promoUtils';
+import {
+  subscribeOfflineSyncQueue,
+  mergeOfflinePendingCollection,
+  mergeOfflinePendingSettings,
+  removeOfflineSyncJob,
+  clearOfflineSyncQueue,
+  getOfflineQueueCount,
+  OfflineSyncJob,
+} from './utils/offlineQueue';
 import {
   findCustomerSpecialPrice,
   isCustomerMember,
@@ -92,7 +124,20 @@ import {
 } from './utils/customerUtils';
 import { generateInvoiceNumber, formatNumber, formatRupiah } from './utils/formatters';
 import { recalculateChronologicalFifoForNewTransaction, restoreProductBatchesForReturn } from './utils/fifoUtils';
+import {
+  runBatchIntegrityCheck,
+  reconcileBatchIntegrityIssues,
+  applyMultiBatchOpnameToProduct,
+  revertMultiBatchOpnameFromProduct,
+  BatchIntegrityCheckReport,
+} from './utils/batchIntegrity';
 import { getCategoryColor } from './utils/categoryColors';
+import {
+  diffTaxConfigs,
+  getEffectiveTaxConfig,
+  TAX_ADJUSTMENT_REASON_LABELS,
+  TAX_ADJUSTMENT_TARGET_LABELS,
+} from './utils/taxUtils';
 import { sound } from './utils/audio';
 import {
   printDirectBluetooth,
@@ -129,6 +174,7 @@ import {
 } from './utils/adminDailySalesAlert';
 import { 
   seedCollectionIfEmpty, 
+  seedCollectionIfEmptyWithResult,
   subscribeToCollection, 
   saveDocumentToFirestore, 
   deleteDocumentFromFirestore, 
@@ -139,10 +185,46 @@ import {
   pauseFirestoreCloudSync,
   resumeFirestoreCloudSync,
   setCloudSyncPaused,
+  testFirestoreConnection,
+  verifyFirestoreServerConnection,
+  forceSyncFirestoreNow,
+  clearPendingSyncQueueStatus,
+  subscribePendingSyncQueue,
+  appendFirestoreConnectionLog,
+  logFirestoreError,
+  formatFirestoreSyncErrorMessage,
   handleFirestoreError,
   OperationType,
-  CloudSyncStatus
+  CloudSyncStatus,
+  FirestoreVerificationResult,
+  runFirestoreSyncHealthAudit,
+  executeSingleOfflineSyncJobNow,
 } from './utils/firebaseSync';
+import {
+  recordCloudNonEmptyCollection,
+  clearCloudCollectionHistory,
+  wasPreviouslyNonEmptyOnServer,
+  isUserExplicitlyClearedDatabase,
+  evaluateCloudEmptySnapshotProtection,
+} from './utils/syncSafeguard';
+import {
+  BackgroundSyncProgressSnapshot,
+  SyncActivityLogEntry,
+  SyncModuleSummary,
+  clearSyncActivityLogs,
+  getBackgroundSyncProgress,
+  getSyncActivityLogs,
+  getSyncModuleLabel,
+  getSyncModuleSummaries,
+  recordModuleSyncActivity,
+  subscribeBackgroundSyncProgress,
+  subscribeSyncActivityLogs,
+} from './utils/syncTelemetry';
+import {
+  SyncConflictItem,
+  SyncHealthAuditReport,
+  SyncRecommendedAction,
+} from './utils/syncConflictDetector';
 
 const detectStorefrontRouteFromUrl = (): { isShop: boolean; trackCode: string } => {
   if (typeof window === 'undefined') return { isShop: false, trackCode: '' };
@@ -278,6 +360,18 @@ export default function App() {
   const [activityLogs, setActivityLogs] = useState<EmployeeActivityLog[]>(() =>
     loadStorage('kasir_activity_logs', [])
   );
+  const [taxRecords, setTaxRecords] = useState<TaxRecord[]>(() =>
+    loadStorage('kasir_tax_records', [])
+  );
+  const [taxAuditLogs, setTaxAuditLogs] = useState<TaxAuditLog[]>(() =>
+    loadStorage('kasir_tax_audit_logs', [])
+  );
+  const [taxAdjustments, setTaxAdjustments] = useState<TaxAdjustment[]>(() =>
+    loadStorage('kasir_tax_adjustments', [])
+  );
+  const [balanceSheetEntries, setBalanceSheetEntries] = useState<BalanceSheetEntry[]>(() =>
+    loadStorage('kasir_balance_sheet_entries', [])
+  );
   const [isGlobalFifoReconcileOpen, setIsGlobalFifoReconcileOpen] = useState<boolean>(false);
   const [storeSettings, setStoreSettings] = useState<StoreSettings>(() => {
     const loaded = loadStorage<Partial<StoreSettings>>('kasir_settings', INITIAL_STORE_SETTINGS);
@@ -369,6 +463,25 @@ export default function App() {
     if (combined.onlineStoreDeliveryEnabled === undefined) {
       combined.onlineStoreDeliveryEnabled = true;
     }
+    combined.taxConfig = {
+      ...(INITIAL_STORE_SETTINGS.taxConfig || {
+        taxpayerStatus: 'UMKM_OP',
+        npwp: '',
+        taxpayerName: '',
+        enablePphFinalUmkm: true,
+        pphFinalRatePercent: 0.5,
+        applyUmkmOpThreshold500Jt: true,
+        enablePpn: false,
+        ppnRatePercent: 11,
+        ppnMode: 'INCLUSIVE',
+        deductInputVatFromPurchases: true,
+        enablePb1: false,
+        pb1RatePercent: 10,
+        excludeCashWithdrawalPrincipal: true,
+        monthlyDueDay: 15,
+      }),
+      ...(combined.taxConfig || {}),
+    };
     return combined;
   });
 
@@ -470,8 +583,140 @@ export default function App() {
   const [isShiftSummaryModalOpen, setIsShiftSummaryModalOpen] = useState(false);
   const [isThresholdModalOpen, setIsThresholdModalOpen] = useState(false);
 
-  // Cloud Sync state
+  // Cloud Sync & Offline Mode Queue state
   const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncStatus>('CONNECTING');
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
+  const [syncRetryNonce, setSyncRetryNonce] = useState<number>(0);
+  const [pendingSyncQueueCount, setPendingSyncQueueCount] = useState<number>(0);
+  const [focusFirestoreSettingsNonce, setFocusFirestoreSettingsNonce] = useState<number>(0);
+  const [offlineQueueJobs, setOfflineQueueJobs] = useState<OfflineSyncJob[]>([]);
+  const [isBrowserOnline, setIsBrowserOnline] = useState<boolean>(() =>
+    typeof navigator === 'undefined' ? true : navigator.onLine !== false
+  );
+  const [isOfflineQueueModalOpen, setIsOfflineQueueModalOpen] = useState(false);
+  const [isGoogleDriveBackupModalOpen, setIsGoogleDriveBackupModalOpen] = useState(false);
+  const [isAutoSyncingOffline, setIsAutoSyncingOffline] = useState(false);
+  const [offlineSyncResultToast, setOfflineSyncResultToast] = useState<string | null>(null);
+
+  // Sync Telemetry, Per-Collection Background Progress & Conflict Health Audit State
+  const [syncActivityLogs, setSyncActivityLogs] = useState<SyncActivityLogEntry[]>(() =>
+    getSyncActivityLogs()
+  );
+  const [syncModuleSummaries, setSyncModuleSummaries] = useState<SyncModuleSummary[]>(() =>
+    getSyncModuleSummaries()
+  );
+  const [backgroundSyncProgress, setBackgroundSyncProgress] =
+    useState<BackgroundSyncProgressSnapshot>(() => getBackgroundSyncProgress());
+  const [syncAuditReport, setSyncAuditReport] = useState<SyncHealthAuditReport | null>(null);
+  const [isScanningSyncHealth, setIsScanningSyncHealth] = useState(false);
+  const [isResolvingBulkSyncConflicts, setIsResolvingBulkSyncConflicts] = useState(false);
+  const [resolvingConflictId, setResolvingConflictId] = useState<string | null>(null);
+  const [syncHealthScanError, setSyncHealthScanError] = useState<string | null>(null);
+  const hasAutoAuditedSyncRef = useRef(false);
+
+  useEffect(() => {
+    return subscribePendingSyncQueue((count) => {
+      setPendingSyncQueueCount(count);
+    });
+  }, []);
+
+  useEffect(() => {
+    return subscribeOfflineSyncQueue((jobs) => {
+      setOfflineQueueJobs(jobs);
+    });
+  }, []);
+
+  useEffect(() => {
+    return subscribeSyncActivityLogs(({ logs, summaries }) => {
+      setSyncActivityLogs(logs);
+      setSyncModuleSummaries(summaries);
+    });
+  }, []);
+
+  useEffect(() => {
+    return subscribeBackgroundSyncProgress((snap) => {
+      setBackgroundSyncProgress(snap);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onOnline = () => setIsBrowserOnline(true);
+    const onOffline = () => setIsBrowserOnline(false);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!offlineSyncResultToast) return;
+    const timer = window.setTimeout(() => {
+      setOfflineSyncResultToast(null);
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [offlineSyncResultToast]);
+
+  // Automatic stability-checked sync when device connectivity returns and queue has pending jobs
+  useEffect(() => {
+    if (!isBrowserOnline || storeSettings.manualOfflineMode || offlineQueueJobs.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    const runStabilityAutoSync = async () => {
+      if (cancelled || isAutoSyncingOffline) return;
+      const beforeCount = getOfflineQueueCount();
+      if (beforeCount <= 0) return;
+
+      setIsAutoSyncingOffline(true);
+      try {
+        const result = await verifyFirestoreServerConnection({
+          forceResumeNetwork: true,
+          flushPendingQueue: true,
+          operationLabel: 'AUTO SYNC OFFLINE',
+        });
+        if (cancelled) return;
+        const afterCount = getOfflineQueueCount();
+        const syncedNow = Math.max(0, beforeCount - afterCount);
+        if (result.ok) {
+          setCloudSyncError(null);
+          setCloudSyncStatus('SYNCED');
+        }
+        if (syncedNow > 0) {
+          sound.playSuccessChime();
+          setOfflineSyncResultToast(
+            `${syncedNow} data antrean Mode Offline berhasil disinkronkan otomatis ke Firebase.${
+              afterCount > 0 ? ` Sisa antrean: ${afterCount}.` : ''
+            }`
+          );
+        }
+      } catch {
+        // Queue stays safely persisted in localStorage and will retry
+      } finally {
+        if (!cancelled) {
+          setIsAutoSyncingOffline(false);
+        }
+      }
+    };
+
+    const initialTimer = window.setTimeout(() => {
+      void runStabilityAutoSync();
+    }, 1500);
+    const retryInterval = window.setInterval(() => {
+      if (getOfflineQueueCount() > 0 && navigator.onLine !== false) {
+        void runStabilityAutoSync();
+      }
+    }, 30000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initialTimer);
+      window.clearInterval(retryInterval);
+    };
+  }, [isBrowserOnline, storeSettings.manualOfflineMode, offlineQueueJobs.length]);
 
   // Automated Daily Multi-Product & Scheduled Low-Stock Admin WhatsApp Alert state
   const [adminLowStockWaAlert, setAdminLowStockWaAlert] = useState<{
@@ -504,6 +749,68 @@ export default function App() {
   const prevProductsStockRef = useRef<Map<string, { stock: number; minStockAlert: number }>>(new Map());
   const hasSeededStockTrackerRef = useRef(false);
 
+  // Automatic Startup & Continuous Batch Integrity Verification Script
+  const lastBatchCheckSourceRef = useRef<'STARTUP' | 'CLOUD_SYNC' | 'POST_OPNAME' | 'MANUAL'>('STARTUP');
+  const [batchIntegrityReport, setBatchIntegrityReport] = useState<BatchIntegrityCheckReport>(() =>
+    runBatchIntegrityCheck(products, { source: 'STARTUP' })
+  );
+  const [dismissedBatchAlertSig, setDismissedBatchAlertSig] = useState<string | null>(null);
+  const [openVerifyStockNonce, setOpenVerifyStockNonce] = useState<number>(0);
+
+  const batchIntegrityIssueSig = useMemo(() => {
+    if (batchIntegrityReport.isClean) return '';
+    return batchIntegrityReport.issueItems
+      .map((item) => `${item.product.id}:${item.discrepancy}:${item.negativeBatches.length}:${item.hasNegativeTotal ? 1 : 0}`)
+      .join('|');
+  }, [batchIntegrityReport]);
+
+  useEffect(() => {
+    const source = lastBatchCheckSourceRef.current;
+    const report = runBatchIntegrityCheck(products, { source });
+    setBatchIntegrityReport(report);
+    if (!report.isClean) {
+      console.warn(
+        `[BatchIntegrity:${source}] Ditemukan ${report.criticalIssuesCount} produk bermasalah (batch negatif: ${report.negativeBatchProductsCount}, mismatch stok-batch: ${report.mismatchProductsCount}).`
+      );
+    }
+    lastBatchCheckSourceRef.current = 'MANUAL';
+  }, [products]);
+
+  const handleRecheckBatchIntegrity = (source: 'STARTUP' | 'CLOUD_SYNC' | 'POST_OPNAME' | 'MANUAL' = 'MANUAL') => {
+    const report = runBatchIntegrityCheck(products, { source });
+    setBatchIntegrityReport(report);
+    setDismissedBatchAlertSig(null);
+    return report;
+  };
+
+  const handleAutoFixAllBatchIntegrity = () => {
+    const { updatedProducts, fixedCount, fixedProducts } = reconcileBatchIntegrityIssues(products);
+    if (fixedCount <= 0) {
+      setBatchIntegrityReport(runBatchIntegrityCheck(products, { source: 'MANUAL' }));
+      return 0;
+    }
+    lastBatchCheckSourceRef.current = 'MANUAL';
+    setProducts(updatedProducts);
+    saveBatchToFirestore('products', fixedProducts).catch(() => {});
+    recordActivityLog({
+      actionType: 'MANUAL_STOCK_ADJUSTMENT',
+      targetType: 'PRODUCT',
+      targetId: fixedProducts[0]?.id || 'batch_integrity_fix',
+      targetLabel: `Perbaikan Integritas ${fixedCount} Produk Batch`,
+      summary: `Sinkronisasi & perbaikan otomatis batch negatif/selisih untuk ${fixedCount} SKU oleh ${currentUser.name}`,
+      oldValue: `${batchIntegrityReport.criticalIssuesCount} SKU bermasalah`,
+      newValue: '0 SKU bermasalah (Batch Valid >= 0)',
+      deltaValue: `${fixedCount} SKU diperbaiki`,
+      numericDelta: fixedCount,
+      reason: 'Perbaikan otomatis pengecekan integritas batch barang',
+    });
+    sound.playSuccessChime();
+    setOfflineSyncResultToast(
+      `Integritas batch ${fixedCount} produk berhasil diperbaiki (nol stok negatif & batch sinkron).`
+    );
+    return fixedCount;
+  };
+
   // Sync state to localStorage asynchronously in background (debounced idle write) so UI stays responsive
   useEffect(() => scheduleSaveStorage('kasir_users', users), [users]);
   useEffect(() => scheduleSaveStorage('kasir_active_user', currentUser), [currentUser]);
@@ -519,6 +826,10 @@ export default function App() {
   useEffect(() => scheduleSaveStorage('kasir_cashflows', cashflows), [cashflows]);
   useEffect(() => scheduleSaveStorage('kasir_online_orders', onlineOrders), [onlineOrders]);
   useEffect(() => scheduleSaveStorage('kasir_activity_logs', activityLogs), [activityLogs]);
+  useEffect(() => scheduleSaveStorage('kasir_tax_records', taxRecords), [taxRecords]);
+  useEffect(() => scheduleSaveStorage('kasir_tax_audit_logs', taxAuditLogs), [taxAuditLogs]);
+  useEffect(() => scheduleSaveStorage('kasir_tax_adjustments', taxAdjustments), [taxAdjustments]);
+  useEffect(() => scheduleSaveStorage('kasir_balance_sheet_entries', balanceSheetEntries), [balanceSheetEntries]);
   useEffect(() => scheduleSaveStorage('kasir_settings', storeSettings), [storeSettings]);
 
   // O(1) Product & Barcode lookup indexes to avoid linear scans across large catalogs
@@ -579,172 +890,690 @@ export default function App() {
     return map;
   }, [products]);
 
+  const latestSyncStateRef = useRef({
+    users,
+    storeSettings,
+    products,
+    purchases,
+    categories,
+    customerCategories,
+    customers,
+    suppliers,
+    transactions,
+    attendances,
+    stockOpnames,
+    cashflows,
+    onlineOrders,
+    activityLogs,
+    taxRecords,
+    taxAuditLogs,
+    taxAdjustments,
+    balanceSheetEntries,
+  });
+  latestSyncStateRef.current = {
+    users,
+    storeSettings,
+    products,
+    purchases,
+    categories,
+    customerCategories,
+    customers,
+    suppliers,
+    transactions,
+    attendances,
+    stockOpnames,
+    cashflows,
+    onlineOrders,
+    activityLogs,
+    taxRecords,
+    taxAuditLogs,
+    taxAdjustments,
+    balanceSheetEntries,
+  };
+
   // Real-time Firestore Multi-Device Synchronization & Connection
   useEffect(() => {
     if (storeSettings.manualOfflineMode) {
       pauseFirestoreCloudSync().catch(() => {});
+      setCloudSyncError(null);
       setCloudSyncStatus('OFFLINE');
       return;
     }
 
     let active = true;
-    setCloudSyncStatus('CONNECTING');
-    resumeFirestoreCloudSync().catch(() => {});
+    let hasListenerError = false;
+    let unsubs: Array<() => void> = [];
+    setCloudSyncError(null);
 
-    // Bootstrap default accounts & settings if missing
-    const bootstrapStore = async () => {
-      try {
-        await seedCollectionIfEmpty('users', INITIAL_USERS);
-        await seedCollectionIfEmpty('settings', [{ ...INITIAL_STORE_SETTINGS, id: 'store_config' }]);
-        await seedCollectionIfEmpty('customer_categories', INITIAL_CUSTOMER_CATEGORIES);
-      } catch (err) {
-        console.warn('[CloudSync] Bootstrap notice:', err);
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setCloudSyncStatus('OFFLINE');
+      setCloudSyncError('Perangkat tidak terhubung ke internet (Offline).');
+    } else {
+      setCloudSyncStatus('CONNECTING');
+    }
+
+    let hasLoggedSessionSync = false;
+    let bootstrapDone = false;
+    let seededUsersOk = false;
+    let seededSettingsOk = false;
+    let seededCustCatsOk = false;
+    let bootstrapPermBlocked = false;
+    let bootstrapAttemptCount = 0;
+    let bootstrapNextRetryAt = 0;
+    const MAX_BOOTSTRAP_ATTEMPTS = 3;
+    const BOOTSTRAP_RETRY_COOLDOWN_MS = 20000;
+    let bootstrapInFlight: Promise<boolean> | null = null;
+    let hasSettingsServerSnapshot = false;
+    let hasUsersServerSnapshot = false;
+    let serverHasSettingsDoc = false;
+    let serverHasUsersDoc = false;
+    const backfilledCollections = new Set<string>();
+    const loggedSessionDownloads = new Set<string>();
+    const pendingEmptyEvaluations = new Map<string, () => void>();
+
+    const isBootstrapCoreResolved = () => hasSettingsServerSnapshot || hasUsersServerSnapshot;
+    const flushPendingEmptyEvaluations = () => {
+      if (!active || pendingEmptyEvaluations.size === 0) return;
+      const tasks = Array.from(pendingEmptyEvaluations.values());
+      pendingEmptyEvaluations.clear();
+      tasks.forEach((fn) => fn());
+    };
+
+    // Bootstrap default accounts & settings if missing (throttled & halted immediately on permission-denied)
+    const bootstrapStore = async (options?: { force?: boolean }): Promise<boolean> => {
+      if (!active) return false;
+      if (seededUsersOk && seededSettingsOk && seededCustCatsOk) {
+        bootstrapDone = true;
+        return true;
+      }
+      if (bootstrapInFlight) return bootstrapInFlight;
+      if (!options?.force) {
+        if (bootstrapPermBlocked) return false;
+        if (bootstrapAttemptCount >= MAX_BOOTSTRAP_ATTEMPTS) return false;
+        if (Date.now() < bootstrapNextRetryAt) return false;
+      }
+
+      bootstrapInFlight = (async () => {
+        try {
+          bootstrapAttemptCount += 1;
+          const snapshot = latestSyncStateRef.current;
+          const seedUsers = snapshot.users.length > 0 ? snapshot.users : INITIAL_USERS;
+          const seedSettings = [{ ...(snapshot.storeSettings || INITIAL_STORE_SETTINGS), id: 'store_config' }];
+          const seedCustCats =
+            snapshot.customerCategories.length > 0
+              ? snapshot.customerCategories
+              : INITIAL_CUSTOMER_CATEGORIES;
+
+          const [resUsers, resSettings, resCustCats] = await Promise.all([
+            seededUsersOk
+              ? Promise.resolve({ ok: true })
+              : seedCollectionIfEmptyWithResult('users', seedUsers, { ignoreUserClearedFlag: true }),
+            seededSettingsOk
+              ? Promise.resolve({ ok: true })
+              : seedCollectionIfEmptyWithResult('settings', seedSettings, { ignoreUserClearedFlag: true }),
+            seededCustCatsOk
+              ? Promise.resolve({ ok: true })
+              : seedCollectionIfEmptyWithResult('customer_categories', seedCustCats, {
+                  ignoreUserClearedFlag: true,
+                }),
+          ]);
+
+          if (resUsers.ok) seededUsersOk = true;
+          if (resSettings.ok) seededSettingsOk = true;
+          if (resCustCats.ok) seededCustCatsOk = true;
+
+          if (
+            ('permissionDenied' in resUsers && resUsers.permissionDenied) ||
+            ('permissionDenied' in resSettings && resSettings.permissionDenied) ||
+            ('permissionDenied' in resCustCats && resCustCats.permissionDenied)
+          ) {
+            bootstrapPermBlocked = true;
+          }
+
+          const allOk = seededUsersOk && seededSettingsOk && seededCustCatsOk;
+          if (allOk) {
+            bootstrapDone = true;
+            bootstrapNextRetryAt = 0;
+          } else {
+            bootstrapNextRetryAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
+          }
+          return allOk;
+        } catch (err) {
+          bootstrapNextRetryAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
+          console.warn('[CloudSync] Bootstrap notice:', err);
+          return false;
+        } finally {
+          bootstrapInFlight = null;
+        }
+      })();
+      return bootstrapInFlight;
+    };
+
+    const handleCollectionSyncError = (collectionName: string) => (err: Error) => {
+      if (!active) return;
+      hasLoggedSessionSync = false;
+      hasListenerError = true;
+      logFirestoreError(err, OperationType.LIST, collectionName);
+      const formatted = formatFirestoreSyncErrorMessage(err);
+      recordModuleSyncActivity({
+        collectionName,
+        direction: 'DOWNLOAD',
+        operation: 'SNAPSHOT_SYNC',
+        status: 'ERROR',
+        recordCount: 0,
+        summary: `Listener real-time ${getSyncModuleLabel(collectionName)} terputus/gagal.`,
+        errorMessage: formatted,
+        errorCode: String((err as { code?: unknown })?.code || '') || undefined,
+      });
+      setCloudSyncError(formatted);
+      setCloudSyncStatus('OFFLINE');
+    };
+
+    const markSynced = () => {
+      if (!active) return;
+      setCloudSyncError(null);
+      setCloudSyncStatus('SYNCED');
+      if (!hasLoggedSessionSync) {
+        hasLoggedSessionSync = true;
+        appendFirestoreConnectionLog({
+          status: 'SUCCESS',
+          operation: 'SINKRONISASI REAL-TIME',
+          message: 'Seluruh listener koleksi Firebase Firestore aktif dan tersinkronisasi dengan server.',
+        });
       }
     };
 
-    bootstrapStore();
-
-    // Real-time Listeners across all devices
-    const unsubs = [
-      subscribeToCollection<Product>('products', (cloudProds) => {
-        if (!active) return;
-        const sanitized = sanitizeProducts(cloudProds);
-        setProducts(sanitized);
-        setCloudSyncStatus('SYNCED');
-      }, () => setCloudSyncStatus('OFFLINE')),
-
-      subscribeToCollection<RestockOrder>('purchases', (cloudPurchases) => {
-        if (!active) return;
-        const sorted = cloudPurchases.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        setPurchases(sorted);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<ProductCategory>('categories', (cloudCats) => {
-        if (!active) return;
-        setCategories(cloudCats);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<CustomerCategoryItem>('customer_categories', (cloudCats) => {
-        if (!active) return;
-        if (cloudCats.length > 0) {
-          setCustomerCategories(cloudCats);
+    const verifyServerConnection = async () => {
+      if (!active) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        setCloudSyncStatus('OFFLINE');
+        setCloudSyncError('Perangkat tidak terhubung ke internet (Offline).');
+        appendFirestoreConnectionLog({
+          status: 'ERROR',
+          operation: 'INISIALISASI',
+          message: 'Perangkat tidak terhubung ke internet (Offline).',
+          errorCode: 'network-offline',
+        });
+        return;
+      }
+      const result = await verifyFirestoreServerConnection({
+        flushPendingQueue: !storeSettings.manualOfflineMode && getOfflineQueueCount() > 0,
+        operationLabel: 'VERIFIKASI REKONEKSI',
+      });
+      if (!active) return;
+      if (result.ok) {
+        markSynced();
+        if (!bootstrapDone && !bootstrapPermBlocked) {
+          void bootstrapStore();
         }
-        setCloudSyncStatus('SYNCED');
-      }),
+      } else {
+        setCloudSyncStatus((prev) => (prev === 'SYNCED' ? 'SYNCED' : 'OFFLINE'));
+        setCloudSyncError((prev) => prev || result.message);
+      }
+    };
 
-      subscribeToCollection<Customer>('customers', (cloudCusts) => {
-        if (!active) return;
-        setCustomers(cloudCusts);
-        setCloudSyncStatus('SYNCED');
-      }),
+    const handleWindowOnline = () => {
+      if (!active) return;
+      setIsBrowserOnline(true);
+      setCloudSyncError(null);
+      setCloudSyncStatus('CONNECTING');
+      appendFirestoreConnectionLog({
+        status: 'INFO',
+        operation: 'JARINGAN',
+        message: 'Koneksi internet perangkat kembali online. Mencoba menghubungkan ulang Firestore...',
+      });
+      if (hasListenerError) {
+        setSyncRetryNonce((n) => n + 1);
+      } else {
+        verifyServerConnection();
+      }
+    };
 
-      subscribeToCollection<Supplier>('suppliers', (cloudSups) => {
-        if (!active) return;
-        setSuppliers(cloudSups);
-        setCloudSyncStatus('SYNCED');
-      }),
+    const handleWindowOffline = () => {
+      if (!active) return;
+      setIsBrowserOnline(false);
+      setCloudSyncStatus('OFFLINE');
+      setCloudSyncError('Perangkat tidak terhubung ke internet (Offline).');
+      appendFirestoreConnectionLog({
+        status: 'ERROR',
+        operation: 'JARINGAN',
+        message: 'Perangkat kehilangan koneksi internet (Browser Offline).',
+        errorCode: 'network-offline',
+      });
+    };
 
-      subscribeToCollection<Transaction>('transactions', (cloudTxs) => {
-        if (!active) return;
-        const sorted = cloudTxs.sort((a, b) => b.timestamp - a.timestamp);
-        setTransactions(sorted);
-        setCloudSyncStatus('SYNCED');
-      }),
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleWindowOnline);
+      window.addEventListener('offline', handleWindowOffline);
+    }
 
-      subscribeToCollection<AttendanceRecord>('attendances', (cloudAtt) => {
-        if (!active) return;
-        setAttendances(cloudAtt);
-        setCloudSyncStatus('SYNCED');
-      }),
+    const applyProtectedCollectionSnapshot = <T extends { id: string }>(
+      collectionName: string,
+      cloudItems: T[],
+      getLocalItems: () => T[],
+      meta: { fromCache: boolean; hasPendingWrites: boolean } | undefined,
+      applyItems: (items: T[]) => void,
+      transform?: (items: T[]) => T[],
+      options?: { allowAutoBackfill?: boolean }
+    ) => {
+      if (!active) return;
+      const fromCache = Boolean(meta?.fromCache);
+      const localItems = getLocalItems();
+      const merged = mergeOfflinePendingCollection(collectionName, cloudItems);
 
-      subscribeToCollection<StockOpnameRecord>('stock_opnames', (cloudOpnames) => {
-        if (!active) return;
-        setStockOpnames(cloudOpnames);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<CashflowRecord>('cashflows', (cloudCashflows) => {
-        if (!active) return;
-        const sorted = cloudCashflows.sort((a, b) => b.timestamp - a.timestamp);
-        setCashflows(sorted);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<OnlineOrder>('online_orders', (cloudOrders) => {
-        if (!active) return;
-        const sorted = cloudOrders.sort((a, b) => b.createdAt - a.createdAt);
-        setOnlineOrders(sorted);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<EmployeeActivityLog>('activity_logs', (cloudLogs) => {
-        if (!active) return;
-        const sorted = cloudLogs.sort((a, b) => b.timestamp - a.timestamp);
-        setActivityLogs(sorted);
-        setCloudSyncStatus('SYNCED');
-      }),
-
-      subscribeToCollection<User>('users', (cloudUsers) => {
-        if (!active) return;
-        if (cloudUsers.length > 0) {
-          setUsers(cloudUsers);
-          setCurrentUser((current) => {
-            if (!cloudUsers.some((u) => u.id === current.id)) {
-              return cloudUsers[0];
-            }
-            return current;
+      if (!fromCache && cloudItems.length > 0) {
+        pendingEmptyEvaluations.delete(collectionName);
+        recordCloudNonEmptyCollection(collectionName, cloudItems.length);
+        if (!loggedSessionDownloads.has(collectionName)) {
+          loggedSessionDownloads.add(collectionName);
+          recordModuleSyncActivity({
+            collectionName,
+            direction: 'DOWNLOAD',
+            operation: 'SNAPSHOT_SYNC',
+            status: 'SUCCESS',
+            recordCount: cloudItems.length,
+            summary: `Sinkronisasi real-time ${cloudItems.length} data ${getSyncModuleLabel(collectionName)} dari server.`,
           });
         }
-        setCloudSyncStatus('SYNCED');
-      }),
+      }
 
-      subscribeToCollection<any>('settings', (cloudSettingsList) => {
-        if (!active) return;
-        const cfg = cloudSettingsList.find((s) => s.id === 'store_config');
-        if (cfg) {
-          const { id, ...rest } = cfg;
-          setStoreSettings((prev) => ({
-            ...prev,
-            ...rest,
-            dailySalesGoal: rest.dailySalesGoal && rest.dailySalesGoal > 0 ? rest.dailySalesGoal : (prev.dailySalesGoal ?? 5000000),
-            weeklySalesGoal: rest.weeklySalesGoal && rest.weeklySalesGoal > 0 ? rest.weeklySalesGoal : (prev.weeklySalesGoal ?? 30000000),
-            monthlySalesGoal: rest.monthlySalesGoal && rest.monthlySalesGoal > 0 ? rest.monthlySalesGoal : (prev.monthlySalesGoal ?? 120000000),
-            categorySalesGoals: rest.categorySalesGoals && typeof rest.categorySalesGoals === 'object' ? rest.categorySalesGoals : (prev.categorySalesGoals ?? {}),
-            autoSendWhatsAppReceipt: rest.autoSendWhatsAppReceipt !== undefined ? rest.autoSendWhatsAppReceipt : (prev.autoSendWhatsAppReceipt ?? false),
-            includeReceiptSummaryInAutoWa: rest.includeReceiptSummaryInAutoWa !== undefined ? rest.includeReceiptSummaryInAutoWa : (prev.includeReceiptSummaryInAutoWa ?? true),
-            includeLoyaltyPointsInAutoWa: rest.includeLoyaltyPointsInAutoWa !== undefined ? rest.includeLoyaltyPointsInAutoWa : (prev.includeLoyaltyPointsInAutoWa ?? true),
-            useCustomWhatsAppTemplate: rest.useCustomWhatsAppTemplate !== undefined ? rest.useCustomWhatsAppTemplate : (prev.useCustomWhatsAppTemplate ?? false),
-            customWhatsAppTemplate: rest.customWhatsAppTemplate !== undefined ? rest.customWhatsAppTemplate : (prev.customWhatsAppTemplate ?? INITIAL_STORE_SETTINGS.customWhatsAppTemplate),
-            autoAdminLowStockWhatsApp: rest.autoAdminLowStockWhatsApp !== undefined ? rest.autoAdminLowStockWhatsApp : (prev.autoAdminLowStockWhatsApp ?? true),
-            adminWhatsAppNumber: rest.adminWhatsAppNumber !== undefined ? rest.adminWhatsAppNumber : (prev.adminWhatsAppNumber ?? ''),
-            adminLowStockTriggerCount: rest.adminLowStockTriggerCount && rest.adminLowStockTriggerCount >= 2 ? rest.adminLowStockTriggerCount : (prev.adminLowStockTriggerCount ?? 2),
-            scheduledAdminLowStockWhatsApp: rest.scheduledAdminLowStockWhatsApp
-              ? normalizeLowStockSchedule(rest.scheduledAdminLowStockWhatsApp)
-              : (prev.scheduledAdminLowStockWhatsApp ?? DEFAULT_LOW_STOCK_SCHEDULE),
-            scheduledDailySalesReportWhatsApp: rest.scheduledDailySalesReportWhatsApp
-              ? normalizeDailySalesSchedule(rest.scheduledDailySalesReportWhatsApp)
-              : (prev.scheduledDailySalesReportWhatsApp ?? DEFAULT_DAILY_SALES_SCHEDULE),
-            printerConnectionType: rest.printerConnectionType || prev.printerConnectionType || 'BLUETOOTH',
-            printerPaperWidth: rest.printerPaperWidth || prev.printerPaperWidth || '58mm',
-            printerDeviceName: rest.printerDeviceName !== undefined ? rest.printerDeviceName : (prev.printerDeviceName || ''),
-            printerAutoCut: rest.printerAutoCut !== undefined ? rest.printerAutoCut : (prev.printerAutoCut ?? true),
-            autoPrintReceipt: rest.autoPrintReceipt !== undefined ? rest.autoPrintReceipt : (prev.autoPrintReceipt ?? false),
-            pointsPerSpend: rest.pointsPerSpend !== undefined ? rest.pointsPerSpend : (prev.pointsPerSpend ?? 1),
-            autoApplyMaxPoints: rest.autoApplyMaxPoints !== undefined ? rest.autoApplyMaxPoints : (prev.autoApplyMaxPoints ?? false),
-            requireTransactionNote: rest.requireTransactionNote !== undefined ? rest.requireTransactionNote : (prev.requireTransactionNote ?? false),
-          }));
+      const wasPrevNonEmpty = wasPreviouslyNonEmptyOnServer(collectionName);
+      // Wait for settings/users server confirmation before accepting a remote-clear of previously synced data
+      if (
+        !fromCache &&
+        merged.length === 0 &&
+        localItems.length > 0 &&
+        wasPrevNonEmpty &&
+        !isBootstrapCoreResolved() &&
+        !isUserExplicitlyClearedDatabase()
+      ) {
+        pendingEmptyEvaluations.set(collectionName, () => {
+          applyProtectedCollectionSnapshot(
+            collectionName,
+            cloudItems,
+            getLocalItems,
+            meta,
+            applyItems,
+            transform,
+            options
+          );
+        });
+        return;
+      }
+
+      const protection = evaluateCloudEmptySnapshotProtection({
+        collectionName,
+        mergedItemsCount: merged.length,
+        localItemsCount: localItems.length,
+        fromCache,
+        isUserClearedDb: isUserExplicitlyClearedDatabase(),
+        serverHasBootstrapCore: serverHasSettingsDoc || serverHasUsersDoc,
+        wasPreviouslyNonEmpty: wasPrevNonEmpty,
+      });
+
+      if (protection.action === 'KEEP_LOCAL_ONLY') {
+        return;
+      }
+
+      if (protection.action === 'KEEP_LOCAL_AND_BACKFILL') {
+        const allowBackfill = options?.allowAutoBackfill !== false;
+        if (allowBackfill && localItems.length > 0 && !backfilledCollections.has(collectionName)) {
+          backfilledCollections.add(collectionName);
+          saveBatchToFirestore(collectionName, localItems).catch(() => {
+            backfilledCollections.delete(collectionName);
+          });
+          appendFirestoreConnectionLog({
+            status: 'INFO',
+            operation: `PROTEKSI DATA (${collectionName})`,
+            message: `Server Firestore kosong untuk koleksi ${collectionName}. Mempertahankan ${localItems.length} data lokal & menyinkronkan ulang ke server.`,
+          });
+          setOfflineSyncResultToast(
+            `Proteksi Sinkronisasi: ${localItems.length} data ${collectionName} lokal dipertahankan & disinkronkan ke server.`
+          );
         }
-        setCloudSyncStatus('SYNCED');
-      }),
-    ];
+        if (!fromCache) markSynced();
+        return;
+      }
+
+      const finalItems = transform ? transform(merged) : merged;
+      applyItems(finalItems);
+      if (!fromCache) markSynced();
+    };
+
+    const attachRealtimeListeners = async () => {
+      await resumeFirestoreCloudSync().catch(() => {});
+      if (!active) return;
+
+      verifyServerConnection();
+      void bootstrapStore();
+
+      // Real-time Listeners across all devices (protected against empty cache wipes & empty-server overwrites)
+      unsubs = [
+        subscribeToCollection<Product>(
+          'products',
+          (cloudProds, meta) =>
+            applyProtectedCollectionSnapshot(
+              'products',
+              cloudProds,
+              () => latestSyncStateRef.current.products,
+              meta,
+              (next) => {
+                lastBatchCheckSourceRef.current = 'CLOUD_SYNC';
+                setProducts(next);
+              },
+              sanitizeProducts
+            ),
+          handleCollectionSyncError('products')
+        ),
+
+        subscribeToCollection<RestockOrder>(
+          'purchases',
+          (cloudPurchases, meta) =>
+            applyProtectedCollectionSnapshot(
+              'purchases',
+              cloudPurchases,
+              () => latestSyncStateRef.current.purchases,
+              meta,
+              setPurchases,
+              (items) => [...items].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+            ),
+          handleCollectionSyncError('purchases')
+        ),
+
+        subscribeToCollection<ProductCategory>(
+          'categories',
+          (cloudCats, meta) =>
+            applyProtectedCollectionSnapshot(
+              'categories',
+              cloudCats,
+              () => latestSyncStateRef.current.categories,
+              meta,
+              setCategories
+            ),
+          handleCollectionSyncError('categories')
+        ),
+
+        subscribeToCollection<CustomerCategoryItem>(
+          'customer_categories',
+          (cloudCats, meta) =>
+            applyProtectedCollectionSnapshot(
+              'customer_categories',
+              cloudCats,
+              () => latestSyncStateRef.current.customerCategories,
+              meta,
+              (next) => {
+                if (next.length > 0) setCustomerCategories(next);
+              }
+            ),
+          handleCollectionSyncError('customer_categories')
+        ),
+
+        subscribeToCollection<Customer>(
+          'customers',
+          (cloudCusts, meta) =>
+            applyProtectedCollectionSnapshot(
+              'customers',
+              cloudCusts,
+              () => latestSyncStateRef.current.customers,
+              meta,
+              setCustomers
+            ),
+          handleCollectionSyncError('customers')
+        ),
+
+        subscribeToCollection<Supplier>(
+          'suppliers',
+          (cloudSups, meta) =>
+            applyProtectedCollectionSnapshot(
+              'suppliers',
+              cloudSups,
+              () => latestSyncStateRef.current.suppliers,
+              meta,
+              setSuppliers
+            ),
+          handleCollectionSyncError('suppliers')
+        ),
+
+        subscribeToCollection<Transaction>(
+          'transactions',
+          (cloudTxs, meta) =>
+            applyProtectedCollectionSnapshot(
+              'transactions',
+              cloudTxs,
+              () => latestSyncStateRef.current.transactions,
+              meta,
+              setTransactions,
+              (items) => [...items].sort((a, b) => b.timestamp - a.timestamp)
+            ),
+          handleCollectionSyncError('transactions')
+        ),
+
+        subscribeToCollection<AttendanceRecord>(
+          'attendances',
+          (cloudAtt, meta) =>
+            applyProtectedCollectionSnapshot(
+              'attendances',
+              cloudAtt,
+              () => latestSyncStateRef.current.attendances,
+              meta,
+              setAttendances
+            ),
+          handleCollectionSyncError('attendances')
+        ),
+
+        subscribeToCollection<StockOpnameRecord>(
+          'stock_opnames',
+          (cloudOpnames, meta) =>
+            applyProtectedCollectionSnapshot(
+              'stock_opnames',
+              cloudOpnames,
+              () => latestSyncStateRef.current.stockOpnames,
+              meta,
+              setStockOpnames
+            ),
+          handleCollectionSyncError('stock_opnames')
+        ),
+
+        subscribeToCollection<CashflowRecord>(
+          'cashflows',
+          (cloudCashflows, meta) =>
+            applyProtectedCollectionSnapshot(
+              'cashflows',
+              cloudCashflows,
+              () => latestSyncStateRef.current.cashflows,
+              meta,
+              setCashflows,
+              (items) => [...items].sort((a, b) => b.timestamp - a.timestamp)
+            ),
+          handleCollectionSyncError('cashflows')
+        ),
+
+        subscribeToCollection<OnlineOrder>(
+          'online_orders',
+          (cloudOrders, meta) =>
+            applyProtectedCollectionSnapshot(
+              'online_orders',
+              cloudOrders,
+              () => latestSyncStateRef.current.onlineOrders,
+              meta,
+              setOnlineOrders,
+              (items) => [...items].sort((a, b) => b.createdAt - a.createdAt)
+            ),
+          handleCollectionSyncError('online_orders')
+        ),
+
+        subscribeToCollection<EmployeeActivityLog>(
+          'activity_logs',
+          (cloudLogs, meta) =>
+            applyProtectedCollectionSnapshot(
+              'activity_logs',
+              cloudLogs,
+              () => latestSyncStateRef.current.activityLogs,
+              meta,
+              setActivityLogs,
+              (items) => [...items].sort((a, b) => b.timestamp - a.timestamp)
+            ),
+          handleCollectionSyncError('activity_logs')
+        ),
+
+        subscribeToCollection<TaxRecord>(
+          'tax_records',
+          (cloudTaxes, meta) =>
+            applyProtectedCollectionSnapshot(
+              'tax_records',
+              cloudTaxes,
+              () => latestSyncStateRef.current.taxRecords,
+              meta,
+              setTaxRecords,
+              (items) => [...items].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+            ),
+          handleCollectionSyncError('tax_records')
+        ),
+
+        subscribeToCollection<TaxAuditLog>(
+          'tax_audit_logs',
+          (cloudAuditLogs, meta) =>
+            applyProtectedCollectionSnapshot(
+              'tax_audit_logs',
+              cloudAuditLogs,
+              () => latestSyncStateRef.current.taxAuditLogs,
+              meta,
+              setTaxAuditLogs,
+              (items) => [...items].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+            ),
+          handleCollectionSyncError('tax_audit_logs')
+        ),
+
+        subscribeToCollection<TaxAdjustment>(
+          'tax_adjustments',
+          (cloudAdjustments, meta) =>
+            applyProtectedCollectionSnapshot(
+              'tax_adjustments',
+              cloudAdjustments,
+              () => latestSyncStateRef.current.taxAdjustments,
+              meta,
+              setTaxAdjustments,
+              (items) => [...items].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+            ),
+          handleCollectionSyncError('tax_adjustments')
+        ),
+
+        subscribeToCollection<BalanceSheetEntry>(
+          'balance_sheet_entries',
+          (cloudEntries, meta) =>
+            applyProtectedCollectionSnapshot(
+              'balance_sheet_entries',
+              cloudEntries,
+              () => latestSyncStateRef.current.balanceSheetEntries,
+              meta,
+              setBalanceSheetEntries,
+              (items) => [...items].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+            ),
+          handleCollectionSyncError('balance_sheet_entries')
+        ),
+
+        subscribeToCollection<User>('users', (cloudUsers, meta) => {
+          if (!active) return;
+          const fromCache = Boolean(meta?.fromCache);
+          if (!fromCache) {
+            hasUsersServerSnapshot = true;
+            serverHasUsersDoc = cloudUsers.length > 0;
+            if (cloudUsers.length > 0) {
+              seededUsersOk = true;
+              recordCloudNonEmptyCollection('users', cloudUsers.length);
+            } else if (!bootstrapPermBlocked) {
+              seededUsersOk = false;
+              bootstrapDone = false;
+              void bootstrapStore();
+            }
+            flushPendingEmptyEvaluations();
+          }
+          const merged = mergeOfflinePendingCollection('users', cloudUsers);
+          if (merged.length > 0) {
+            setUsers(merged);
+            setCurrentUser((current) => {
+              if (!merged.some((u) => u.id === current.id)) {
+                return merged[0];
+              }
+              return current;
+            });
+          }
+          if (!fromCache) markSynced();
+        }, handleCollectionSyncError('users')),
+
+        subscribeToCollection<any>('settings', (cloudSettingsList, meta) => {
+          if (!active) return;
+          const fromCache = Boolean(meta?.fromCache);
+          const cfg = cloudSettingsList.find((s) => s.id === 'store_config');
+          if (!fromCache) {
+            hasSettingsServerSnapshot = true;
+            serverHasSettingsDoc = Boolean(cfg);
+            if (cfg) {
+              seededSettingsOk = true;
+              recordCloudNonEmptyCollection('settings', cloudSettingsList.length);
+            } else if (!bootstrapPermBlocked) {
+              seededSettingsOk = false;
+              bootstrapDone = false;
+              void bootstrapStore();
+            }
+            flushPendingEmptyEvaluations();
+          }
+          if (cfg) {
+            const { id, ...rawRest } = cfg;
+            const rest = mergeOfflinePendingSettings(rawRest as StoreSettings);
+            setStoreSettings((prev) => ({
+              ...prev,
+              ...rest,
+              dailySalesGoal: rest.dailySalesGoal && rest.dailySalesGoal > 0 ? rest.dailySalesGoal : (prev.dailySalesGoal ?? 5000000),
+              weeklySalesGoal: rest.weeklySalesGoal && rest.weeklySalesGoal > 0 ? rest.weeklySalesGoal : (prev.weeklySalesGoal ?? 30000000),
+              monthlySalesGoal: rest.monthlySalesGoal && rest.monthlySalesGoal > 0 ? rest.monthlySalesGoal : (prev.monthlySalesGoal ?? 120000000),
+              categorySalesGoals: rest.categorySalesGoals && typeof rest.categorySalesGoals === 'object' ? rest.categorySalesGoals : (prev.categorySalesGoals ?? {}),
+              autoSendWhatsAppReceipt: rest.autoSendWhatsAppReceipt !== undefined ? rest.autoSendWhatsAppReceipt : (prev.autoSendWhatsAppReceipt ?? false),
+              includeReceiptSummaryInAutoWa: rest.includeReceiptSummaryInAutoWa !== undefined ? rest.includeReceiptSummaryInAutoWa : (prev.includeReceiptSummaryInAutoWa ?? true),
+              includeLoyaltyPointsInAutoWa: rest.includeLoyaltyPointsInAutoWa !== undefined ? rest.includeLoyaltyPointsInAutoWa : (prev.includeLoyaltyPointsInAutoWa ?? true),
+              useCustomWhatsAppTemplate: rest.useCustomWhatsAppTemplate !== undefined ? rest.useCustomWhatsAppTemplate : (prev.useCustomWhatsAppTemplate ?? false),
+              customWhatsAppTemplate: rest.customWhatsAppTemplate !== undefined ? rest.customWhatsAppTemplate : (prev.customWhatsAppTemplate ?? INITIAL_STORE_SETTINGS.customWhatsAppTemplate),
+              autoAdminLowStockWhatsApp: rest.autoAdminLowStockWhatsApp !== undefined ? rest.autoAdminLowStockWhatsApp : (prev.autoAdminLowStockWhatsApp ?? true),
+              adminWhatsAppNumber: rest.adminWhatsAppNumber !== undefined ? rest.adminWhatsAppNumber : (prev.adminWhatsAppNumber ?? ''),
+              adminLowStockTriggerCount: rest.adminLowStockTriggerCount && rest.adminLowStockTriggerCount >= 2 ? rest.adminLowStockTriggerCount : (prev.adminLowStockTriggerCount ?? 2),
+              scheduledAdminLowStockWhatsApp: rest.scheduledAdminLowStockWhatsApp
+                ? normalizeLowStockSchedule(rest.scheduledAdminLowStockWhatsApp)
+                : (prev.scheduledAdminLowStockWhatsApp ?? DEFAULT_LOW_STOCK_SCHEDULE),
+              scheduledDailySalesReportWhatsApp: rest.scheduledDailySalesReportWhatsApp
+                ? normalizeDailySalesSchedule(rest.scheduledDailySalesReportWhatsApp)
+                : (prev.scheduledDailySalesReportWhatsApp ?? DEFAULT_DAILY_SALES_SCHEDULE),
+              printerConnectionType: rest.printerConnectionType || prev.printerConnectionType || 'BLUETOOTH',
+              printerPaperWidth: rest.printerPaperWidth || prev.printerPaperWidth || '58mm',
+              printerDeviceName: rest.printerDeviceName !== undefined ? rest.printerDeviceName : (prev.printerDeviceName || ''),
+              printerAutoCut: rest.printerAutoCut !== undefined ? rest.printerAutoCut : (prev.printerAutoCut ?? true),
+              autoPrintReceipt: rest.autoPrintReceipt !== undefined ? rest.autoPrintReceipt : (prev.autoPrintReceipt ?? false),
+              requireTransactionNote: rest.requireTransactionNote !== undefined ? rest.requireTransactionNote : (prev.requireTransactionNote ?? false),
+              taxConfig: rest.taxConfig
+                ? {
+                    ...(INITIAL_STORE_SETTINGS.taxConfig!),
+                    ...(prev.taxConfig || {}),
+                    ...rest.taxConfig,
+                  }
+                : prev.taxConfig ?? INITIAL_STORE_SETTINGS.taxConfig,
+            }));
+          }
+          if (!fromCache) markSynced();
+        }, handleCollectionSyncError('settings')),
+      ];
+    };
+
+    attachRealtimeListeners();
 
     return () => {
       active = false;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleWindowOnline);
+        window.removeEventListener('offline', handleWindowOffline);
+      }
       unsubs.forEach((unsub) => unsub());
+      unsubs = [];
     };
-  }, [storeSettings.manualOfflineMode]);
+  }, [storeSettings.manualOfflineMode, syncRetryNonce]);
 
   // Keep selectedCustomer updated if customers list changes
   useEffect(() => {
@@ -1071,7 +1900,7 @@ export default function App() {
     let totalSavedRupiah = 0;
     const appliedNames: string[] = [];
 
-    // Check and automatically update special customer category pricing for all items already in cart
+    // Check and automatically update customer special pricing & product promos for all items in cart
     const nextCart = cart.map((item) => {
       const product = productMap.get(item.productId);
       if (!product) return item;
@@ -1083,47 +1912,36 @@ export default function App() {
         product.units.find((u) => u.id === item.selectedUnit.id || u.unitName === item.selectedUnit.unitName) ||
         item.selectedUnit;
 
-      // Standard original price (with variant adjustment if applicable)
-      let standardPrice = freshUnit.sellingPrice;
-      if (item.selectedVariant && product.variants) {
-        const vObj = product.variants.find((v) => v.name.toLowerCase() === item.selectedVariant?.toLowerCase());
-        if (vObj && vObj.price !== undefined && vObj.price > 0) {
-          standardPrice = vObj.price * (freshUnit.conversionFactor || 1);
-        } else if (vObj && vObj.priceAdjustment) {
-          standardPrice = Math.max(0, freshUnit.sellingPrice + vObj.priceAdjustment * (freshUnit.conversionFactor || 1));
-        }
-      }
+      const resolved = resolveProductDiscount(
+        product,
+        freshUnit,
+        item.selectedVariant,
+        customer,
+        item.quantity
+      );
 
-      const specialPricing = effectiveCategory
-        ? findCustomerSpecialPrice(product, effectiveCategory, freshUnit, item.quantity)
-        : null;
-
-      if (specialPricing) {
+      if (resolved.source === 'CUSTOMER_SPECIAL' && resolved.hasDiscount) {
         specialAppliedCount += 1;
-        totalSavedRupiah += Math.max(0, (standardPrice - specialPricing.specialPrice) * item.quantity);
+        totalSavedRupiah += resolved.savingsPerUnit * item.quantity;
         if (!appliedNames.includes(item.productName)) {
           appliedNames.push(item.productName);
         }
-        return {
-          ...item,
-          selectedUnit: freshUnit,
-          unitPrice: specialPricing.specialPrice,
-          subtotal: item.quantity * specialPricing.specialPrice,
-          isCustomerSpecialPrice: true,
-          customerPriceCategory: effectiveCategory,
-          originalUnitPrice: standardPrice,
-        };
       }
 
-      // Revert to standard price if customer has no special price for this item
       return {
         ...item,
         selectedUnit: freshUnit,
-        unitPrice: standardPrice,
-        subtotal: item.quantity * standardPrice,
-        isCustomerSpecialPrice: false,
-        customerPriceCategory: undefined,
-        originalUnitPrice: standardPrice,
+        unitPrice: resolved.effectiveUnitPrice,
+        subtotal: item.quantity * resolved.effectiveUnitPrice,
+        isCustomerSpecialPrice: resolved.source === 'CUSTOMER_SPECIAL',
+        customerPriceCategory:
+          resolved.source === 'CUSTOMER_SPECIAL'
+            ? resolved.customerPriceCategory || effectiveCategory
+            : undefined,
+        productDiscountPercent:
+          resolved.source === 'PRODUCT_PROMO' ? resolved.discountPercent : undefined,
+        promoLabel: resolved.promoLabel,
+        originalUnitPrice: resolved.baseUnitPrice,
       };
     });
 
@@ -1155,17 +1973,6 @@ export default function App() {
 
     const maxUnits = Math.floor(product.stockInBaseUnit / unit.conversionFactor);
 
-    // Calculate standard unit price with variant specific price or adjustment if applicable
-    let standardUnitPrice = unit.sellingPrice;
-    if (selectedVariant && product.variants) {
-      const vObj = product.variants.find((v) => v.name.toLowerCase() === selectedVariant.toLowerCase());
-      if (vObj && vObj.price !== undefined && vObj.price > 0) {
-        standardUnitPrice = vObj.price * (unit.conversionFactor || 1);
-      } else if (vObj && vObj.priceAdjustment) {
-        standardUnitPrice = Math.max(0, unit.sellingPrice + (vObj.priceAdjustment * (unit.conversionFactor || 1)));
-      }
-    }
-
     if (existingIndex > -1) {
       const updatedCart = [...cart];
       const newQty = updatedCart[existingIndex].quantity + qtyToAdd;
@@ -1174,30 +1981,26 @@ export default function App() {
         return;
       }
 
-      // Re-evaluate customer special price with updated total quantity
-      let effectivePrice = updatedCart[existingIndex].unitPrice;
-      let isSpecial = updatedCart[existingIndex].isCustomerSpecialPrice;
-      let cat = updatedCart[existingIndex].customerPriceCategory;
-
       if (!updatedCart[existingIndex].isCustomPrice) {
-        const activeCat = getEffectiveCustomerCategory(selectedCustomer);
-        const specialPricing = findCustomerSpecialPrice(product, activeCat, unit, newQty);
-        if (specialPricing) {
-          effectivePrice = specialPricing.specialPrice;
-          isSpecial = true;
-          cat = activeCat;
-        } else {
-          effectivePrice = standardUnitPrice;
-          isSpecial = false;
-          cat = undefined;
-        }
+        const resolved = resolveProductDiscount(
+          product,
+          unit,
+          selectedVariant,
+          selectedCustomer,
+          newQty
+        );
+        updatedCart[existingIndex].unitPrice = resolved.effectiveUnitPrice;
+        updatedCart[existingIndex].originalUnitPrice = resolved.baseUnitPrice;
+        updatedCart[existingIndex].isCustomerSpecialPrice =
+          resolved.source === 'CUSTOMER_SPECIAL';
+        updatedCart[existingIndex].customerPriceCategory = resolved.customerPriceCategory;
+        updatedCart[existingIndex].productDiscountPercent =
+          resolved.source === 'PRODUCT_PROMO' ? resolved.discountPercent : undefined;
+        updatedCart[existingIndex].promoLabel = resolved.promoLabel;
       }
 
       updatedCart[existingIndex].quantity = newQty;
-      updatedCart[existingIndex].unitPrice = effectivePrice;
-      updatedCart[existingIndex].isCustomerSpecialPrice = isSpecial;
-      updatedCart[existingIndex].customerPriceCategory = cat;
-      updatedCart[existingIndex].subtotal = newQty * effectivePrice;
+      updatedCart[existingIndex].subtotal = newQty * updatedCart[existingIndex].unitPrice;
       setCart(updatedCart);
     } else {
       if (qtyToAdd > maxUnits) {
@@ -1205,18 +2008,13 @@ export default function App() {
         return;
       }
 
-      // Check special customer price with quantity trigger
-      let effectiveUnitPrice = standardUnitPrice;
-      let isCustomerSpecialPrice = false;
-      let customerPriceCategory: string | undefined = undefined;
-
-      const activeCat = getEffectiveCustomerCategory(selectedCustomer);
-      const specialPricing = findCustomerSpecialPrice(product, activeCat, unit, qtyToAdd);
-      if (specialPricing) {
-        effectiveUnitPrice = specialPricing.specialPrice;
-        isCustomerSpecialPrice = true;
-        customerPriceCategory = activeCat;
-      }
+      const resolved = resolveProductDiscount(
+        product,
+        unit,
+        selectedVariant,
+        selectedCustomer,
+        qtyToAdd
+      );
 
       const newItem: CartItem = {
         cartItemId: 'c_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
@@ -1226,15 +2024,18 @@ export default function App() {
         baseUnit: product.baseUnit,
         selectedUnit: unit,
         quantity: qtyToAdd,
-        unitPrice: effectiveUnitPrice,
-        originalUnitPrice: standardUnitPrice,
-        subtotal: qtyToAdd * effectiveUnitPrice,
+        unitPrice: resolved.effectiveUnitPrice,
+        originalUnitPrice: resolved.baseUnitPrice,
+        subtotal: qtyToAdd * resolved.effectiveUnitPrice,
         availableStockInUnits: maxUnits,
         selectedVariant: selectedVariant || undefined,
         isService: product.productType === 'JASA',
         serviceNotes: product.serviceNotes,
-        isCustomerSpecialPrice,
-        customerPriceCategory,
+        isCustomerSpecialPrice: resolved.source === 'CUSTOMER_SPECIAL',
+        customerPriceCategory: resolved.customerPriceCategory,
+        productDiscountPercent:
+          resolved.source === 'PRODUCT_PROMO' ? resolved.discountPercent : undefined,
+        promoLabel: resolved.promoLabel,
       };
       setCart([...cart, newItem]);
     }
@@ -1476,46 +2277,39 @@ export default function App() {
           }
 
           let unitPrice = item.unitPrice;
+          let originalUnitPrice = item.originalUnitPrice || item.selectedUnit.sellingPrice;
           let isCustomerSpecialPrice = item.isCustomerSpecialPrice;
           let customerPriceCategory = item.customerPriceCategory;
+          let productDiscountPercent = item.productDiscountPercent;
+          let promoLabel = item.promoLabel;
 
-          // Re-evaluate special pricing trigger on quantity changes
+          // Re-evaluate product promo & special pricing trigger on quantity changes
           if (!item.isCustomPrice && product) {
-            let standardUnitPrice = item.originalUnitPrice || item.selectedUnit.sellingPrice;
-            if (item.selectedVariant && product.variants) {
-              const vObj = product.variants.find((v) => v.name.toLowerCase() === item.selectedVariant?.toLowerCase());
-              if (vObj && vObj.price !== undefined && vObj.price > 0) {
-                standardUnitPrice = vObj.price * (item.selectedUnit.conversionFactor || 1);
-              } else if (vObj && vObj.priceAdjustment) {
-                standardUnitPrice = Math.max(0, item.selectedUnit.sellingPrice + (vObj.priceAdjustment * (item.selectedUnit.conversionFactor || 1)));
-              }
-            }
-
-            const activeCat = getEffectiveCustomerCategory(selectedCustomer);
-            const specialPricing = findCustomerSpecialPrice(
+            const resolved = resolveProductDiscount(
               product,
-              activeCat,
               item.selectedUnit,
+              item.selectedVariant,
+              selectedCustomer,
               newQty
             );
-
-            if (specialPricing) {
-              unitPrice = specialPricing.specialPrice;
-              isCustomerSpecialPrice = true;
-              customerPriceCategory = activeCat;
-            } else {
-              unitPrice = standardUnitPrice;
-              isCustomerSpecialPrice = false;
-              customerPriceCategory = undefined;
-            }
+            unitPrice = resolved.effectiveUnitPrice;
+            originalUnitPrice = resolved.baseUnitPrice;
+            isCustomerSpecialPrice = resolved.source === 'CUSTOMER_SPECIAL';
+            customerPriceCategory = resolved.customerPriceCategory;
+            productDiscountPercent =
+              resolved.source === 'PRODUCT_PROMO' ? resolved.discountPercent : undefined;
+            promoLabel = resolved.promoLabel;
           }
 
           return {
             ...item,
             quantity: newQty,
             unitPrice,
+            originalUnitPrice,
             isCustomerSpecialPrice,
             customerPriceCategory,
+            productDiscountPercent,
+            promoLabel,
             subtotal: newQty * unitPrice,
           };
         }
@@ -1529,20 +2323,39 @@ export default function App() {
       prev.map((item) => {
         if (item.cartItemId === cartItemId) {
           const product = productMap.get(item.productId);
-          const activeCat = getEffectiveCustomerCategory(selectedCustomer);
-          const specialPricing = product
-            ? findCustomerSpecialPrice(product, activeCat, newUnit, item.quantity)
-            : null;
-          const price = specialPricing ? specialPricing.specialPrice : newUnit.sellingPrice;
+          if (product) {
+            const resolved = resolveProductDiscount(
+              product,
+              newUnit,
+              item.selectedVariant,
+              selectedCustomer,
+              item.quantity
+            );
+            return {
+              ...item,
+              selectedUnit: newUnit,
+              unitPrice: resolved.effectiveUnitPrice,
+              subtotal: item.quantity * resolved.effectiveUnitPrice,
+              isCustomPrice: false,
+              originalUnitPrice: resolved.baseUnitPrice,
+              isCustomerSpecialPrice: resolved.source === 'CUSTOMER_SPECIAL',
+              customerPriceCategory: resolved.customerPriceCategory,
+              productDiscountPercent:
+                resolved.source === 'PRODUCT_PROMO' ? resolved.discountPercent : undefined,
+              promoLabel: resolved.promoLabel,
+            };
+          }
           return {
             ...item,
             selectedUnit: newUnit,
-            unitPrice: price,
-            subtotal: item.quantity * price,
+            unitPrice: newUnit.sellingPrice,
+            subtotal: item.quantity * newUnit.sellingPrice,
             isCustomPrice: false,
             originalUnitPrice: newUnit.sellingPrice,
-            isCustomerSpecialPrice: !!specialPricing,
-            customerPriceCategory: specialPricing ? activeCat : undefined,
+            isCustomerSpecialPrice: false,
+            customerPriceCategory: undefined,
+            productDiscountPercent: undefined,
+            promoLabel: undefined,
           };
         }
         return item;
@@ -2010,6 +2823,8 @@ export default function App() {
             batchDeductions: [],
             isCustomerSpecialPrice: item.isCustomerSpecialPrice,
             customerPriceCategory: item.customerPriceCategory,
+            ...(item.productDiscountPercent !== undefined ? { productDiscountPercent: item.productDiscountPercent } : {}),
+            ...(item.promoLabel ? { promoLabel: item.promoLabel } : {}),
           };
         }),
       };
@@ -2025,6 +2840,8 @@ export default function App() {
 
       setProducts(recalcResult.updatedProducts);
       setTransactions(recalcResult.updatedTransactions);
+      saveStorage('kasir_products', recalcResult.updatedProducts);
+      saveStorage('kasir_transactions', recalcResult.updatedTransactions);
       recordWithdrawalCashflowForTransaction(finalizedNewTransaction);
 
       if (selectedCustomer) {
@@ -2044,6 +2861,7 @@ export default function App() {
           return c;
         });
         setCustomers(updatedCustomers);
+        saveStorage('kasir_customers', updatedCustomers);
         const custObj = customers.find((c) => c.id === selectedCustomer.id);
         if (custObj) {
           const newPoints = custObj.totalPoints - pointsUsed + pointsEarned;
@@ -2204,6 +3022,7 @@ export default function App() {
     });
 
     setProducts(updatedProducts);
+    saveStorage('kasir_products', updatedProducts);
 
     // 2. Update Customer Points & Debt (if applicable)
     if (selectedCustomer) {
@@ -2223,6 +3042,7 @@ export default function App() {
         return c;
       });
       setCustomers(updatedCustomers);
+      saveStorage('kasir_customers', updatedCustomers);
     }
 
     // 3. Build Transaction Record with FIFO Audit Trail
@@ -2284,12 +3104,15 @@ export default function App() {
           batchDeductions: fifoData?.batchDeductions || [],
           isCustomerSpecialPrice: item.isCustomerSpecialPrice,
           customerPriceCategory: item.customerPriceCategory,
+          ...(item.productDiscountPercent !== undefined ? { productDiscountPercent: item.productDiscountPercent } : {}),
+          ...(item.promoLabel ? { promoLabel: item.promoLabel } : {}),
         };
       }),
     };
 
     const nextTransactions = [newTransaction, ...transactions];
     setTransactions(nextTransactions);
+    saveStorage('kasir_transactions', nextTransactions);
     recordWithdrawalCashflowForTransaction(newTransaction);
     setLastCompletedTransaction(newTransaction);
     setIsPaymentModalOpen(false);
@@ -3148,6 +3971,7 @@ export default function App() {
   const handleClearDatabaseExceptUsers = async () => {
     try {
       localStorage.setItem('kasir_db_cleared_by_user', 'true');
+      clearCloudCollectionHistory();
 
       // Clear operational local storage keys
       localStorage.removeItem('kasir_products');
@@ -3166,6 +3990,10 @@ export default function App() {
       localStorage.removeItem('kasir_latest_sunday_backup');
       localStorage.removeItem('kasir_cashflows');
       localStorage.removeItem('kasir_activity_logs');
+      localStorage.removeItem('kasir_tax_records');
+      localStorage.removeItem('kasir_tax_audit_logs');
+      localStorage.removeItem('kasir_tax_adjustments');
+      localStorage.removeItem('kasir_balance_sheet_entries');
       hasSeededStockTrackerRef.current = false;
       prevProductsStockRef.current = new Map();
       setAdminLowStockWaAlert(null);
@@ -3181,6 +4009,10 @@ export default function App() {
       saveStorage('kasir_stock_opnames', []);
       saveStorage('kasir_cashflows', []);
       saveStorage('kasir_activity_logs', []);
+      saveStorage('kasir_tax_records', []);
+      saveStorage('kasir_tax_audit_logs', []);
+      saveStorage('kasir_tax_adjustments', []);
+      saveStorage('kasir_balance_sheet_entries', []);
 
       // Reset local React state to zero/empty
       setProducts([]);
@@ -3193,6 +4025,10 @@ export default function App() {
       setStockOpnames([]);
       setCashflows([]);
       setActivityLogs([]);
+      setTaxRecords([]);
+      setTaxAuditLogs([]);
+      setTaxAdjustments([]);
+      setBalanceSheetEntries([]);
       setCart([]);
       setSelectedCustomer(null);
       setRequestedPoints(0);
@@ -3219,6 +4055,10 @@ export default function App() {
       setStockOpnames([]);
       setCashflows([]);
       setActivityLogs([]);
+      setTaxRecords([]);
+      setTaxAuditLogs([]);
+      setTaxAdjustments([]);
+      setBalanceSheetEntries([]);
       setCart([]);
 
       sound.playSuccessChime();
@@ -3246,6 +4086,12 @@ export default function App() {
     const nextStockOpnames = Array.isArray(backup.data.stockOpnames) ? backup.data.stockOpnames : [];
     const nextOnlineOrders = Array.isArray(backup.data.onlineOrders) ? backup.data.onlineOrders : [];
     const nextActivityLogs = Array.isArray(backup.data.activityLogs) ? backup.data.activityLogs : [];
+    const nextTaxRecords = Array.isArray(backup.data.taxRecords) ? backup.data.taxRecords : [];
+    const nextTaxAuditLogs = Array.isArray(backup.data.taxAuditLogs) ? backup.data.taxAuditLogs : [];
+    const nextTaxAdjustments = Array.isArray(backup.data.taxAdjustments) ? backup.data.taxAdjustments : [];
+    const nextBalanceSheetEntries = Array.isArray(backup.data.balanceSheetEntries)
+      ? backup.data.balanceSheetEntries
+      : [];
     const nextSettings: StoreSettings = backup.data.storeSettings
       ? {
           ...INITIAL_STORE_SETTINGS,
@@ -3271,6 +4117,10 @@ export default function App() {
     setStockOpnames(nextStockOpnames);
     setOnlineOrders(nextOnlineOrders);
     setActivityLogs(nextActivityLogs);
+    setTaxRecords(nextTaxRecords);
+    setTaxAuditLogs(nextTaxAuditLogs);
+    setTaxAdjustments(nextTaxAdjustments);
+    setBalanceSheetEntries(nextBalanceSheetEntries);
     setStoreSettings(nextSettings);
 
     try {
@@ -3308,6 +4158,10 @@ export default function App() {
       replaceCollectionInFirestore('stock_opnames', nextStockOpnames),
       replaceCollectionInFirestore('online_orders', nextOnlineOrders),
       replaceCollectionInFirestore('activity_logs', nextActivityLogs),
+      replaceCollectionInFirestore('tax_records', nextTaxRecords),
+      replaceCollectionInFirestore('tax_audit_logs', nextTaxAuditLogs),
+      replaceCollectionInFirestore('tax_adjustments', nextTaxAdjustments),
+      replaceCollectionInFirestore('balance_sheet_entries', nextBalanceSheetEntries),
       saveStoreSettingsToFirestore(nextSettings, true),
     ];
 
@@ -3920,8 +4774,11 @@ export default function App() {
     const finalStock = Math.max(0, newStock);
     const existingProd = productMap.get(productId);
     const updatedProducts = products.map((p) =>
-      p.id === productId ? { ...p, stockInBaseUnit: finalStock } : p
+      p.id === productId
+        ? applyMultiBatchOpnameToProduct(p, { newStock: finalStock })
+        : p
     );
+    lastBatchCheckSourceRef.current = 'POST_OPNAME';
     setProducts(updatedProducts);
     const targetProd = updatedProducts.find((p) => p.id === productId);
     if (targetProd) {
@@ -3971,14 +4828,16 @@ export default function App() {
     const updatedProducts = products.map((p) => {
       const newStockVal = adjMap.get(p.id);
       if (newStockVal !== undefined) {
-        const clamped = Math.max(0, newStockVal);
-        const nextProd = { ...p, stockInBaseUnit: clamped };
+        const opItem = opnameItemMap.get(p.id);
+        const nextProd = applyMultiBatchOpnameToProduct(p, {
+          newStock: Math.max(0, newStockVal),
+          batchDetails: opItem?.batchDetails,
+        });
         changedProducts.push(nextProd);
 
-        if (clamped !== p.stockInBaseUnit) {
-          const diff = clamped - p.stockInBaseUnit;
+        if (nextProd.stockInBaseUnit !== p.stockInBaseUnit || (opItem?.batchDetails && opItem.batchDetails.some((b) => b.difference !== 0))) {
+          const diff = nextProd.stockInBaseUnit - p.stockInBaseUnit;
           const sign = diff > 0 ? '+' : '';
-          const opItem = opnameItemMap.get(p.id);
           logsToCreate.push({
             id: `act_${baseTs}_${p.id}_${Math.random().toString(36).slice(2, 6)}`,
             timestamp: baseTs,
@@ -3989,9 +4848,9 @@ export default function App() {
             targetType: 'STOCK_OPNAME',
             targetId: p.id,
             targetLabel: `${p.name} (${sessionRecord.sessionNumber})`,
-            summary: `Opname stok (${sessionRecord.sessionNumber}) untuk ${p.name}`,
+            summary: `Opname${opItem?.batchDetails && opItem.batchDetails.length > 0 ? ' multi-batch' : ''} stok (${sessionRecord.sessionNumber}) untuk ${p.name}`,
             oldValue: `${formatNumber(p.stockInBaseUnit)} ${p.baseUnit}`,
-            newValue: `${formatNumber(clamped)} ${p.baseUnit}`,
+            newValue: `${formatNumber(nextProd.stockInBaseUnit)} ${p.baseUnit}`,
             deltaValue: `${sign}${formatNumber(diff)} ${p.baseUnit}`,
             numericDelta: diff,
             reason: opItem?.reason || sessionRecord.generalReason || 'Sesi Stock Opname',
@@ -3999,6 +4858,7 @@ export default function App() {
             metadata: {
               opnameEvent: 'OPNAME_ADJUSTMENT',
               sessionNumber: sessionRecord.sessionNumber,
+              auditMode: sessionRecord.auditMode || 'SKU',
               responsibleUserId: responsibleId,
               responsibleUserName: responsibleName,
               responsibleUserRole: responsibleRole,
@@ -4009,6 +4869,7 @@ export default function App() {
       }
       return p;
     });
+    lastBatchCheckSourceRef.current = 'POST_OPNAME';
     setProducts(updatedProducts);
     setStockOpnames((prev) => [sessionRecord, ...prev]);
 
@@ -4031,31 +4892,25 @@ export default function App() {
     revertStockChanges: boolean
   ) => {
     const cleanReason = deletionReason.trim() || 'Penghapusan riwayat Stock Opname';
-    const revertDeltaMap = new Map<string, number>();
+    const opItemMap = new Map<string, typeof record.items[number]>();
     if (revertStockChanges && Array.isArray(record.items)) {
       record.items.forEach((item) => {
-        if (item.difference !== 0) {
-          revertDeltaMap.set(
-            item.productId,
-            (revertDeltaMap.get(item.productId) || 0) + item.difference
-          );
+        if (item.difference !== 0 || (item.batchDetails && item.batchDetails.some((b) => b.difference !== 0))) {
+          opItemMap.set(item.productId, item);
         }
       });
     }
 
     const changedProducts: Product[] = [];
-    if (revertDeltaMap.size > 0) {
+    if (opItemMap.size > 0) {
       const updatedProducts = products.map((prod) => {
-        const opDiff = revertDeltaMap.get(prod.id);
-        if (opDiff === undefined) return prod;
-        const revertedStock = Math.max(0, prod.stockInBaseUnit - opDiff);
-        if (revertedStock !== prod.stockInBaseUnit) {
-          const nextProd = { ...prod, stockInBaseUnit: revertedStock };
-          changedProducts.push(nextProd);
-          return nextProd;
-        }
-        return prod;
+        const item = opItemMap.get(prod.id);
+        if (!item) return prod;
+        const nextProd = revertMultiBatchOpnameFromProduct(prod, item);
+        changedProducts.push(nextProd);
+        return nextProd;
       });
+      lastBatchCheckSourceRef.current = 'POST_OPNAME';
       setProducts(updatedProducts);
       if (changedProducts.length > 0) {
         saveBatchToFirestore('products', changedProducts).catch(() => {});
@@ -4096,19 +4951,357 @@ export default function App() {
   };
 
   const handleUpdateStoreSettings = (newSettings: StoreSettings) => {
+    const wasOffline = Boolean(storeSettings.manualOfflineMode);
     const isOffline = Boolean(newSettings.manualOfflineMode);
-    setCloudSyncPaused(isOffline);
+    setCloudSyncError(null);
     setStoreSettings(newSettings);
     saveStorage('kasir_settings', newSettings);
     if (isOffline) {
+      setCloudSyncPaused(true);
       pauseFirestoreCloudSync().catch(() => {});
       setCloudSyncStatus('OFFLINE');
-    } else {
+    } else if (wasOffline) {
+      setCloudSyncStatus('CONNECTING');
       resumeFirestoreCloudSync()
         .then(() => saveStoreSettingsToFirestore(newSettings))
         .catch(() => {});
+    } else {
+      saveStoreSettingsToFirestore(newSettings).catch(() => {});
     }
   };
+
+  const handleForceVerifyCloudSync = async (): Promise<FirestoreVerificationResult> => {
+    const wasOffline = Boolean(storeSettings.manualOfflineMode);
+    const shouldReattachListeners = wasOffline || cloudSyncStatus === 'OFFLINE' || Boolean(cloudSyncError);
+    const queuedBefore = getOfflineQueueCount();
+
+    // Force Sync Now: automatically exit manual offline mode if active, clear queue status, and verify server immediately
+    if (wasOffline) {
+      const nextSettings: StoreSettings = { ...storeSettings, manualOfflineMode: false };
+      setStoreSettings(nextSettings);
+      saveStorage('kasir_settings', nextSettings);
+    }
+
+    setCloudSyncError(null);
+    setCloudSyncStatus('CONNECTING');
+    setIsAutoSyncingOffline(true);
+    clearPendingSyncQueueStatus();
+
+    try {
+      const result = await forceSyncFirestoreNow();
+      const queuedAfter = getOfflineQueueCount();
+      const flushedNow = Math.max(0, queuedBefore - queuedAfter);
+
+      if (result.ok) {
+        setCloudSyncError(null);
+        setCloudSyncStatus('SYNCED');
+        if (flushedNow > 0) {
+          sound.playSuccessChime();
+          setOfflineSyncResultToast(
+            `${flushedNow} antrean Mode Offline berhasil disinkronkan ke server.`
+          );
+        }
+        if (wasOffline) {
+          saveStoreSettingsToFirestore({ ...storeSettings, manualOfflineMode: false }).catch(() => {});
+        } else if (shouldReattachListeners) {
+          setSyncRetryNonce((n) => n + 1);
+        }
+      } else {
+        setCloudSyncError(result.message);
+        setCloudSyncStatus('OFFLINE');
+      }
+      return result;
+    } finally {
+      setIsAutoSyncingOffline(false);
+    }
+  };
+
+  const handleOpenFirestoreDiagnosticsInSettings = () => {
+    setActiveTab('settings');
+    setFocusFirestoreSettingsNonce((n) => n + 1);
+  };
+
+  const buildLocalCollectionsSnapshotForAudit = () => {
+    const snap = latestSyncStateRef.current;
+    return {
+      products: snap.products as unknown as Array<Record<string, unknown> & { id: string }>,
+      purchases: snap.purchases as unknown as Array<Record<string, unknown> & { id: string }>,
+      categories: snap.categories as unknown as Array<Record<string, unknown> & { id: string }>,
+      customer_categories: snap.customerCategories as unknown as Array<Record<string, unknown> & { id: string }>,
+      customers: snap.customers as unknown as Array<Record<string, unknown> & { id: string }>,
+      suppliers: snap.suppliers as unknown as Array<Record<string, unknown> & { id: string }>,
+      transactions: snap.transactions as unknown as Array<Record<string, unknown> & { id: string }>,
+      attendances: snap.attendances as unknown as Array<Record<string, unknown> & { id: string }>,
+      stock_opnames: snap.stockOpnames as unknown as Array<Record<string, unknown> & { id: string }>,
+      cashflows: snap.cashflows as unknown as Array<Record<string, unknown> & { id: string }>,
+      online_orders: snap.onlineOrders as unknown as Array<Record<string, unknown> & { id: string }>,
+      activity_logs: snap.activityLogs as unknown as Array<Record<string, unknown> & { id: string }>,
+      tax_records: snap.taxRecords as unknown as Array<Record<string, unknown> & { id: string }>,
+      tax_audit_logs: snap.taxAuditLogs as unknown as Array<Record<string, unknown> & { id: string }>,
+      tax_adjustments: snap.taxAdjustments as unknown as Array<Record<string, unknown> & { id: string }>,
+      balance_sheet_entries: snap.balanceSheetEntries as unknown as Array<Record<string, unknown> & { id: string }>,
+      users: snap.users as unknown as Array<Record<string, unknown> & { id: string }>,
+      settings: snap.storeSettings as unknown as Record<string, unknown>,
+    };
+  };
+
+  const handleScanSyncHealth = async (options?: { trackBackgroundProgress?: boolean }) => {
+    if (isScanningSyncHealth) return;
+    setIsScanningSyncHealth(true);
+    setSyncHealthScanError(null);
+    try {
+      const report = await runFirestoreSyncHealthAudit(
+        buildLocalCollectionsSnapshotForAudit(),
+        offlineQueueJobs,
+        options
+      );
+      setSyncAuditReport(report);
+    } catch (err) {
+      setSyncHealthScanError(formatFirestoreSyncErrorMessage(err));
+    } finally {
+      setIsScanningSyncHealth(false);
+    }
+  };
+
+  const applyServerRecordToLocalState = (
+    collectionName: string,
+    docId: string,
+    serverRecord?: Record<string, unknown>,
+    removeIfMissing = false
+  ) => {
+    const upsertOrRemove = <T extends { id: string }>(
+      prev: T[],
+      storageKey: string,
+      sortFn?: (items: T[]) => T[]
+    ): T[] => {
+      let next: T[];
+      if (removeIfMissing || !serverRecord) {
+        next = prev.filter((it) => it.id !== docId);
+      } else {
+        const merged = { ...(serverRecord as unknown as T), id: docId };
+        const exists = prev.some((it) => it.id === docId);
+        next = exists
+          ? prev.map((it) => (it.id === docId ? merged : it))
+          : [merged, ...prev];
+      }
+      if (sortFn) next = sortFn(next);
+      saveStorage(storageKey, next);
+      return next;
+    };
+
+    switch (collectionName) {
+      case 'products':
+        lastBatchCheckSourceRef.current = 'CLOUD_SYNC';
+        setProducts((prev) => upsertOrRemove(prev, 'kasir_products'));
+        break;
+      case 'purchases':
+        setPurchases((prev) =>
+          upsertOrRemove(prev, 'kasir_purchases', (arr) =>
+            [...arr].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+          )
+        );
+        break;
+      case 'categories':
+        setCategories((prev) => upsertOrRemove(prev, 'kasir_categories'));
+        break;
+      case 'customer_categories':
+        setCustomerCategories((prev) => upsertOrRemove(prev, 'kasir_customer_categories'));
+        break;
+      case 'customers':
+        setCustomers((prev) => upsertOrRemove(prev, 'kasir_customers'));
+        break;
+      case 'suppliers':
+        setSuppliers((prev) => upsertOrRemove(prev, 'kasir_suppliers'));
+        break;
+      case 'transactions':
+        setTransactions((prev) =>
+          upsertOrRemove(prev, 'kasir_transactions', (arr) =>
+            [...arr].sort((a, b) => b.timestamp - a.timestamp)
+          )
+        );
+        break;
+      case 'attendances':
+        setAttendances((prev) => upsertOrRemove(prev, 'kasir_attendances'));
+        break;
+      case 'stock_opnames':
+        setStockOpnames((prev) => upsertOrRemove(prev, 'kasir_stock_opnames'));
+        break;
+      case 'cashflows':
+        setCashflows((prev) =>
+          upsertOrRemove(prev, 'kasir_cashflows', (arr) =>
+            [...arr].sort((a, b) => b.timestamp - a.timestamp)
+          )
+        );
+        break;
+      case 'online_orders':
+        setOnlineOrders((prev) =>
+          upsertOrRemove(prev, 'kasir_online_orders', (arr) =>
+            [...arr].sort((a, b) => b.createdAt - a.createdAt)
+          )
+        );
+        break;
+      case 'activity_logs':
+        setActivityLogs((prev) =>
+          upsertOrRemove(prev, 'kasir_activity_logs', (arr) =>
+            [...arr].sort((a, b) => b.timestamp - a.timestamp)
+          )
+        );
+        break;
+      case 'tax_records':
+        setTaxRecords((prev) => upsertOrRemove(prev, 'kasir_tax_records'));
+        break;
+      case 'tax_audit_logs':
+        setTaxAuditLogs((prev) => upsertOrRemove(prev, 'kasir_tax_audit_logs'));
+        break;
+      case 'tax_adjustments':
+        setTaxAdjustments((prev) => upsertOrRemove(prev, 'kasir_tax_adjustments'));
+        break;
+      case 'balance_sheet_entries':
+        setBalanceSheetEntries((prev) => upsertOrRemove(prev, 'kasir_balance_sheet_entries'));
+        break;
+      case 'users':
+        setUsers((prev) => upsertOrRemove(prev, 'kasir_users'));
+        break;
+      case 'settings':
+        if (serverRecord) {
+          const { id: _id, ...rest } = serverRecord;
+          setStoreSettings((prev) => {
+            const next = { ...prev, ...(rest as Partial<StoreSettings>) };
+            saveStorage('kasir_settings', next);
+            return next;
+          });
+        }
+        break;
+    }
+  };
+
+  const executeSingleConflictResolution = async (
+    conflict: SyncConflictItem,
+    action: SyncRecommendedAction
+  ) => {
+    if (action === 'PUSH_LOCAL') {
+      if (conflict.conflictType === 'BOOTSTRAP_MISSING') {
+        const snap = latestSyncStateRef.current;
+        if (conflict.collectionName === 'settings') {
+          await saveStoreSettingsToFirestore(snap.storeSettings);
+        } else if (conflict.collectionName === 'users') {
+          await saveBatchToFirestore('users', snap.users);
+        }
+      } else if (conflict.collectionName === 'settings') {
+        await saveStoreSettingsToFirestore(
+          conflict.localRecord || (latestSyncStateRef.current.storeSettings as unknown as Record<string, unknown>)
+        );
+      } else if (conflict.localRecord) {
+        await saveDocumentToFirestore(conflict.collectionName, conflict.docId, conflict.localRecord);
+      }
+      recordModuleSyncActivity({
+        collectionName: conflict.collectionName,
+        direction: 'CONFLICT_FIX',
+        operation: 'RECONCILE',
+        status: 'SUCCESS',
+        recordCount: 1,
+        docId: conflict.docId,
+        summary: `Konflik diselesaikan dengan mengirim data lokal: ${conflict.recordTitle}`,
+      });
+    } else if (action === 'PULL_SERVER') {
+      const shouldRemoveLocal = conflict.conflictType === 'LOCAL_ONLY' && !conflict.serverRecord;
+      applyServerRecordToLocalState(
+        conflict.collectionName,
+        conflict.docId,
+        conflict.serverRecord,
+        shouldRemoveLocal
+      );
+      recordModuleSyncActivity({
+        collectionName: conflict.collectionName,
+        direction: 'CONFLICT_FIX',
+        operation: 'RECONCILE',
+        status: 'SUCCESS',
+        recordCount: 1,
+        docId: conflict.docId,
+        summary: shouldRemoveLocal
+          ? `Konflik diselesaikan dengan menghapus data lokal usang: ${conflict.recordTitle}`
+          : `Konflik diselesaikan dengan menarik data server: ${conflict.recordTitle}`,
+      });
+    } else if (action === 'RETRY_QUEUE' && conflict.offlineJob) {
+      const retryRes = await executeSingleOfflineSyncJobNow(conflict.offlineJob);
+      if (retryRes.ok) {
+        removeOfflineSyncJob(conflict.offlineJob.id);
+      } else {
+        throw new Error(retryRes.error || 'Gagal mengirim ulang antrean.');
+      }
+    } else if (action === 'DISMISS_QUEUE_JOB' && conflict.offlineJob) {
+      removeOfflineSyncJob(conflict.offlineJob.id);
+      recordModuleSyncActivity({
+        collectionName: conflict.collectionName,
+        direction: 'CONFLICT_FIX',
+        operation: 'RECONCILE',
+        status: 'WARNING',
+        recordCount: 1,
+        docId: conflict.docId,
+        summary: `Antrean bermasalah dibersihkan oleh pengguna: ${conflict.recordTitle}`,
+      });
+    }
+  };
+
+  const handleResolveSyncConflict = async (
+    conflict: SyncConflictItem,
+    action: SyncRecommendedAction
+  ) => {
+    setResolvingConflictId(conflict.id);
+    setSyncHealthScanError(null);
+    try {
+      await executeSingleConflictResolution(conflict, action);
+      sound.playSuccessChime();
+      await handleScanSyncHealth({ trackBackgroundProgress: false });
+    } catch (err) {
+      setSyncHealthScanError(
+        err instanceof Error ? err.message : 'Gagal menerapkan resolusi konflik.'
+      );
+    } finally {
+      setResolvingConflictId(null);
+    }
+  };
+
+  const handleResolveAllSyncConflicts = async () => {
+    if (!syncAuditReport || syncAuditReport.conflicts.length === 0) return;
+    setIsResolvingBulkSyncConflicts(true);
+    setSyncHealthScanError(null);
+    try {
+      for (const conflict of syncAuditReport.conflicts) {
+        try {
+          await executeSingleConflictResolution(conflict, conflict.recommendedAction);
+        } catch {
+          // continue resolving remaining conflicts cleanly
+        }
+      }
+      sound.playSuccessChime();
+      await handleScanSyncHealth({ trackBackgroundProgress: true });
+    } finally {
+      setIsResolvingBulkSyncConflicts(false);
+    }
+  };
+
+  // Automatic lightweight Sync Health Audit when opening sync-health tab or once on initial real-time connection
+  useEffect(() => {
+    if (
+      cloudSyncStatus === 'SYNCED' &&
+      isBrowserOnline &&
+      !storeSettings.manualOfflineMode &&
+      !hasAutoAuditedSyncRef.current
+    ) {
+      hasAutoAuditedSyncRef.current = true;
+      const t = window.setTimeout(() => {
+        void handleScanSyncHealth({ trackBackgroundProgress: false });
+      }, 2500);
+      return () => window.clearTimeout(t);
+    }
+  }, [cloudSyncStatus, isBrowserOnline, storeSettings.manualOfflineMode]);
+
+  useEffect(() => {
+    if (activeTab === 'sync-health' && !isScanningSyncHealth) {
+      void handleScanSyncHealth({ trackBackgroundProgress: false });
+    }
+  }, [activeTab]);
 
   const handleUpdateUsers = (newUsers: User[]) => {
     setUsers(newUsers);
@@ -4139,6 +5332,317 @@ export default function App() {
     setCashflows((prev) => prev.filter((c) => c.id !== id));
     deleteDocumentFromFirestore('cashflows', id).catch((err) => {
       console.error('[FirebaseSync] Failed to delete cashflow from Firestore:', err);
+    });
+  };
+
+  // Tax Management Handlers (Konfigurasi Pajak, Audit Log Khusus, Adjustment Pajak & Setoran)
+  const handleRecordTaxAuditLog = async (entry: {
+    category: TaxAuditCategory;
+    actionLabel: string;
+    summary: string;
+    changes?: TaxAuditChangeItem[];
+    reason?: string;
+    periodMonth?: string;
+  }) => {
+    const nowMs = Date.now();
+    const auditLog: TaxAuditLog = {
+      id: `txaud_${nowMs}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: nowMs,
+      createdAt: new Date(nowMs).toISOString(),
+      category: entry.category,
+      actionLabel: entry.actionLabel,
+      actorId: currentUser.id,
+      actorName: currentUser.name,
+      actorRole: currentUser.role,
+      summary: entry.summary,
+      changes: (entry.changes || []).slice(0, 50),
+      ...(entry.reason && entry.reason.trim() ? { reason: entry.reason.trim() } : {}),
+      ...(entry.periodMonth && /^\d{4}-\d{2}$/.test(entry.periodMonth)
+        ? { periodMonth: entry.periodMonth }
+        : {}),
+    };
+
+    setTaxAuditLogs((prev) => [auditLog, ...prev]);
+    await saveDocumentToFirestore('tax_audit_logs', auditLog.id, auditLog).catch((err) => {
+      console.error('[FirebaseSync] Failed to save tax audit log to Firestore:', err);
+    });
+  };
+
+  const handleUpdateTaxConfig = async (nextConfig: TaxConfig, auditReason?: string) => {
+    const prevEffective = getEffectiveTaxConfig(storeSettings);
+    const nextEffective = getEffectiveTaxConfig(nextConfig, storeSettings.storeName);
+    const diff = diffTaxConfigs(prevEffective, nextEffective);
+
+    const nextSettings: StoreSettings = {
+      ...storeSettings,
+      taxConfig: nextConfig,
+    };
+    handleUpdateStoreSettings(nextSettings);
+
+    if (diff.changes.length > 0 || (auditReason && auditReason.trim())) {
+      await handleRecordTaxAuditLog({
+        category: diff.isRateOverride ? 'RATE_OVERRIDE' : 'CONFIG_CHANGE',
+        actionLabel: diff.isRateOverride
+          ? 'Perubahan / Override Tarif Pajak'
+          : 'Pembaruan Konfigurasi Pajak',
+        summary: diff.summary,
+        changes: diff.changes,
+        reason: auditReason,
+      });
+    }
+  };
+
+  const handleSaveTaxRecord = async (record: TaxRecord, alsoRecordCashflow: boolean) => {
+    let finalRecord: TaxRecord = { ...record };
+    const existingRecord = taxRecords.find((r) => r.id === finalRecord.id);
+
+    if (
+      alsoRecordCashflow &&
+      finalRecord.status === 'SUDAH_SETOR' &&
+      !finalRecord.linkedCashflowId
+    ) {
+      const cashflowAmount = finalRecord.paidAmount > 0 ? finalRecord.paidAmount : finalRecord.taxAmountDue;
+      const cashflowDate = finalRecord.paidDate || new Date().toISOString().slice(0, 10);
+      const cashflowTimestamp = new Date(`${cashflowDate}T12:00:00`).getTime() || Date.now();
+      const cfId = 'cf_tax_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+      const newCashflow: CashflowRecord = {
+        id: cfId,
+        type: 'PENGELUARAN',
+        category: 'Pajak, Iuran & Retribusi',
+        amount: cashflowAmount,
+        date: cashflowDate,
+        timestamp: cashflowTimestamp,
+        paymentMethod: finalRecord.paymentMethod || 'TRANSFER_BCA',
+        description: `${finalRecord.taxTypeLabel} (${finalRecord.periodMonth})${finalRecord.ntpnCode ? ` · NTPN ${finalRecord.ntpnCode}` : ''}`,
+        referenceNumber: finalRecord.ntpnCode || finalRecord.billingCode || undefined,
+        recordedBy: currentUser.name,
+        recordedById: currentUser.id,
+        createdAt: new Date().toISOString(),
+      };
+      setCashflows((prev) => [newCashflow, ...prev]);
+      saveDocumentToFirestore('cashflows', newCashflow.id, newCashflow).catch((err) => {
+        console.error('[FirebaseSync] Failed to save tax cashflow to Firestore:', err);
+      });
+      finalRecord = {
+        ...finalRecord,
+        linkedCashflowId: cfId,
+      };
+    }
+
+    setTaxRecords((prev) => {
+      const exists = prev.some((r) => r.id === finalRecord.id);
+      const updated = exists
+        ? prev.map((r) => (r.id === finalRecord.id ? finalRecord : r))
+        : [finalRecord, ...prev];
+      return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    });
+
+    await saveDocumentToFirestore('tax_records', finalRecord.id, finalRecord).catch((err) => {
+      console.error('[FirebaseSync] Failed to save tax record to Firestore:', err);
+    });
+
+    // Detect manual rate override against configured tax rate
+    const effCfg = getEffectiveTaxConfig(storeSettings);
+    const configuredRate =
+      finalRecord.taxType === 'PPH_FINAL_UMKM'
+        ? Number(effCfg.pphFinalRatePercent ?? 0.5)
+        : finalRecord.taxType === 'PPN'
+        ? Number(effCfg.ppnRatePercent ?? 11)
+        : finalRecord.taxType === 'PB1'
+        ? Number(effCfg.pb1RatePercent ?? 10)
+        : finalRecord.taxType === 'PPH_BADAN'
+        ? Number(effCfg.pphBadanRatePercent ?? 22)
+        : null;
+    const hasManualRateOverride =
+      configuredRate !== null &&
+      Math.abs(Number(finalRecord.taxRatePercent || 0) - configuredRate) > 0.0001;
+
+    await handleRecordTaxAuditLog({
+      category: hasManualRateOverride ? 'RATE_OVERRIDE' : 'RECORD_MUTATION',
+      actionLabel: existingRecord
+        ? hasManualRateOverride
+          ? 'Edit Setoran & Override Tarif Manual'
+          : 'Edit Catatan Setoran Pajak'
+        : hasManualRateOverride
+        ? 'Input Setoran Dengan Override Tarif Manual'
+        : 'Pencatatan Setoran / Tagihan Pajak',
+      summary: `${finalRecord.taxTypeLabel} masa ${finalRecord.periodMonth}: Terutang ${formatRupiah(
+        finalRecord.taxAmountDue
+      )}, Disetor ${formatRupiah(finalRecord.paidAmount)} (${finalRecord.status})`,
+      changes: [
+        ...(hasManualRateOverride
+          ? [
+              {
+                field: 'taxRatePercent',
+                label: 'Tarif Pajak Digunakan',
+                oldValue: `${configuredRate}% (Tarif Profil)`,
+                newValue: `${finalRecord.taxRatePercent}% (Override Manual)`,
+              },
+            ]
+          : []),
+        ...(existingRecord
+          ? [
+              {
+                field: 'status',
+                label: 'Status Setoran',
+                oldValue: existingRecord.status,
+                newValue: finalRecord.status,
+              },
+              {
+                field: 'taxAmountDue',
+                label: 'Nominal Terutang',
+                oldValue: formatRupiah(existingRecord.taxAmountDue),
+                newValue: formatRupiah(finalRecord.taxAmountDue),
+              },
+            ]
+          : [
+              {
+                field: 'taxAmountDue',
+                label: 'Nominal Terutang',
+                oldValue: 'Baru',
+                newValue: formatRupiah(finalRecord.taxAmountDue),
+              },
+            ]),
+      ],
+      reason: finalRecord.notes,
+      periodMonth: finalRecord.periodMonth,
+    });
+  };
+
+  const handleDeleteTaxRecord = async (id: string) => {
+    const target = taxRecords.find((r) => r.id === id);
+    setTaxRecords((prev) => prev.filter((r) => r.id !== id));
+    await deleteDocumentFromFirestore('tax_records', id).catch((err) => {
+      console.error('[FirebaseSync] Failed to delete tax record from Firestore:', err);
+    });
+    if (target) {
+      await handleRecordTaxAuditLog({
+        category: 'RECORD_MUTATION',
+        actionLabel: 'Hapus Catatan Setoran Pajak',
+        summary: `Menghapus catatan ${target.taxTypeLabel} masa ${target.periodMonth} senilai ${formatRupiah(
+          target.taxAmountDue
+        )}`,
+        changes: [
+          {
+            field: 'taxRecord',
+            label: target.taxTypeLabel,
+            oldValue: formatRupiah(target.taxAmountDue),
+            newValue: 'Dihapus',
+          },
+        ],
+        periodMonth: target.periodMonth,
+      });
+    }
+  };
+
+  const handleSaveTaxAdjustment = async (
+    adjustment: TaxAdjustment,
+    isEdit = false,
+    auditReason?: string
+  ) => {
+    const prevAdj = taxAdjustments.find((a) => a.id === adjustment.id);
+    setTaxAdjustments((prev) => {
+      const exists = prev.some((a) => a.id === adjustment.id);
+      const updated = exists
+        ? prev.map((a) => (a.id === adjustment.id ? adjustment : a))
+        : [adjustment, ...prev];
+      return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    });
+
+    await saveDocumentToFirestore('tax_adjustments', adjustment.id, adjustment).catch((err) => {
+      console.error('[FirebaseSync] Failed to save tax adjustment to Firestore:', err);
+    });
+
+    await handleRecordTaxAuditLog({
+      category: 'ADJUSTMENT',
+      actionLabel: isEdit
+        ? adjustment.status === 'VOIDED' && prevAdj?.status === 'ACTIVE'
+          ? `Void Adjustment ${adjustment.adjustmentNumber}`
+          : `Edit Adjustment ${adjustment.adjustmentNumber}`
+        : `Adjustment Pajak Baru (${adjustment.adjustmentNumber})`,
+      summary: `${TAX_ADJUSTMENT_REASON_LABELS[adjustment.reasonType]} pada ${
+        TAX_ADJUSTMENT_TARGET_LABELS[adjustment.affectedTaxType]
+      } (Delta Pajak: ${adjustment.taxDelta >= 0 ? '+' : '-'}${formatRupiah(
+        Math.abs(adjustment.taxDelta)
+      )}, Delta DPP: ${adjustment.dppDelta >= 0 ? '+' : '-'}${formatRupiah(
+        Math.abs(adjustment.dppDelta)
+      )})`,
+      changes: prevAdj
+        ? [
+            {
+              field: 'status',
+              label: 'Status Adjustment',
+              oldValue: prevAdj.status,
+              newValue: adjustment.status,
+            },
+            {
+              field: 'taxDelta',
+              label: 'Koreksi Pajak',
+              oldValue: formatRupiah(prevAdj.taxDelta),
+              newValue: formatRupiah(adjustment.taxDelta),
+            },
+          ]
+        : [
+            {
+              field: 'taxDelta',
+              label: TAX_ADJUSTMENT_TARGET_LABELS[adjustment.affectedTaxType],
+              oldValue: 'Rp 0',
+              newValue: `${adjustment.taxDelta >= 0 ? '+' : '-'}${formatRupiah(
+                Math.abs(adjustment.taxDelta)
+              )}`,
+            },
+          ],
+      reason: auditReason || adjustment.notes,
+      periodMonth: adjustment.periodMonth,
+    });
+  };
+
+  const handleDeleteTaxAdjustment = async (adjustment: TaxAdjustment, auditReason?: string) => {
+    setTaxAdjustments((prev) => prev.filter((a) => a.id !== adjustment.id));
+    await deleteDocumentFromFirestore('tax_adjustments', adjustment.id).catch((err) => {
+      console.error('[FirebaseSync] Failed to delete tax adjustment from Firestore:', err);
+    });
+
+    await handleRecordTaxAuditLog({
+      category: 'ADJUSTMENT',
+      actionLabel: `Hapus Adjustment ${adjustment.adjustmentNumber}`,
+      summary: `Menghapus adjustment ${adjustment.adjustmentNumber} (${
+        TAX_ADJUSTMENT_TARGET_LABELS[adjustment.affectedTaxType]
+      }) masa ${adjustment.periodMonth}`,
+      changes: [
+        {
+          field: 'taxAdjustment',
+          label: adjustment.adjustmentNumber,
+          oldValue: `${adjustment.taxDelta >= 0 ? '+' : '-'}${formatRupiah(
+            Math.abs(adjustment.taxDelta)
+          )}`,
+          newValue: 'Dihapus Permanen',
+        },
+      ],
+      reason: auditReason || adjustment.notes,
+      periodMonth: adjustment.periodMonth,
+    });
+  };
+
+  // Balance Sheet (Neraca Aktiva & Pasiva) Manual Account Handlers
+  const handleSaveBalanceSheetEntry = async (entry: BalanceSheetEntry) => {
+    setBalanceSheetEntries((prev) => {
+      const exists = prev.some((item) => item.id === entry.id);
+      const updated = exists
+        ? prev.map((item) => (item.id === entry.id ? entry : item))
+        : [entry, ...prev];
+      return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    });
+
+    await saveDocumentToFirestore('balance_sheet_entries', entry.id, entry).catch((err) => {
+      console.error('[FirebaseSync] Failed to save balance sheet entry to Firestore:', err);
+    });
+  };
+
+  const handleDeleteBalanceSheetEntry = async (entry: BalanceSheetEntry) => {
+    setBalanceSheetEntries((prev) => prev.filter((item) => item.id !== entry.id));
+    await deleteDocumentFromFirestore('balance_sheet_entries', entry.id).catch((err) => {
+      console.error('[FirebaseSync] Failed to delete balance sheet entry from Firestore:', err);
     });
   };
 
@@ -4396,7 +5900,10 @@ export default function App() {
       items: txItems,
     };
 
-    setTransactions((prev) => [newTransaction, ...prev]);
+    const nextTransactions = [newTransaction, ...transactions];
+    setTransactions(nextTransactions);
+    saveStorage('kasir_products', updatedProducts);
+    saveStorage('kasir_transactions', nextTransactions);
     saveDocumentToFirestore('transactions', newTransaction.id, newTransaction).catch(() => {});
     if (changedProducts.length > 0) {
       saveBatchToFirestore('products', changedProducts).catch(() => {});
@@ -4410,7 +5917,9 @@ export default function App() {
       linkedInvoiceNumber: newTransaction.invoiceNumber,
       processedByName: currentUser.name,
     };
-    setOnlineOrders((prev) => prev.map((o) => (o.id === order.id ? completedOrder : o)));
+    const nextOnlineOrders = onlineOrders.map((o) => (o.id === order.id ? completedOrder : o));
+    setOnlineOrders(nextOnlineOrders);
+    saveStorage('kasir_online_orders', nextOnlineOrders);
     saveDocumentToFirestore('online_orders', order.id, completedOrder).catch(() => {});
 
     setShouldAutoSendWaOnReceipt(false);
@@ -4486,10 +5995,102 @@ export default function App() {
         transactions={transactions}
         customers={customers}
         cloudSyncStatus={cloudSyncStatus === 'SYNCED' ? 'SYNCED' : cloudSyncStatus === 'CONNECTING' ? 'CONNECTING' : 'OFFLINE'}
+        cloudSyncError={cloudSyncError}
+        pendingSyncQueueCount={pendingSyncQueueCount}
+        offlineQueueCount={offlineQueueJobs.length}
+        syncConflictCount={syncAuditReport?.totalConflicts || 0}
+        onRetryCloudSync={() => setSyncRetryNonce((n) => n + 1)}
+        onOpenFirestoreSettings={handleOpenFirestoreDiagnosticsInSettings}
+        onOpenOfflineQueue={() => setIsOfflineQueueModalOpen(true)}
+        onOpenGoogleDriveBackup={() => setIsGoogleDriveBackupModalOpen(true)}
       />
 
       {/* Main Content Area */}
       <main className={`flex-1 flex flex-col overflow-hidden ${activeTab === 'pos' ? 'min-h-0' : ''}`}>
+        {batchIntegrityReport.criticalIssuesCount > 0 && dismissedBatchAlertSig !== batchIntegrityIssueSig && (
+          <div
+            role="alert"
+            className="px-3 md:px-5 py-2.5 border-b border-rose-300 bg-rose-50 text-rose-950 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shrink-0 select-none"
+          >
+            <div className="flex items-start sm:items-center gap-2 min-w-0">
+              <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0 mt-0.5 sm:mt-0" />
+              <div className="min-w-0">
+                <span className="font-bold">
+                  Pengecekan Integritas Batch Otomatis: ditemukan {batchIntegrityReport.criticalIssuesCount} produk bermasalah
+                </span>
+                <span className="text-rose-800 ml-1.5">
+                  (
+                  {[
+                    batchIntegrityReport.negativeBatchProductsCount > 0
+                      ? `${batchIntegrityReport.negativeBatchProductsCount} SKU batch negatif`
+                      : null,
+                    batchIntegrityReport.negativeTotalStockCount > 0
+                      ? `${batchIntegrityReport.negativeTotalStockCount} SKU stok negatif`
+                      : null,
+                    batchIntegrityReport.mismatchProductsCount > 0
+                      ? `${batchIntegrityReport.mismatchProductsCount} SKU selisih stok vs batch`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                  )
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setActiveTab('stock-report');
+                  setOpenVerifyStockNonce((n) => n + 1);
+                }}
+                className="px-2.5 py-1.5 rounded-lg bg-white hover:bg-rose-100 border border-rose-300 text-rose-800 font-bold text-[11px] whitespace-nowrap cursor-pointer transition-colors"
+              >
+                Periksa Laporan
+              </button>
+              {(currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    handleAutoFixAllBatchIntegrity();
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-[11px] whitespace-nowrap cursor-pointer transition-colors"
+                >
+                  Perbaiki Otomatis
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setDismissedBatchAlertSig(batchIntegrityIssueSig)}
+                className="p-1 rounded-lg hover:bg-rose-200/70 text-rose-600 cursor-pointer"
+                aria-label="Tutup peringatan integritas batch"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+        <BackgroundSyncProgressIndicator
+          isBrowserOnline={isBrowserOnline}
+          isManualOfflineMode={Boolean(storeSettings.manualOfflineMode)}
+          cloudSyncStatus={cloudSyncStatus}
+          isAutoSyncingOffline={isAutoSyncingOffline}
+          offlineQueueJobs={offlineQueueJobs}
+          backgroundProgress={backgroundSyncProgress}
+          offlineSyncResultToast={offlineSyncResultToast}
+          canAccessSyncHealth={
+            currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER'
+          }
+          onDismissToast={() => setOfflineSyncResultToast(null)}
+          onOpenOfflineQueue={() => setIsOfflineQueueModalOpen(true)}
+          onOpenSyncHealth={() => setActiveTab('sync-health')}
+          onForceSyncNow={() => {
+            void handleForceVerifyCloudSync();
+          }}
+        />
         {activeTab === 'online-orders' && (
           <OnlineOrdersManagementView
             onlineOrders={onlineOrders}
@@ -4608,6 +6209,14 @@ export default function App() {
             storeSettings={storeSettings}
             transactions={transactions}
             purchases={purchases}
+            cashflows={cashflows}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
+            batchIntegrityReport={batchIntegrityReport}
+            openVerifyStockNonce={openVerifyStockNonce}
+            onRecheckBatchIntegrity={() => handleRecheckBatchIntegrity('MANUAL')}
+            onAutoFixAllBatchIntegrity={handleAutoFixAllBatchIntegrity}
             onUpdateStock={handleUpdateStock}
             onUpdateProduct={handleUpdateProduct}
             onBulkUpdateStock={handleBulkUpdateStock}
@@ -4720,6 +6329,10 @@ export default function App() {
             categories={categories}
             cashflows={cashflows}
             customers={customers}
+            purchases={purchases}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
             currentUserRole={currentUser.role}
             storeName={storeSettings.storeName}
             storeSettings={storeSettings}
@@ -4732,11 +6345,59 @@ export default function App() {
           <FinanceView
             cashflows={cashflows}
             transactions={transactions}
+            products={products}
+            purchases={purchases}
+            customers={customers}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
+            storeSettings={storeSettings}
             onAddCashflow={handleAddCashflow}
             onUpdateCashflow={handleUpdateCashflow}
             onDeleteCashflow={handleDeleteCashflow}
+            onSaveBalanceSheetEntry={handleSaveBalanceSheetEntry}
+            onDeleteBalanceSheetEntry={handleDeleteBalanceSheetEntry}
             currentUser={currentUser}
             storeName={storeSettings.storeName}
+          />
+        )}
+
+        {activeTab === 'balance-sheet' && (
+          <BalanceSheetView
+            transactions={transactions}
+            products={products}
+            purchases={purchases}
+            cashflows={cashflows}
+            customers={customers}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
+            storeSettings={storeSettings}
+            currentUser={currentUser}
+            onSaveEntry={handleSaveBalanceSheetEntry}
+            onDeleteEntry={handleDeleteBalanceSheetEntry}
+            onNavigateToFinance={() => setActiveTab('finance')}
+          />
+        )}
+
+        {activeTab === 'tax' && (
+          <TaxManagementView
+            transactions={transactions}
+            products={products}
+            purchases={purchases}
+            cashflows={cashflows}
+            taxRecords={taxRecords}
+            taxAuditLogs={taxAuditLogs}
+            taxAdjustments={taxAdjustments}
+            storeSettings={storeSettings}
+            currentUser={currentUser}
+            onUpdateTaxConfig={handleUpdateTaxConfig}
+            onSaveTaxRecord={handleSaveTaxRecord}
+            onDeleteTaxRecord={handleDeleteTaxRecord}
+            onRecordTaxAuditLog={handleRecordTaxAuditLog}
+            onSaveTaxAdjustment={handleSaveTaxAdjustment}
+            onDeleteTaxAdjustment={handleDeleteTaxAdjustment}
+            onNavigateToPOS={() => setActiveTab('pos')}
           />
         )}
 
@@ -4777,6 +6438,13 @@ export default function App() {
                 bcaAccountNumber={storeSettings.bcaAccountNumber}
                 bcaAccountName={storeSettings.bcaAccountName}
                 onNavigateToPiutang={() => setActiveTab('piutang')}
+                purchases={purchases}
+                taxRecords={taxRecords}
+                taxAdjustments={taxAdjustments}
+                storeSettings={storeSettings}
+                onUpdateStoreSettings={handleUpdateStoreSettings}
+                onNavigateToTax={() => setActiveTab('tax')}
+                currentUserName={currentUser.name}
                 onSaveProducts={async (updatedProducts) => {
                   const changedProducts = updatedProducts.filter((p) => productMap.get(p.id) !== p);
                   setProducts(updatedProducts);
@@ -4789,6 +6457,15 @@ export default function App() {
           </div>
         )}
 
+        {activeTab === 'sales-report' && (
+          <SalesReportView
+            transactions={transactions}
+            products={products}
+            categories={categories}
+            storeName={storeSettings.storeName}
+          />
+        )}
+
         {activeTab === 'monthly-sales' && (
           <MonthlySalesReportView
             transactions={transactions}
@@ -4796,6 +6473,58 @@ export default function App() {
             categories={categories}
             currentUserRole={currentUser.role}
             storeName={storeSettings.storeName}
+            storeSettings={storeSettings}
+            cashflows={cashflows}
+            purchases={purchases}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
+          />
+        )}
+
+        {activeTab === 'employee-activity' && (
+          <EmployeeActivityView
+            activityLogs={activityLogs}
+            users={users}
+            currentUser={currentUser}
+            storeName={storeSettings.storeName}
+            onNavigateToPOS={() => setActiveTab('pos')}
+          />
+        )}
+
+        {activeTab === 'sync-health' && (currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER') && (
+          <SyncHealthDashboardView
+            auditReport={syncAuditReport}
+            isScanning={isScanningSyncHealth}
+            isResolvingBulk={isResolvingBulkSyncConflicts}
+            resolvingConflictId={resolvingConflictId}
+            lastScanError={syncHealthScanError}
+            isBrowserOnline={isBrowserOnline}
+            isManualOfflineMode={Boolean(storeSettings.manualOfflineMode)}
+            offlineQueueJobs={offlineQueueJobs}
+            moduleSummaries={syncModuleSummaries}
+            backgroundProgress={backgroundSyncProgress}
+            canAccessSyncLogs={currentUser.role === 'ADMIN'}
+            onRescanHealth={() => handleScanSyncHealth({ trackBackgroundProgress: true })}
+            onResolveConflict={handleResolveSyncConflict}
+            onResolveAllRecommended={handleResolveAllSyncConflicts}
+            onNavigateToSyncLogs={() => setActiveTab('sync-logs')}
+            onOpenOfflineQueue={() => setIsOfflineQueueModalOpen(true)}
+          />
+        )}
+
+        {activeTab === 'sync-logs' && currentUser.role === 'ADMIN' && (
+          <SyncActivityLogView
+            logs={syncActivityLogs}
+            moduleSummaries={syncModuleSummaries}
+            isBrowserOnline={isBrowserOnline}
+            isManualOfflineMode={Boolean(storeSettings.manualOfflineMode)}
+            offlineQueueCount={offlineQueueJobs.length}
+            onClearLogs={(resetStats) => clearSyncActivityLogs(resetStats)}
+            onNavigateToSyncHealth={() => setActiveTab('sync-health')}
+            onForceSyncNow={async () => {
+              await handleForceVerifyCloudSync();
+            }}
           />
         )}
 
@@ -4815,12 +6544,26 @@ export default function App() {
             stockOpnames={stockOpnames}
             onlineOrders={onlineOrders}
             activityLogs={activityLogs}
+            taxRecords={taxRecords}
+            taxAuditLogs={taxAuditLogs}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
             currentUserRole={currentUser.role}
+            currentUserName={currentUser.name}
             onUpdateStoreSettings={handleUpdateStoreSettings}
             onUpdateUsers={handleUpdateUsers}
             onResetToDemoData={handleResetToDemoData}
             onClearDatabaseExceptUsers={handleClearDatabaseExceptUsers}
             onRestoreBackup={handleRestoreBackup}
+            cloudSyncStatus={cloudSyncStatus === 'SYNCED' ? 'SYNCED' : cloudSyncStatus === 'CONNECTING' ? 'CONNECTING' : 'OFFLINE'}
+            cloudSyncError={cloudSyncError}
+            pendingSyncQueueCount={pendingSyncQueueCount}
+            offlineQueueCount={offlineQueueJobs.length}
+            onOpenOfflineQueueModal={() => setIsOfflineQueueModalOpen(true)}
+            focusFirestoreSettingsNonce={focusFirestoreSettingsNonce}
+            onForceVerifyCloudSync={handleForceVerifyCloudSync}
+            onOpenSyncHealth={() => setActiveTab('sync-health')}
+            onOpenSyncLogs={() => setActiveTab('sync-logs')}
           />
         )}
       </main>
@@ -4842,6 +6585,7 @@ export default function App() {
         tierDiscountPercent={tierDiscountPercent}
         isAdmin={currentUser.role === 'ADMIN'}
         defaultBackdated={preferBackdatedCheckout}
+        isOfflineMode={!isBrowserOnline || Boolean(storeSettings.manualOfflineMode)}
         onConfirmPayment={handleConfirmPayment}
         onOpenCustomerModal={() => {
           setIsPaymentModalOpen(false);
@@ -5390,6 +7134,87 @@ export default function App() {
               >
                 Mengerti
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <OfflineQueueModal
+        isOpen={isOfflineQueueModalOpen}
+        onClose={() => setIsOfflineQueueModalOpen(false)}
+        jobs={offlineQueueJobs}
+        isBrowserOnline={isBrowserOnline}
+        isManualOfflineMode={Boolean(storeSettings.manualOfflineMode)}
+        isSyncing={isAutoSyncingOffline}
+        onForceSyncNow={async () => {
+          await handleForceVerifyCloudSync();
+        }}
+        onRemoveJob={removeOfflineSyncJob}
+        onClearAllJobs={clearOfflineSyncQueue}
+        canClearQueue={currentUser.role === 'ADMIN'}
+      />
+
+      {isGoogleDriveBackupModalOpen && (currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER') && (
+        <div className="fixed inset-0 z-[105] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 md:p-6">
+          <div className="bg-white rounded-3xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="px-5 py-4 bg-slate-900 text-white flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/30 flex items-center justify-center shrink-0">
+                  <HardDrive className="w-5 h-5 text-sky-300" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm md:text-base font-extrabold truncate">
+                    Backup Data Toko ke Google Drive
+                  </h3>
+                  <p className="text-[11px] text-slate-300 truncate">
+                    Cadangkan &amp; pulihkan seluruh data toko secara aman di luar Firebase
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setIsGoogleDriveBackupModalOpen(false);
+                }}
+                className="p-2 rounded-xl text-slate-300 hover:text-white hover:bg-slate-800 cursor-pointer shrink-0"
+                aria-label="Tutup Backup Google Drive"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 md:p-5 overflow-y-auto space-y-4">
+              <GoogleDriveBackupPanel
+                canManageBackup={currentUser.role === 'ADMIN' || currentUser.role === 'STORE_MANAGER'}
+                currentUserName={currentUser.name}
+                buildBackupPayload={(prefix) =>
+                  buildFullBackupPayload({
+                    fileNamePrefix: prefix,
+                    products,
+                    categories,
+                    customerCategories,
+                    customers,
+                    suppliers,
+                    purchases,
+                    transactions,
+                    cashflows,
+                    attendances,
+                    stockOpnames,
+                    onlineOrders,
+                    activityLogs,
+                    taxRecords,
+                    taxAuditLogs,
+                    taxAdjustments,
+                    balanceSheetEntries,
+                    storeSettings,
+                    users,
+                  })
+                }
+                onRestoreBackup={handleRestoreBackup}
+                onBackupCompleted={() => {
+                  setOfflineSyncResultToast('Cadangan data toko berhasil diunggah ke Google Drive.');
+                }}
+              />
             </div>
           </div>
         </div>

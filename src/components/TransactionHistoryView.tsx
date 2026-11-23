@@ -1164,9 +1164,9 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
     setIsPdfExportModalOpen(true);
   };
 
-  const buildCurrentPdfDocument = () => {
+  const buildCurrentPdfDocument = async () => {
     if (pdfReportType === 'DAILY_PNL') {
-      const { doc, filename } = generateDailyProfitLossPdf(
+      const { doc, filename } = await generateDailyProfitLossPdf(
         transactions,
         dailyReportDate,
         storeSettings,
@@ -1183,7 +1183,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
         ? `${selectedTransactionsList.length} Transaksi Terpilih`
         : `Filter: ${categoryFilter} • ${methodFilter}${dateRangeStr}${custStr}`;
 
-    const { doc, filename } = generateSelectedTransactionsPdf(
+    const { doc, filename } = await generateSelectedTransactionsPdf(
       targetTransactionsForPdf,
       storeSettings,
       products,
@@ -1200,7 +1200,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
     return { doc, filename };
   };
 
-  const handleSavePdfLocally = () => {
+  const handleSavePdfLocally = async () => {
     sound.playTap();
     const hasData =
       pdfReportType === 'DAILY_PNL'
@@ -1213,7 +1213,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
       });
       return;
     }
-    const { doc, filename } = buildCurrentPdfDocument();
+    const { doc, filename } = await buildCurrentPdfDocument();
     doc.save(filename);
     setPdfModalFeedback({
       type: 'success',
@@ -1235,7 +1235,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
       return;
     }
 
-    const { doc, filename } = buildCurrentPdfDocument();
+    const { doc, filename } = await buildCurrentPdfDocument();
     const pdfBlob = doc.output('blob');
     const pdfFile = new File([pdfBlob], filename, { type: 'application/pdf' });
 
@@ -1287,9 +1287,9 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
     }
   };
 
-  const handleDownloadSingleTxPdf = (tx: Transaction) => {
+  const handleDownloadSingleTxPdf = async (tx: Transaction) => {
     sound.playTap();
-    const { doc, filename } = generateSingleTransactionPdf(tx, storeSettings, products, customers);
+    const { doc, filename } = await generateSingleTransactionPdf(tx, storeSettings, products, customers);
     doc.save(filename);
     setActionBanner({
       type: 'success',
@@ -1299,7 +1299,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
 
   const handleShareSingleTxPdf = async (tx: Transaction) => {
     sound.playTap();
-    const { doc, filename } = generateSingleTransactionPdf(tx, storeSettings, products, customers);
+    const { doc, filename } = await generateSingleTransactionPdf(tx, storeSettings, products, customers);
     const pdfBlob = doc.output('blob');
     const pdfFile = new File([pdfBlob], filename, { type: 'application/pdf' });
     const nav = navigator as Navigator & {
@@ -3041,14 +3041,14 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
                     href={buildWhatsAppShareHref(pdfWaPhone, pdfWaMessage)}
                     target="_blank"
                     rel="noopener noreferrer"
-                    onClick={() => {
+                    onClick={async () => {
                       sound.playTap();
                       const hasData =
                         pdfReportType === 'DAILY_PNL'
                           ? dailyPnlPreviewData.transactionCount > 0
                           : targetTransactionsForPdf.length > 0;
                       if (hasData) {
-                        const { doc, filename } = buildCurrentPdfDocument();
+                        const { doc, filename } = await buildCurrentPdfDocument();
                         doc.save(filename);
                         setPdfModalFeedback({
                           type: 'info',

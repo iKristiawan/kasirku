@@ -70,6 +70,7 @@ import { sound } from '../utils/audio';
 import { CATEGORY_COLOR_PRESETS, getCategoryColor, isDarkColor } from '../utils/categoryColors';
 import { deleteDocumentFromFirestore } from '../utils/firebaseSync';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { LazyProductImage } from './LazyProductImage';
 import { getCustomerCategoryBadge, DEFAULT_CUSTOMER_CATEGORIES } from '../utils/customerUtils';
 import * as XLSX from 'xlsx';
 
@@ -98,6 +99,86 @@ export const getNextSequentialSku = (existingProducts: Product[], isService: boo
 
   const nextNum = maxNum + 1;
   return `${detectedPrefix}${String(nextNum).padStart(4, '0')}`;
+};
+
+export interface UnitMarginEvaluation {
+  unitId: string;
+  unitName: string;
+  costPrice: number;
+  sellingPrice: number;
+  profitPerUnit: number;
+  marginPercent: number;
+  isLowMargin: boolean;
+  isLoss: boolean;
+}
+
+export interface ProductMarginEvaluation {
+  hasConfiguredCost: boolean;
+  isLowMargin: boolean;
+  isLoss: boolean;
+  worstMarginPercent: number;
+  worstUnit: UnitMarginEvaluation | null;
+  unitMap: Map<string, UnitMarginEvaluation>;
+}
+
+export const evaluateProductMargin = (prod: Product): ProductMarginEvaluation => {
+  const unitMap = new Map<string, UnitMarginEvaluation>();
+  let worstUnit: UnitMarginEvaluation | null = null;
+  const baseCost = Number(prod.costPrice) || 0;
+
+  (prod.units || []).forEach((u, idx) => {
+    const conv = Number(u.conversionFactor) || 1;
+    const rawUnitCost = Number(u.costPrice) || 0;
+    const effectiveCost =
+      idx === 0
+        ? rawUnitCost > 0
+          ? rawUnitCost
+          : baseCost
+        : rawUnitCost > 0
+        ? rawUnitCost
+        : Math.round(baseCost * conv);
+    const sellPrice = Number(u.sellingPrice) || 0;
+
+    if (effectiveCost <= 0) return;
+
+    const profitPerUnit = sellPrice - effectiveCost;
+    const marginPercent = sellPrice > 0 ? (profitPerUnit / sellPrice) * 100 : -100;
+    const evalItem: UnitMarginEvaluation = {
+      unitId: u.id,
+      unitName: u.unitName,
+      costPrice: effectiveCost,
+      sellingPrice: sellPrice,
+      profitPerUnit,
+      marginPercent,
+      isLowMargin: marginPercent < 2,
+      isLoss: marginPercent <= 0,
+    };
+    unitMap.set(u.id, evalItem);
+    if (!worstUnit || evalItem.marginPercent < worstUnit.marginPercent) {
+      worstUnit = evalItem;
+    }
+  });
+
+  if (!worstUnit) {
+    return {
+      hasConfiguredCost: false,
+      isLowMargin: false,
+      isLoss: false,
+      worstMarginPercent: 0,
+      worstUnit: null,
+      unitMap,
+    };
+  }
+
+  const finalWorst = worstUnit as UnitMarginEvaluation;
+  return {
+    hasConfiguredCost: true,
+    isLowMargin: finalWorst.marginPercent < 2,
+    isLoss: finalWorst.marginPercent <= 0,
+    worstMarginPercent: finalWorst.marginPercent,
+    worstUnit: finalWorst,
+    unitMap,
+  };
 };
 
 interface ProductManagementViewProps {
@@ -616,6 +697,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   // Item type filter: 'ALL' | 'BARANG' | 'JASA'
   const [productTypeFilter, setProductTypeFilter] = useState<'ALL' | 'BARANG' | 'JASA'>('ALL');
   const [showLowStockOnly, setShowLowStockOnly] = useState<boolean>(false);
+  const [showLowMarginOnly, setShowLowMarginOnly] = useState<boolean>(false);
 
   // Customer Category names list
   const availableCategoryNames = useMemo(() => {
@@ -646,6 +728,8 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
   const [variantLabel, setVariantLabel] = useState<string>('Rasa');
   const [variantInput, setVariantInput] = useState<string>('');
   const [customerPrices, setCustomerPrices] = useState<CustomerSpecialPrice[]>([]);
+  const [discountPercent, setDiscountPercent] = useState<string>('0');
+  const [promoLabel, setPromoLabel] = useState<string>('');
 
   // CSV Import States
   const [isCsvModalOpen, setIsCsvModalOpen] = useState(false);
@@ -1176,12 +1260,40 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     return { physicalProductsCount: physical, serviceProductsCount: service, lowStockProductsCount: low };
   }, [products]);
 
+  const lowMarginSummary = useMemo(() => {
+    const map = new Map<string, ProductMarginEvaluation>();
+    const flagged: { product: Product; eval: ProductMarginEvaluation }[] = [];
+    let lossCount = 0;
+    let thinCount = 0;
+
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      const evaluation = evaluateProductMargin(p);
+      map.set(p.id, evaluation);
+      if (evaluation.isLowMargin) {
+        flagged.push({ product: p, eval: evaluation });
+        if (evaluation.isLoss) lossCount += 1;
+        else thinCount += 1;
+      }
+    }
+
+    flagged.sort((a, b) => a.eval.worstMarginPercent - b.eval.worstMarginPercent);
+    return {
+      map,
+      items: flagged,
+      count: flagged.length,
+      lossCount,
+      thinCount,
+    };
+  }, [products]);
+
   const filteredProducts = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
     const list = products.filter((p) => {
       const pType = p.productType || 'BARANG';
       if (productTypeFilter !== 'ALL' && pType !== productTypeFilter) return false;
       if (showLowStockOnly && (pType === 'JASA' || p.stockInBaseUnit > p.minStockAlert)) return false;
+      if (showLowMarginOnly && !lowMarginSummary.map.get(p.id)?.isLowMargin) return false;
       if (selectedCategory !== 'SEMUA' && p.category !== selectedCategory) return false;
       if (!q) return true;
 
@@ -1241,7 +1353,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
       return 0;
     });
-  }, [products, productTypeFilter, showLowStockOnly, selectedCategory, deferredSearch, sortField, sortDirection]);
+  }, [products, productTypeFilter, showLowStockOnly, showLowMarginOnly, lowMarginSummary, selectedCategory, deferredSearch, sortField, sortDirection]);
 
   const handleToggleSortField = (field: 'SKU' | 'NAME' | 'CATEGORY' | 'STOCK') => {
     sound.playTap();
@@ -1258,7 +1370,7 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [deferredSearch, selectedCategory, productTypeFilter, showLowStockOnly, pageSize, sortField, sortDirection]);
+  }, [deferredSearch, selectedCategory, productTypeFilter, showLowStockOnly, showLowMarginOnly, pageSize, sortField, sortDirection]);
 
   const paginatedProducts = useMemo(() => {
     const start = (safeCurrentPage - 1) * pageSize;
@@ -1289,6 +1401,8 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantLabel('Rasa');
     setVariantInput('');
     setCustomerPrices([]);
+    setDiscountPercent('0');
+    setPromoLabel('');
     setShowInlineCatCreator(false);
     setPriceChangeReason('');
     setIsAddingNew(true);
@@ -1318,6 +1432,8 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantLabel('Tipe');
     setVariantInput('');
     setCustomerPrices([]);
+    setDiscountPercent('0');
+    setPromoLabel('');
     setShowInlineCatCreator(false);
     setPriceChangeReason('');
     setIsAddingNew(true);
@@ -1360,6 +1476,10 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
     setVariantLabel(prod.variantLabel || 'Rasa');
     setVariantInput('');
     setCustomerPrices(prod.customerPrices ? [...prod.customerPrices] : []);
+    setDiscountPercent(
+      prod.discountPercent && prod.discountPercent > 0 ? String(prod.discountPercent) : '0'
+    );
+    setPromoLabel(prod.promoLabel || '');
     setShowInlineCatCreator(false);
     setPriceChangeReason('');
     setIsAddingNew(false);
@@ -1557,6 +1677,14 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
       technicianName: isService ? technicianName.trim() : undefined,
       serviceNotes: isService ? serviceNotes.trim() : undefined,
       expiryDate: (!isService && expiryDate.trim()) ? expiryDate.trim() : undefined,
+      discountPercent: (() => {
+        const parsed = Math.min(99, Math.max(0, parseFloat(discountPercent) || 0));
+        return parsed > 0 ? Math.round(parsed * 10) / 10 : undefined;
+      })(),
+      promoLabel:
+        (parseFloat(discountPercent) || 0) > 0 && promoLabel.trim()
+          ? promoLabel.trim()
+          : undefined,
       customerPrices: customerPrices.length > 0 ? customerPrices.map((cp) => ({
         id: cp.id || ('cp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6)),
         customerCategory: cp.customerCategory.trim().toUpperCase(),
@@ -2278,6 +2406,25 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                 >
                   <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                   <span>{lowStockProductsCount} Stok Menipis</span>
+                </button>
+              )}
+              {lowMarginSummary.count > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setShowLowMarginOnly((prev) => !prev);
+                    setActiveTab('CATALOG');
+                  }}
+                  title="Klik untuk menyaring produk dengan margin keuntungan di bawah 2%"
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-black border transition-all cursor-pointer ${
+                    showLowMarginOnly
+                      ? 'bg-amber-600 text-white border-amber-600 shadow-xs'
+                      : 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                  }`}
+                >
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{lowMarginSummary.count} Margin &lt; 2%</span>
                 </button>
               )}
             </div>
@@ -3129,6 +3276,34 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                   {lowStockProductsCount}
                 </span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  setShowLowMarginOnly((prev) => !prev);
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                  showLowMarginOnly
+                    ? 'bg-amber-600 text-white border-amber-600 shadow-xs'
+                    : lowMarginSummary.count > 0
+                    ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                    : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                }`}
+                title="Saring produk dengan margin keuntungan di bawah 2%"
+              >
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>Margin &lt; 2%</span>
+                <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-black ${
+                  showLowMarginOnly
+                    ? 'bg-white text-amber-700'
+                    : lowMarginSummary.count > 0
+                    ? 'bg-amber-600 text-white'
+                    : 'bg-slate-200 text-slate-600'
+                }`}>
+                  {lowMarginSummary.count}
+                </span>
+              </button>
             </div>
 
             <div className="text-xs text-slate-500 font-semibold self-end sm:self-auto">
@@ -3148,8 +3323,39 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
               />
             </div>
 
-            {/* Sort By Dropdown & Direction Toggle */}
+            {/* Category Dropdown Filter */}
             <div className="flex items-center gap-2 shrink-0 flex-wrap">
+              <div
+                className={`flex items-center gap-1.5 border px-3 py-2 rounded-xl text-xs transition-colors ${
+                  selectedCategory !== 'SEMUA'
+                    ? 'bg-sky-50 border-sky-300 text-sky-900'
+                    : 'bg-slate-50 border-slate-200 text-slate-700'
+                }`}
+              >
+                <Filter
+                  className={`w-3.5 h-3.5 shrink-0 ${
+                    selectedCategory !== 'SEMUA' ? 'text-sky-600' : 'text-slate-400'
+                  }`}
+                />
+                <span className="text-slate-500 font-bold whitespace-nowrap">Kategori:</span>
+                <select
+                  aria-label="Filter Kategori Produk"
+                  value={selectedCategory}
+                  onChange={(e) => {
+                    sound.playTap();
+                    setSelectedCategory(e.target.value);
+                  }}
+                  className="bg-transparent font-bold text-slate-800 focus:outline-none cursor-pointer max-w-[180px]"
+                >
+                  <option value="SEMUA">Semua Kategori ({products.length})</option>
+                  {categoryNamesList.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat} ({categoryCountMap.get(cat.toLowerCase()) || 0})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <div
                 className={`flex items-center gap-1.5 border px-3 py-2 rounded-xl text-xs transition-colors ${
                   sortField !== 'DEFAULT'
@@ -3281,6 +3487,81 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
           </div>
         </div>
 
+        {/* Automated Margin Warning Banner (< 2%) */}
+        {lowMarginSummary.count > 0 && (
+          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-3">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="p-2 rounded-xl bg-amber-600 text-white shrink-0">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs md:text-sm font-bold text-amber-950">
+                    Peringatan Margin Tipis: {lowMarginSummary.count} Produk Memiliki Margin Keuntungan &lt; 2%
+                  </div>
+                  <p className="text-xs text-amber-900 mt-0.5 tabular-nums">
+                    {lowMarginSummary.lossCount > 0 && (
+                      <>
+                        <strong className="text-rose-700">{lowMarginSummary.lossCount} produk berpotensi rugi (margin ≤ 0%)</strong>
+                        {lowMarginSummary.thinCount > 0 ? ' dan ' : '. '}
+                      </>
+                    )}
+                    {lowMarginSummary.thinCount > 0 && (
+                      <>
+                        <strong>{lowMarginSummary.thinCount} produk bermargin tipis (0–2%)</strong>.
+                      </>
+                    )}{' '}
+                    Klik produk di bawah atau tombol &ldquo;Sesuaikan Harga&rdquo; pada tabel untuk memperbarui harga jual.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playTap();
+                    setShowLowMarginOnly((prev) => !prev);
+                  }}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                    showLowMarginOnly
+                      ? 'bg-slate-900 text-white hover:bg-slate-800'
+                      : 'bg-amber-600 hover:bg-amber-700 text-white'
+                  }`}
+                >
+                  {showLowMarginOnly ? 'Tampilkan Semua Produk' : `Saring ${lowMarginSummary.count} Produk (< 2%)`}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-amber-200/70">
+              {lowMarginSummary.items.slice(0, 5).map(({ product: lp, eval: ev }) => (
+                <button
+                  key={lp.id}
+                  type="button"
+                  onClick={() => openEditModal(lp)}
+                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                    ev.isLoss
+                      ? 'bg-rose-50 hover:bg-rose-100 text-rose-800 border-rose-200'
+                      : 'bg-white hover:bg-amber-100 text-amber-900 border-amber-200'
+                  }`}
+                  title={`Klik untuk menyesuaikan harga jual ${lp.name}`}
+                >
+                  <span className="truncate max-w-[160px]">{lp.name}</span>
+                  <span className="font-mono tabular-nums">
+                    ({ev.worstMarginPercent.toFixed(1)}%)
+                  </span>
+                </button>
+              ))}
+              {lowMarginSummary.items.length > 5 && (
+                <span className="text-[11px] font-semibold text-amber-800 px-1.5">
+                  +{lowMarginSummary.items.length - 5} produk lainnya
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Products Table */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
           <div className="overflow-x-auto">
@@ -3389,9 +3670,21 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                   paginatedProducts.map((prod) => {
                     const isLow = prod.stockInBaseUnit <= prod.minStockAlert;
                     const catColor = getCategoryColor(prod.category, categories, prod);
+                    const marginEval = lowMarginSummary.map.get(prod.id);
+                    const isLowMargin = Boolean(marginEval?.isLowMargin);
+                    const isLossMargin = Boolean(marginEval?.isLoss);
 
                     return (
-                      <tr key={prod.id} className="hover:bg-slate-50/70 transition-colors">
+                      <tr
+                        key={prod.id}
+                        className={`transition-colors ${
+                          isLossMargin
+                            ? 'bg-rose-50/60 hover:bg-rose-50/90'
+                            : isLowMargin
+                            ? 'bg-amber-50/60 hover:bg-amber-50/90'
+                            : 'hover:bg-slate-50/70'
+                        }`}
+                      >
                         {/* Product Name & Barcode */}
                         <td className="py-3 px-4">
                           <div className="flex items-center gap-3">
@@ -3400,26 +3693,24 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                               title="Klik untuk ambil/ganti foto profil dengan kamera"
                               className="relative group/thumb w-10 h-10 rounded-xl bg-slate-100 overflow-hidden shrink-0 border border-slate-200/60 cursor-pointer shadow-2xs"
                             >
-                              {prod.imageUrl ? (
-                                <img
-                                  src={prod.imageUrl}
-                                  alt={prod.name}
-                                  loading="lazy"
-                                  decoding="async"
-                                  referrerPolicy="no-referrer"
-                                  className="w-full h-full object-cover"
-                                />
-                              ) : (
-                                <div
-                                  className="w-full h-full flex items-center justify-center font-bold text-xs"
-                                  style={{
-                                    backgroundColor: `${catColor}15`,
-                                    color: catColor,
-                                  }}
-                                >
-                                  {prod.name.charAt(0)}
-                                </div>
-                              )}
+                              <LazyProductImage
+                                src={prod.imageUrl}
+                                alt={prod.name}
+                                className="w-full h-full object-cover"
+                                containerClassName="w-full h-full relative"
+                                unloadFarOffscreen={true}
+                                fallback={
+                                  <div
+                                    className="w-full h-full flex items-center justify-center font-bold text-xs"
+                                    style={{
+                                      backgroundColor: `${catColor}15`,
+                                      color: catColor,
+                                    }}
+                                  >
+                                    {prod.name.charAt(0)}
+                                  </div>
+                                }
+                              />
                               <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/thumb:opacity-100 transition-opacity flex items-center justify-center text-white">
                                 <Camera className="w-4 h-4" />
                               </div>
@@ -3427,6 +3718,11 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                             <div>
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span className="font-bold text-slate-900">{prod.name}</span>
+                                {prod.discountPercent && prod.discountPercent > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded text-[9.5px] font-black bg-rose-100 text-rose-800 border border-rose-200 inline-flex items-center gap-1 tabular-nums">
+                                    <span>-{prod.discountPercent}% {prod.promoLabel || 'PROMO'}</span>
+                                  </span>
+                                )}
                                 {prod.productType === 'JASA' && (
                                   <span className="px-1.5 py-0.5 rounded text-[9.5px] font-black bg-purple-100 text-purple-800 border border-purple-200 inline-flex items-center gap-1 shadow-2xs">
                                     <Wrench className="w-2.5 h-2.5 text-purple-600" />
@@ -3540,38 +3836,59 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                         {/* Multi Units & Service Tariffs Breakdown */}
                         <td className="py-3 px-4">
                           <div className="space-y-1">
-                            {prod.units.map((u) => (
-                              <div key={u.id} className="flex items-center gap-2 text-xs flex-wrap">
-                                <span className={`px-1.5 py-0.5 rounded font-mono font-bold ${
-                                  prod.productType === 'JASA'
-                                    ? 'bg-purple-50 text-purple-800 border border-purple-200'
-                                    : 'bg-slate-100 text-slate-700'
-                                }`}>
-                                  {u.unitName}
-                                </span>
-                                {prod.productType !== 'JASA' && u.conversionFactor > 1 && (
-                                  <span className="text-[11px] text-slate-400">
-                                    ({u.conversionFactor} {prod.baseUnit})
+                            {prod.units.map((u) => {
+                              const unitEval = marginEval?.unitMap.get(u.id);
+                              return (
+                                <div key={u.id} className="flex items-center gap-2 text-xs flex-wrap">
+                                  <span className={`px-1.5 py-0.5 rounded font-mono font-bold ${
+                                    prod.productType === 'JASA'
+                                      ? 'bg-purple-50 text-purple-800 border border-purple-200'
+                                      : 'bg-slate-100 text-slate-700'
+                                  }`}>
+                                    {u.unitName}
                                   </span>
-                                )}
-                                <span className={`font-mono font-bold ${
-                                  prod.productType === 'JASA' ? 'text-purple-700' : 'text-sky-700'
-                                }`}>
-                                  {formatRupiah(u.sellingPrice)}
-                                </span>
-                                {u.barcode && (
-                                  <span className="text-[10px] text-slate-400 font-mono flex items-center gap-0.5 bg-slate-50 px-1 py-0.2 rounded border border-slate-200" title={`Barcode Satuan: ${u.barcode}`}>
-                                    <Barcode className="w-2.5 h-2.5" />
-                                    <span>{u.barcode}</span>
+                                  {prod.productType !== 'JASA' && u.conversionFactor > 1 && (
+                                    <span className="text-[11px] text-slate-400">
+                                      ({u.conversionFactor} {prod.baseUnit})
+                                    </span>
+                                  )}
+                                  <span className={`font-mono font-bold ${
+                                    prod.productType === 'JASA' ? 'text-purple-700' : 'text-sky-700'
+                                  }`}>
+                                    {formatRupiah(u.sellingPrice)}
                                   </span>
-                                )}
-                                {prod.productType === 'JASA' && u.costPrice ? (
-                                  <span className="text-[10px] text-slate-400 font-mono">
-                                    (Komisi: {formatRupiah(u.costPrice)})
-                                  </span>
-                                ) : null}
-                              </div>
-                            ))}
+                                  {unitEval && (
+                                    <span
+                                      className={`text-[10.5px] font-mono tabular-nums font-bold ${
+                                        unitEval.isLoss
+                                          ? 'text-rose-700'
+                                          : unitEval.isLowMargin
+                                          ? 'text-amber-700'
+                                          : 'text-emerald-700'
+                                      }`}
+                                      title={`Modal ${formatRupiah(unitEval.costPrice)} • Laba ${formatRupiah(unitEval.profitPerUnit)}/${u.unitName}`}
+                                    >
+                                      {unitEval.isLoss
+                                        ? `Rugi (${unitEval.marginPercent.toFixed(1)}%)`
+                                        : unitEval.isLowMargin
+                                        ? `Margin < 2% (${unitEval.marginPercent.toFixed(1)}%)`
+                                        : `Margin ${unitEval.marginPercent.toFixed(1)}%`}
+                                    </span>
+                                  )}
+                                  {u.barcode && (
+                                    <span className="text-[10px] text-slate-400 font-mono flex items-center gap-0.5 bg-slate-50 px-1 py-0.2 rounded border border-slate-200" title={`Barcode Satuan: ${u.barcode}`}>
+                                      <Barcode className="w-2.5 h-2.5" />
+                                      <span>{u.barcode}</span>
+                                    </span>
+                                  )}
+                                  {prod.productType === 'JASA' && u.costPrice ? (
+                                    <span className="text-[10px] text-slate-400 font-mono">
+                                      (Komisi: {formatRupiah(u.costPrice)})
+                                    </span>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
 
                             {/* Badges Harga Khusus Pelanggan */}
                             {prod.customerPrices && prod.customerPrices.length > 0 && (
@@ -3602,6 +3919,17 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                         {/* Actions */}
                         <td className="py-3 px-4 text-right">
                           <div className="flex items-center justify-end gap-1.5">
+                            {isLowMargin && (
+                              <button
+                                type="button"
+                                onClick={() => openEditModal(prod)}
+                                title="Sesuaikan harga jual karena margin keuntungan di bawah 2%"
+                                className="px-2 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[10.5px] font-bold flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                                <span>Sesuaikan Harga</span>
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => {
@@ -4872,6 +5200,71 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                           </div>
                         </div>
 
+                        {/* Live Margin Indicator & Quick Adjustment Presets */}
+                        {(() => {
+                          const baseCostNum = Number(units[0]?.costPrice) || Number(costPrice) || 0;
+                          const rawCostNum = Number(unit.costPrice) || 0;
+                          const effectiveCost =
+                            idx === 0
+                              ? rawCostNum > 0
+                                ? rawCostNum
+                                : baseCostNum
+                              : rawCostNum > 0
+                              ? rawCostNum
+                              : Math.round(baseCostNum * (Number(unit.conversionFactor) || 1));
+                          const sellNum = Number(unit.sellingPrice) || 0;
+                          if (effectiveCost <= 0) return null;
+
+                          const profit = sellNum - effectiveCost;
+                          const marginPct = sellNum > 0 ? (profit / sellNum) * 100 : -100;
+                          const isThinOrLoss = marginPct < 2;
+
+                          const applyTargetMargin = (targetRate: number) => {
+                            sound.playTap();
+                            const suggested = Math.ceil(effectiveCost / (1 - targetRate) / 100) * 100;
+                            handleUnitChange(idx, 'sellingPrice', String(suggested));
+                          };
+
+                          return (
+                            <div
+                              className={`px-2.5 py-2 rounded-lg border text-[11px] flex flex-wrap items-center justify-between gap-2 ${
+                                marginPct <= 0
+                                  ? 'bg-rose-50 border-rose-200 text-rose-800'
+                                  : isThinOrLoss
+                                  ? 'bg-amber-50 border-amber-200 text-amber-900'
+                                  : 'bg-emerald-50/70 border-emerald-200 text-emerald-800'
+                              }`}
+                            >
+                              <div className="font-mono tabular-nums font-bold">
+                                Laba: {formatRupiah(profit)} · Margin: {marginPct.toFixed(1)}%
+                                {isThinOrLoss && (
+                                  <span className="ml-1.5 font-sans font-extrabold">
+                                    ({marginPct <= 0 ? 'Rugi — di bawah modal' : 'Peringatan Margin < 2%'})
+                                  </span>
+                                )}
+                              </div>
+                              {isThinOrLoss && (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => applyTargetMargin(0.05)}
+                                    className="px-2 py-0.5 rounded bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 font-bold text-[10px] cursor-pointer"
+                                  >
+                                    Set Margin 5%
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => applyTargetMargin(0.1)}
+                                    className="px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10px] cursor-pointer"
+                                  >
+                                    Set Margin 10%
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+
                         {/* Kolom Barcode Satuan berada tepat di bawah Harga Jual dengan Tombol Scan Kamera / Alat Scanner */}
                         <div>
                           <div className="flex items-center justify-between mb-1">
@@ -5096,6 +5489,112 @@ export const ProductManagementView: React.FC<ProductManagementViewProps> = ({
                     Belum ada varian ditambahkan. Produk akan dijual standar tanpa pilihan variasi.
                   </p>
                 )}
+              </div>
+
+              {/* PROMO & DISKON PRODUK */}
+              <div className="p-4 rounded-2xl border border-rose-200/80 bg-gradient-to-r from-rose-50/60 via-amber-50/40 to-white space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-rose-100">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-xl bg-rose-600 text-white flex items-center justify-center shadow-xs shrink-0 font-black text-xs">
+                      %
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-black text-slate-900 uppercase tracking-wider">
+                          Diskon &amp; Promo Produk Langsung
+                        </span>
+                        {(parseFloat(discountPercent) || 0) > 0 && (
+                          <span className="px-2 py-0.5 rounded-md bg-rose-600 text-white text-[10px] font-extrabold tabular-nums">
+                            Aktif -{parseFloat(discountPercent)}%
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Ditampilkan otomatis dengan harga coret &amp; badge promo di katalog kasir dan keranjang belanja.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {[0, 5, 10, 15, 20, 25].map((pct) => (
+                      <button
+                        key={pct}
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          setDiscountPercent(String(pct));
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[11px] font-bold border transition-all cursor-pointer tabular-nums ${
+                          (parseFloat(discountPercent) || 0) === pct
+                            ? 'bg-rose-600 text-white border-rose-600 shadow-2xs'
+                            : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50'
+                        }`}
+                      >
+                        {pct === 0 ? 'Normal' : `${pct}%`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
+                  <div className="sm:col-span-4">
+                    <label className="text-[10.5px] font-bold text-slate-600 block mb-1">
+                      Persentase Diskon (%)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="99"
+                      step="0.5"
+                      value={discountPercent}
+                      onChange={(e) => setDiscountPercent(e.target.value)}
+                      className="w-full p-2 rounded-xl border border-slate-200 text-xs font-bold font-mono focus:border-rose-500 bg-white"
+                      placeholder="0"
+                    />
+                  </div>
+                  <div className="sm:col-span-4">
+                    <label className="text-[10.5px] font-bold text-slate-600 block mb-1">
+                      Label Promo (Opsional)
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={32}
+                      value={promoLabel}
+                      onChange={(e) => setPromoLabel(e.target.value)}
+                      disabled={(parseFloat(discountPercent) || 0) <= 0}
+                      className="w-full p-2 rounded-xl border border-slate-200 text-xs focus:border-rose-500 bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                      placeholder="Contoh: Promo Akhir Pekan"
+                    />
+                  </div>
+                  <div className="sm:col-span-4">
+                    {(() => {
+                      const basePrice = Number(units[0]?.sellingPrice) || 0;
+                      const pct = Math.min(99, Math.max(0, parseFloat(discountPercent) || 0));
+                      const finalPrice = Math.max(0, Math.round(basePrice * (1 - pct / 100)));
+                      return (
+                        <div className="p-2.5 rounded-xl bg-white border border-slate-200 text-xs tabular-nums">
+                          <div className="text-[10px] font-bold text-slate-400 uppercase">
+                            Harga Jual di Kasir ({units[0]?.unitName || baseUnit})
+                          </div>
+                          {pct > 0 ? (
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                              <span className="line-through text-slate-400 text-[11px] font-mono">
+                                {formatRupiah(basePrice)}
+                              </span>
+                              <span className="font-extrabold text-rose-700 font-mono text-sm">
+                                {formatRupiah(finalPrice)}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="font-extrabold text-slate-800 font-mono text-sm mt-0.5">
+                              {formatRupiah(basePrice)} (Harga Normal)
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
               </div>
 
               {/* MENU PELANGGAN: HARGA KHUSUS KATEGORI PELANGGAN */}

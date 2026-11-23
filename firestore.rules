@@ -216,24 +216,31 @@ service cloud.firestore {
     }
 
     function isValidStoreSettings(data) {
-      return data.keys().size() <= 75 &&
+      return data.keys().size() <= 85 &&
              nonEmptyStr(data.get('storeName', ''), 160) &&
-             optStr(data.get('storeAddress', null), 400) &&
-             optStr(data.get('storePhone', null), 40) &&
-             optStr(data.get('storeFooterReceipt', null), 500) &&
-             optStr(data.get('storeLogo', null), 500000) &&
-             optNonNegNum(data.get('dailySalesGoal', null), 10000000000) &&
-             optNonNegNum(data.get('weeklySalesGoal', null), 10000000000) &&
-             optNonNegNum(data.get('monthlySalesGoal', null), 100000000000) &&
-             optStr(data.get('adminWhatsAppNumber', null), 40) &&
+             optStr(data.get('storeAddress', null), 500) &&
+             optStr(data.get('storePhone', null), 80) &&
+             optStr(data.get('storeHeaderReceipt', null), 500) &&
+             optStr(data.get('storeFooterReceipt', null), 1000) &&
+             optStr(data.get('storeLogo', null), 600000) &&
+             optStr(data.get('qrisImageUrl', null), 600000) &&
+             optNonNegNum(data.get('dailySalesGoal', null), 1000000000000) &&
+             optNonNegNum(data.get('weeklySalesGoal', null), 1000000000000) &&
+             optNonNegNum(data.get('monthlySalesGoal', null), 1000000000000) &&
+             optStr(data.get('adminWhatsAppNumber', null), 80) &&
              optBoundedNum(data.get('adminLowStockTriggerCount', null), 1, 100) &&
-             optNonNegNum(data.get('spendPerPoint', null), 100000000) &&
+             optNonNegNum(data.get('spendPerPoint', null), 1000000000) &&
              optNonNegNum(data.get('pointsPerSpend', null), 100000) &&
              optNonNegNum(data.get('pointValueRupiah', null), 10000000) &&
              optList(data.get('customPaymentMethods', null), 25) &&
+             optList(data.get('storeUnits', null), 50) &&
+             optList(data.get('stockTransferRequests', null), 100) &&
              optMap(data.get('categorySalesGoals', null), 100) &&
              optMap(data.get('scheduledAdminLowStockWhatsApp', null), 15) &&
-             optMap(data.get('scheduledDailySalesReportWhatsApp', null), 15);
+             optMap(data.get('scheduledDailySalesReportWhatsApp', null), 15) &&
+             optMap(data.get('membershipDiscounts', null), 10) &&
+             optMap(data.get('chartTheme', null), 10) &&
+             optMap(data.get('taxConfig', null), 30);
     }
 
     function isValidOnlineOrder(data) {
@@ -306,47 +313,145 @@ service cloud.firestore {
     }
 
     // =========================================================================
+    // TAX RECORDS VALIDATOR
+    // =========================================================================
+    function isValidTaxRecord(data) {
+      return data.keys().size() <= 22 &&
+             nonEmptyStr(data.get('periodMonth', ''), 10) &&
+             data.get('taxType', '') in ['PPH_FINAL_UMKM', 'PPH_BADAN', 'PPN', 'PB1', 'PPH_21', 'LAINNYA'] &&
+             nonEmptyStr(data.get('taxTypeLabel', ''), 120) &&
+             nonNegNum(data.get('taxBaseAmount', -1), 100000000000) &&
+             nonNegNum(data.get('taxRatePercent', -1), 100) &&
+             nonNegNum(data.get('taxAmountDue', -1), 10000000000) &&
+             nonNegNum(data.get('paidAmount', -1), 10000000000) &&
+             data.get('status', '') in ['BELUM_SETOR', 'SUDAH_SETOR'] &&
+             optStr(data.get('billingCode', null), 80) &&
+             optStr(data.get('ntpnCode', null), 80) &&
+             optStr(data.get('paidDate', null), 20) &&
+             optStr(data.get('paymentMethod', null), 60) &&
+             optStr(data.get('notes', null), 1000) &&
+             optStr(data.get('linkedCashflowId', null), 128) &&
+             nonEmptyStr(data.get('recordedBy', ''), 120) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('createdAt', ''), 64) &&
+             optStr(data.get('updatedAt', null), 64);
+    }
+
+    // =========================================================================
+    // TAX AUDIT LOGS VALIDATOR (Immutable Audit Trail)
+    // =========================================================================
+    function isValidTaxAuditLog(data) {
+      return data.keys().size() <= 16 &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('createdAt', ''), 64) &&
+             data.get('category', '') in ['CONFIG_CHANGE', 'RATE_OVERRIDE', 'ADJUSTMENT', 'RECORD_MUTATION'] &&
+             nonEmptyStr(data.get('actionLabel', ''), 180) &&
+             nonEmptyStr(data.get('actorId', ''), 128) &&
+             nonEmptyStr(data.get('actorName', ''), 120) &&
+             data.get('actorRole', '') in ['ADMIN', 'STORE_MANAGER', 'KARYAWAN'] &&
+             nonEmptyStr(data.get('summary', ''), 800) &&
+             optList(data.get('changes', null), 50) &&
+             optStr(data.get('reason', null), 600) &&
+             optStr(data.get('periodMonth', null), 12);
+    }
+
+    // =========================================================================
+    // TAX ADJUSTMENTS VALIDATOR
+    // =========================================================================
+    function isValidTaxAdjustment(data) {
+      return data.keys().size() <= 18 &&
+             nonEmptyStr(data.get('adjustmentNumber', ''), 64) &&
+             nonEmptyStr(data.get('periodMonth', ''), 10) &&
+             nonEmptyStr(data.get('adjustmentDate', ''), 20) &&
+             data.get('reasonType', '') in ['PEMBATALAN_FAKTUR', 'KESALAHAN_INPUT', 'RETUR_NOTA_RETUR', 'KOREKSI_TARIF_DPP', 'LAINNYA'] &&
+             data.get('affectedTaxType', '') in ['DPP_OMZET', 'PPH_FINAL_UMKM', 'PPN_KELUARAN', 'PPN_MASUKAN', 'PB1'] &&
+             data.get('direction', '') in ['DECREASE', 'INCREASE'] &&
+             optStr(data.get('referenceInvoiceNumber', null), 100) &&
+             optBoundedNum(data.get('dppDelta', 0), -100000000000, 100000000000) &&
+             optBoundedNum(data.get('taxDelta', 0), -100000000000, 100000000000) &&
+             data.get('status', '') in ['ACTIVE', 'VOIDED'] &&
+             optStr(data.get('notes', null), 1000) &&
+             nonEmptyStr(data.get('createdBy', ''), 120) &&
+             optStr(data.get('createdById', null), 128) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('createdAt', ''), 64) &&
+             optStr(data.get('updatedAt', null), 64);
+    }
+
+    // =========================================================================
+    // BALANCE SHEET ENTRIES VALIDATOR (Aktiva & Pasiva Manual Accounts)
+    // =========================================================================
+    function isValidBalanceSheetEntry(data) {
+      return data.keys().size() <= 20 &&
+             nonEmptyStr(data.get('accountCode', ''), 24) &&
+             nonEmptyStr(data.get('accountName', ''), 160) &&
+             data.get('section', '') in ['AKTIVA_LANCAR', 'AKTIVA_TETAP', 'KEWAJIBAN_LANCAR', 'KEWAJIBAN_JANGKA_PANJANG', 'EKUITAS'] &&
+             nonNegNum(data.get('amount', -1), 1000000000000) &&
+             optBool(data.get('isContra', null)) &&
+             nonEmptyStr(data.get('asOfDate', ''), 20) &&
+             (data.get('depreciationMethod', null) == null || data.get('depreciationMethod', null) in ['NONE', 'STRAIGHT_LINE']) &&
+             optNonNegNum(data.get('usefulLifeMonths', null), 1200) &&
+             optNonNegNum(data.get('salvageValue', null), 1000000000000) &&
+             optStr(data.get('notes', null), 600) &&
+             nonEmptyStr(data.get('createdBy', ''), 120) &&
+             optStr(data.get('createdById', null), 128) &&
+             data.get('timestamp', 0) is number &&
+             data.get('timestamp', 0) > 0 &&
+             nonEmptyStr(data.get('createdAt', ''), 64) &&
+             optStr(data.get('updatedAt', null), 64);
+    }
+
+    // =========================================================================
     // COLLECTION MATCH RULES
     // =========================================================================
 
     // Users (Kasir / Store Manager / Admin PIN profiles)
     match /users/{userId} {
-      allow read: if isValidDocId(userId);
+      allow get: if isValidDocId(userId);
+      allow list: if true;
       allow create, update: if isValidDocId(userId) && isValidUser(request.resource.data);
       allow delete: if isValidDocId(userId);
     }
 
     // Product Categories
     match /categories/{categoryId} {
-      allow read: if isValidDocId(categoryId);
+      allow get: if isValidDocId(categoryId);
+      allow list: if true;
       allow create, update: if isValidDocId(categoryId) && isValidCategory(request.resource.data);
       allow delete: if isValidDocId(categoryId);
     }
 
     // Products Inventory
     match /products/{productId} {
-      allow read: if isValidDocId(productId);
+      allow get: if isValidDocId(productId);
+      allow list: if true;
       allow create, update: if isValidDocId(productId) && isValidProduct(request.resource.data);
       allow delete: if isValidDocId(productId);
     }
 
     // Customers & Loyalty Balances
     match /customers/{customerId} {
-      allow read: if isValidDocId(customerId);
+      allow get: if isValidDocId(customerId);
+      allow list: if true;
       allow create, update: if isValidDocId(customerId) && isValidCustomer(request.resource.data);
       allow delete: if isValidDocId(customerId);
     }
 
     // Customer Categories
     match /customer_categories/{catId} {
-      allow read: if isValidDocId(catId);
+      allow get: if isValidDocId(catId);
+      allow list: if true;
       allow create, update: if isValidDocId(catId) && isValidCustomerCategory(request.resource.data);
       allow delete: if isValidDocId(catId);
     }
 
     // Sales Transactions (Financial Audit Trail: invoiceNumber immutable on update)
     match /transactions/{transactionId} {
-      allow read: if isValidDocId(transactionId);
+      allow get: if isValidDocId(transactionId);
+      allow list: if true;
       allow create: if isValidDocId(transactionId) && isValidTransaction(request.resource.data);
       allow update: if isValidDocId(transactionId) &&
                        isValidTransaction(request.resource.data) &&
@@ -356,21 +461,24 @@ service cloud.firestore {
 
     // Suppliers
     match /suppliers/{supplierId} {
-      allow read: if isValidDocId(supplierId);
+      allow get: if isValidDocId(supplierId);
+      allow list: if true;
       allow create, update: if isValidDocId(supplierId) && isValidSupplier(request.resource.data);
       allow delete: if isValidDocId(supplierId);
     }
 
     // Employee Attendance Shifts
     match /attendances/{attendanceId} {
-      allow read: if isValidDocId(attendanceId);
+      allow get: if isValidDocId(attendanceId);
+      allow list: if true;
       allow create, update: if isValidDocId(attendanceId) && isValidAttendance(request.resource.data);
       allow delete: if isValidDocId(attendanceId);
     }
 
     // Stock Opname Audit Sessions (sessionNumber & date immutable once created)
     match /stock_opnames/{opnameId} {
-      allow read: if isValidDocId(opnameId);
+      allow get: if isValidDocId(opnameId);
+      allow list: if true;
       allow create: if isValidDocId(opnameId) && isValidStockOpname(request.resource.data);
       allow update: if isValidDocId(opnameId) &&
                        isValidStockOpname(request.resource.data) &&
@@ -380,28 +488,32 @@ service cloud.firestore {
 
     // Restock Purchases / POs
     match /purchases/{purchaseId} {
-      allow read: if isValidDocId(purchaseId);
+      allow get: if isValidDocId(purchaseId);
+      allow list: if true;
       allow create, update: if isValidDocId(purchaseId) && isValidPurchase(request.resource.data);
       allow delete: if isValidDocId(purchaseId);
     }
 
     // Cashflow Records (Expenses & Misc Income)
     match /cashflows/{cashflowId} {
-      allow read: if isValidDocId(cashflowId);
+      allow get: if isValidDocId(cashflowId);
+      allow list: if true;
       allow create, update: if isValidDocId(cashflowId) && isValidCashflow(request.resource.data);
       allow delete: if isValidDocId(cashflowId);
     }
 
     // Store Configuration Singleton (only store_config writable, non-deletable)
     match /settings/{settingId} {
-      allow read: if isValidDocId(settingId);
+      allow get: if isValidDocId(settingId);
+      allow list: if true;
       allow create, update: if settingId == 'store_config' && isValidStoreSettings(request.resource.data);
       allow delete: if false;
     }
 
     // Online Storefront Orders (Immutable orderCode & totalAmount once placed)
     match /online_orders/{orderId} {
-      allow read: if isValidDocId(orderId);
+      allow get: if isValidDocId(orderId);
+      allow list: if true;
       allow create: if isValidDocId(orderId) &&
                        isValidOnlineOrder(request.resource.data) &&
                        request.resource.data.status == 'MENUNGGU_KONFIRMASI';
@@ -414,7 +526,8 @@ service cloud.firestore {
 
     // Employee Sensitive Actions Audit Trail (Immutable log entries)
     match /activity_logs/{logId} {
-      allow read: if isValidDocId(logId);
+      allow get: if isValidDocId(logId);
+      allow list: if true;
       allow create: if isValidDocId(logId) && isValidActivityLog(request.resource.data);
       allow update: if false;
       allow delete: if isValidDocId(logId);
@@ -422,9 +535,43 @@ service cloud.firestore {
 
     // Digital Receipt Email Dispatch Queue (Immutable client queue for Firebase Trigger Email)
     match /mail/{mailId} {
-      allow read: if isValidDocId(mailId);
+      allow get: if isValidDocId(mailId);
+      allow list: if true;
       allow create: if isValidDocId(mailId) && isValidMail(request.resource.data);
       allow update, delete: if false;
+    }
+
+    // Tax Filing & Payment Records
+    match /tax_records/{taxRecordId} {
+      allow get: if isValidDocId(taxRecordId);
+      allow list: if true;
+      allow create, update: if isValidDocId(taxRecordId) && isValidTaxRecord(request.resource.data);
+      allow delete: if isValidDocId(taxRecordId);
+    }
+
+    // Tax Configuration & Rate Override Audit Logs (Immutable Entries)
+    match /tax_audit_logs/{logId} {
+      allow get: if isValidDocId(logId);
+      allow list: if true;
+      allow create: if isValidDocId(logId) && isValidTaxAuditLog(request.resource.data);
+      allow update: if false;
+      allow delete: if isValidDocId(logId);
+    }
+
+    // Tax Adjustments (Corrections & Cancelled Invoices)
+    match /tax_adjustments/{adjustmentId} {
+      allow get: if isValidDocId(adjustmentId);
+      allow list: if true;
+      allow create, update: if isValidDocId(adjustmentId) && isValidTaxAdjustment(request.resource.data);
+      allow delete: if isValidDocId(adjustmentId);
+    }
+
+    // Custom Balance Sheet Accounts (Neraca Aktiva & Pasiva)
+    match /balance_sheet_entries/{entryId} {
+      allow get: if isValidDocId(entryId);
+      allow list: if true;
+      allow create, update: if isValidDocId(entryId) && isValidBalanceSheetEntry(request.resource.data);
+      allow delete: if isValidDocId(entryId);
     }
 
     // Default Deny Catch-All for any unrecognized path or subcollection

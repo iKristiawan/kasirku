@@ -13,6 +13,7 @@ import {
   Minimize2, 
   Clock,
   LogOut,
+  ShieldAlert,
   ShieldCheck,
   Briefcase,
   UserCheck,
@@ -23,18 +24,28 @@ import {
   AlertCircle,
   ChevronRight,
   X,
-  Cloud,
+  CloudOff,
   CalendarRange,
   Wrench,
   PackagePlus,
   CalendarDays,
   Wallet,
-  Globe
+  Globe,
+  Wifi,
+  WifiOff,
+  Loader2,
+  Landmark,
+  Scale,
+  HardDrive,
+  Database,
+  FileSpreadsheet,
+  History
 } from 'lucide-react';
 import { User, UserRole, StoreSettings, Product, Transaction, Customer } from '../types/pos';
 import { sound } from '../utils/audio';
 import { formatRupiah } from '../utils/formatters';
 import { getUpcomingDuePiutangEntries } from './PiutangDueAlertBanner';
+import { getDriveBackupSchedule, isDriveBackupOverdue } from '../utils/googleDriveBackup';
 
 interface NavbarProps {
   currentUser: User;
@@ -52,6 +63,14 @@ interface NavbarProps {
   transactions?: Transaction[];
   customers?: Customer[];
   cloudSyncStatus?: 'SYNCED' | 'CONNECTING' | 'OFFLINE';
+  cloudSyncError?: string | null;
+  pendingSyncQueueCount?: number;
+  offlineQueueCount?: number;
+  syncConflictCount?: number;
+  onRetryCloudSync?: () => void;
+  onOpenFirestoreSettings?: () => void;
+  onOpenOfflineQueue?: () => void;
+  onOpenGoogleDriveBackup?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -70,6 +89,14 @@ export const Navbar: React.FC<NavbarProps> = ({
   transactions = [],
   customers = [],
   cloudSyncStatus = 'SYNCED',
+  cloudSyncError = null,
+  pendingSyncQueueCount = 0,
+  offlineQueueCount = 0,
+  syncConflictCount = 0,
+  onRetryCloudSync: _onRetryCloudSync,
+  onOpenFirestoreSettings,
+  onOpenOfflineQueue,
+  onOpenGoogleDriveBackup,
 }) => {
   const [time, setTime] = useState<string>('');
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
@@ -279,9 +306,27 @@ export const Navbar: React.FC<NavbarProps> = ({
       allowed: canAccessManagement,
     },
     {
+      id: 'balance-sheet',
+      label: 'Neraca',
+      icon: Scale,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'tax',
+      label: 'Pajak',
+      icon: Landmark,
+      allowed: canAccessManagement,
+    },
+    {
       id: 'sales-dashboard',
       label: 'Dashboard Sales',
       icon: BarChart3,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'sales-report',
+      label: 'Laporan Penjualan',
+      icon: FileSpreadsheet,
       allowed: canAccessManagement,
     },
     {
@@ -289,6 +334,25 @@ export const Navbar: React.FC<NavbarProps> = ({
       label: 'Laporan Bulanan',
       icon: CalendarRange,
       allowed: canAccessManagement,
+    },
+    {
+      id: 'employee-activity',
+      label: 'Aktivitas Karyawan',
+      icon: ShieldAlert,
+      allowed: canAccessSettings,
+    },
+    {
+      id: 'sync-health',
+      label: 'Kesehatan Sync',
+      icon: ShieldCheck,
+      badge: syncConflictCount > 0 ? `${syncConflictCount} Konflik` : null,
+      allowed: canAccessManagement,
+    },
+    {
+      id: 'sync-logs',
+      label: 'Log Sinkronisasi',
+      icon: History,
+      allowed: canAccessSettings,
     },
     {
       id: 'settings',
@@ -300,26 +364,26 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header className="bg-slate-900 text-white select-none border-b border-slate-800 shrink-0 sticky top-0 z-30 shadow-md">
-      <div className="flex items-center justify-between px-3 md:px-5 h-16 gap-2">
+      <div className="flex flex-wrap lg:flex-nowrap portrait:flex-wrap items-center justify-between px-3 md:px-5 py-2 lg:py-0 lg:h-16 portrait:py-2 portrait:h-auto gap-x-2 gap-y-1.5">
         {/* Left: Brand & Store Name */}
-        <div className="flex items-center gap-3 shrink-0">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
+        <div className="flex items-center gap-2.5 shrink-0">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
             <Store className="w-5 h-5 text-white" />
           </div>
-          <div className="hidden sm:block">
-            <h1 className="text-base font-bold text-white tracking-tight leading-tight">
+          <div className="hidden sm:block max-w-[145px] xl:max-w-[210px]">
+            <h1 className="text-sm md:text-base font-bold text-white tracking-tight leading-tight truncate">
               {storeSettings.storeName}
             </h1>
-            <p className="text-xs text-slate-400 flex items-center gap-1.5 font-medium">
+            <p className="text-[11px] text-slate-400 flex items-center gap-1.5 font-medium whitespace-nowrap">
               <span>POS Tablet</span>
               <span>·</span>
-              <span className="font-mono text-sky-400">{time}</span>
+              <span className="font-mono tabular-nums text-sky-400">{time}</span>
             </p>
           </div>
         </div>
 
-        {/* Center: Main Navigation Tabs */}
-        <nav className="flex items-center gap-1 overflow-x-auto no-scrollbar py-1">
+        {/* Center / Portrait Row 2: Main Navigation Tabs (always visible & scrollable in portrait mode) */}
+        <nav className="order-3 w-full lg:order-none lg:w-auto lg:flex-1 lg:min-w-0 portrait:order-3 portrait:w-full flex items-center gap-1 overflow-x-auto no-scrollbar py-1 border-t border-slate-800/80 pt-1.5 lg:border-t-0 lg:pt-1 portrait:border-t portrait:pt-1.5">
           {navItems.map((item) => {
             if (!item.allowed) return null;
             const Icon = item.icon;
@@ -341,7 +405,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                     ? `${item.label} (${item.iconLowStockCount} produk mencapai batas stok minimum)`
                     : item.label
                 }
-                className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs md:text-sm font-semibold transition-all whitespace-nowrap relative ${
+                className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs md:text-sm font-semibold transition-all whitespace-nowrap shrink-0 relative ${
                   isActive
                     ? 'bg-sky-600 text-white shadow-md shadow-sky-600/30 font-bold'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
@@ -365,14 +429,14 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </span>
                 <span>{item.label}</span>
                 {item.badge && (
-                  <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-400 text-slate-900 ml-0.5">
+                  <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-400 text-slate-900 ml-0.5 tabular-nums">
                     {item.badge}
                   </span>
                 )}
                 {item.lowStockBadge && (
                   <span
                     title={`${item.lowStockBadge} produk dengan stok di bawah/pada ambang batas minimum`}
-                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-black bg-rose-500 text-white shadow-xs ml-0.5"
+                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-black bg-rose-500 text-white shadow-xs ml-0.5 tabular-nums"
                   >
                     <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
                     <span>{item.lowStockBadge}</span>
@@ -383,101 +447,168 @@ export const Navbar: React.FC<NavbarProps> = ({
           })}
         </nav>
 
-        {/* Right: User Switcher, Attendance Status, Shift, Fullscreen */}
-        <div className="flex items-center gap-2 shrink-0">
-          {/* Cloud Sync Status Indicator */}
-          <div 
+        {/* Right: Compact Icon-Only Status & Quick Actions, Notifications, Fullscreen, User Switcher */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {/* Compact Icon-Only Firestore Connection Status Indicator */}
+          <button
+            type="button"
+            onClick={() => {
+              sound.playTap();
+              if (onOpenFirestoreSettings) {
+                onOpenFirestoreSettings();
+              } else {
+                setActiveTab('settings');
+              }
+            }}
             title={
               storeSettings.manualOfflineMode
-                ? 'Mode Local Only (Cloud Sync dijeda — data tetap tersimpan di perangkat)'
+                ? 'Firestore: Mode Local Only (dijeda) — Klik untuk cek koneksi & aktifkan di Pengaturan'
                 : cloudSyncStatus === 'SYNCED'
-                ? 'Terhubung ke Database Firebase Firestore (Real-time Multi-Device Sync Aktif)'
+                ? 'Firestore: Terhubung Real-Time — Klik untuk buka diagnostik & log koneksi di Pengaturan'
                 : cloudSyncStatus === 'CONNECTING'
-                ? 'Menghubungkan ke Cloud Firestore...'
-                : 'Mode Offline (LocalStorage Aktif)'
+                ? 'Firestore: Sedang menghubungkan ke server — Klik untuk buka pengecekan koneksi di Pengaturan'
+                : `Firestore: Terputus${cloudSyncError ? ` (${cloudSyncError})` : ''} — Klik untuk cek koneksi & Force Sync Now di Pengaturan`
             }
-            className={`hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+            aria-label={
               storeSettings.manualOfflineMode
-                ? 'bg-amber-950/80 border-amber-500/60 text-amber-300'
+                ? 'Status Firestore: Mode Local Only — klik untuk menuju Pengaturan'
                 : cloudSyncStatus === 'SYNCED'
-                ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300'
+                ? 'Status Firestore: Terhubung Real-Time — klik untuk menuju Pengaturan'
                 : cloudSyncStatus === 'CONNECTING'
-                ? 'bg-sky-950/70 border-sky-500/50 text-sky-300'
-                : 'bg-slate-800 border-slate-700 text-slate-400'
+                ? 'Status Firestore: Sedang menyinkronkan — klik untuk menuju Pengaturan'
+                : 'Status Firestore: Terputus — klik untuk menuju Pengaturan'
+            }
+            className={`relative flex items-center justify-center w-9 h-9 rounded-lg border transition-colors cursor-pointer ${
+              storeSettings.manualOfflineMode
+                ? 'bg-amber-950/90 border-amber-500/70 text-amber-300 hover:bg-amber-900/80'
+                : cloudSyncStatus === 'SYNCED'
+                ? 'bg-emerald-950/85 border-emerald-500/60 text-emerald-400 hover:bg-emerald-900/75'
+                : cloudSyncStatus === 'CONNECTING'
+                ? 'bg-sky-950/85 border-sky-500/60 text-sky-400 hover:bg-sky-900/75'
+                : 'bg-rose-950/95 border-rose-500/80 text-rose-400 hover:bg-rose-900/85'
             }`}
           >
-            <Cloud className={`w-3.5 h-3.5 ${storeSettings.manualOfflineMode ? 'text-amber-400' : ''}`} />
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                storeSettings.manualOfflineMode
-                  ? 'bg-amber-400'
-                  : cloudSyncStatus === 'SYNCED'
-                  ? 'bg-emerald-400 animate-pulse'
-                  : cloudSyncStatus === 'CONNECTING'
-                  ? 'bg-sky-400 animate-ping'
-                  : 'bg-slate-500'
-              }`}
-            />
-            <span className="font-mono text-[11px] font-bold">
-              {storeSettings.manualOfflineMode ? 'Local Only' : cloudSyncStatus === 'SYNCED' ? 'Firebase Aktif' : cloudSyncStatus === 'CONNECTING' ? 'Menghubungkan...' : 'Offline'}
-            </span>
-          </div>
+            {storeSettings.manualOfflineMode ? (
+              <CloudOff className="w-4 h-4 shrink-0" />
+            ) : cloudSyncStatus === 'SYNCED' ? (
+              <Wifi className="w-4 h-4 shrink-0" />
+            ) : cloudSyncStatus === 'CONNECTING' ? (
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+            ) : (
+              <WifiOff className="w-4 h-4 shrink-0" />
+            )}
 
-          {/* Quick Attendance Pill */}
+            {pendingSyncQueueCount > 0 && (
+              <span
+                title={`${pendingSyncQueueCount} perubahan menunggu antrean sinkronisasi`}
+                className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-amber-400 text-slate-950 text-[9px] font-black leading-none flex items-center justify-center border border-slate-900 tabular-nums"
+              >
+                {pendingSyncQueueCount > 9 ? '9+' : pendingSyncQueueCount}
+              </span>
+            )}
+          </button>
+
+          {/* Offline Queue Quick Inspector Button when pending offline mutations exist */}
+          {offlineQueueCount > 0 && onOpenOfflineQueue && (
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                onOpenOfflineQueue();
+              }}
+              title={`${offlineQueueCount} data Mode Offline menunggu sinkronisasi ke server — Klik untuk kelola`}
+              className="hidden sm:inline-flex items-center gap-1 h-9 px-2.5 rounded-lg border border-amber-500/70 bg-amber-950/90 hover:bg-amber-900 text-amber-200 text-[11px] font-extrabold cursor-pointer transition-colors tabular-nums"
+            >
+              <Database className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+              <span>Antrean ({offlineQueueCount})</span>
+            </button>
+          )}
+
+          {/* Google Drive Store Backup Quick Access (Admin & Store Manager) */}
+          {canAccessManagement && onOpenGoogleDriveBackup && (() => {
+            const driveOverdue = isDriveBackupOverdue(getDriveBackupSchedule());
+            return (
+              <button
+                type="button"
+                onClick={() => {
+                  sound.playTap();
+                  onOpenGoogleDriveBackup();
+                }}
+                title={
+                  driveOverdue
+                    ? 'Backup Data Toko ke Google Drive (Disarankan cadangkan sekarang)'
+                    : 'Backup Data Toko ke Google Drive'
+                }
+                aria-label="Backup Google Drive"
+                className="relative flex items-center justify-center w-9 h-9 rounded-lg border bg-slate-800 hover:bg-slate-700 text-sky-300 border-slate-700 transition-colors cursor-pointer"
+              >
+                <HardDrive className="w-4 h-4 shrink-0" />
+                {driveOverdue && (
+                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-amber-400 border border-slate-900" />
+                )}
+              </button>
+            );
+          })()}
+
+          {/* Compact Icon-Only Attendance Quick Action */}
           <button
+            type="button"
             onClick={() => {
               sound.playTap();
               setActiveTab('attendance');
             }}
-            title="Klik untuk buka terminal absensi"
-            className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
+            title={
               isCurrentUserClockedIn
-                ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/80'
-                : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                ? 'Absensi: Shift aktif — Klik untuk buka terminal absensi'
+                : 'Absensi Karyawan — Klik untuk buka terminal absensi'
+            }
+            aria-label={isCurrentUserClockedIn ? 'Absensi (Shift Aktif)' : 'Buka Absensi Karyawan'}
+            className={`relative flex items-center justify-center w-9 h-9 rounded-lg border transition-colors cursor-pointer ${
+              activeTab === 'attendance'
+                ? 'bg-sky-600 border-sky-400 text-white'
+                : isCurrentUserClockedIn
+                ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-400 hover:bg-emerald-900/80'
+                : 'bg-slate-800 hover:bg-slate-700 text-amber-300 border-slate-700'
             }`}
           >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                isCurrentUserClockedIn ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-              }`}
-            ></span>
-            <span>{isCurrentUserClockedIn ? 'Shift Aktif' : 'Absensi'}</span>
+            <UserCheck className="w-4 h-4 shrink-0" />
           </button>
 
+          {/* Compact Icon-Only Shift Summary Action */}
           <button
+            type="button"
             onClick={() => {
               sound.playTap();
               onOpenShiftSummary();
             }}
             title="Ringkasan Kas / Shift"
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 transition-colors"
+            aria-label="Ringkasan Kas / Shift"
+            className="flex items-center justify-center w-9 h-9 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 transition-colors cursor-pointer"
           >
-            <Clock className="w-3.5 h-3.5 text-sky-400" />
-            <span>Shift</span>
+            <Clock className="w-4 h-4 shrink-0" />
           </button>
 
-          {/* Notification Center Bell with Pulsing Alert Indicator */}
+          {/* Notification Center Bell */}
           <div className="relative">
             <button
+              type="button"
               onClick={() => {
                 sound.playTap();
                 setIsNotificationOpen(!isNotificationOpen);
               }}
               title="Pusat Peringatan Stok & Kadaluarsa"
-              className={`p-2 rounded-lg border transition-all relative cursor-pointer ${
+              aria-label="Pusat Peringatan Stok & Kadaluarsa"
+              className={`w-9 h-9 rounded-lg border transition-colors relative cursor-pointer flex items-center justify-center ${
                 totalAlertCount > 0
-                  ? 'bg-amber-950/70 border-amber-500/70 text-amber-300 hover:bg-amber-900/90 shadow-md shadow-amber-500/20'
+                  ? 'bg-amber-950/70 border-amber-500/70 text-amber-300 hover:bg-amber-900/90'
                   : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
               }`}
             >
               <Bell className="w-4 h-4" />
               {totalAlertCount > 0 && (
-                <>
-                  <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 text-white text-[9px] font-black rounded-full flex items-center justify-center shadow-xs">
-                    {totalAlertCount > 9 ? '9+' : totalAlertCount}
-                  </span>
-                  <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-400 rounded-full animate-ping opacity-75" />
-                </>
+                <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 bg-rose-500 text-white text-[9px] font-black rounded-full flex items-center justify-center border border-slate-900 tabular-nums">
+                  {totalAlertCount > 9 ? '9+' : totalAlertCount}
+                </span>
               )}
             </button>
 
@@ -667,33 +798,37 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={toggleFullscreen}
             title="Layar Penuh Tablet"
-            className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors"
+            aria-label="Layar Penuh Tablet"
+            className="w-9 h-9 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors cursor-pointer"
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
 
           {/* Active User Card & Switch Button */}
-          <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+          <div className="flex items-center gap-1.5 pl-1.5 border-l border-slate-800">
             <button
+              type="button"
               onClick={() => {
                 sound.playTap();
                 onOpenSwitchUser();
               }}
-              className="flex items-center gap-2 px-2.5 py-1 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 transition-all text-left"
+              className="flex items-center gap-2 px-2 py-1 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 transition-all text-left cursor-pointer"
               title="Klik untuk Ganti Pengguna / Lock Screen"
+              aria-label={`Pengguna aktif ${currentUser.name} — Klik untuk ganti pengguna`}
             >
-              <div className={`w-7 h-7 rounded-lg ${currentUser.avatarColor} flex items-center justify-center text-white text-xs font-bold`}>
+              <div className={`w-7 h-7 rounded-lg ${currentUser.avatarColor} flex items-center justify-center text-white text-xs font-bold shrink-0`}>
                 {currentUser.name.charAt(0)}
               </div>
-              <div className="hidden lg:block text-left">
-                <div className="text-xs font-semibold text-white truncate max-w-[110px]">
+              <div className="hidden lg:block portrait:hidden text-left">
+                <div className="text-xs font-semibold text-white truncate max-w-[100px]">
                   {currentUser.name.split(' ')[0]}
                 </div>
                 <div className="text-[10px] text-slate-400">{roleBadge()}</div>
               </div>
-              <Lock className="w-3.5 h-3.5 text-slate-400 hover:text-sky-400 ml-0.5" />
+              <Lock className="w-3.5 h-3.5 text-slate-400 hover:text-sky-400 ml-0.5 shrink-0" />
             </button>
           </div>
         </div>

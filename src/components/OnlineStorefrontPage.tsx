@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   ShoppingBag,
   Search,
@@ -29,7 +29,14 @@ import {
   SlidersHorizontal,
   ArrowLeft,
 } from 'lucide-react';
+import { motion } from 'motion/react';
 import storefrontHeroImg from '../assets/images/online_store_hero_1794833654577.jpg';
+import {
+  FlyToCartOverlay,
+  FlyingCartParticle,
+  computeFlyCoords,
+} from './FlyToCartOverlay';
+import { LazyProductImage } from './LazyProductImage';
 import {
   Product,
   ProductCategory,
@@ -157,6 +164,18 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [cartToast, setCartToast] = useState<string | null>(null);
+  const cartButtonRef = useRef<HTMLButtonElement>(null);
+  const storefrontBounceTimerRef = useRef<number | null>(null);
+  const [flyingParticles, setFlyingParticles] = useState<FlyingCartParticle[]>([]);
+  const [cartBounceTick, setCartBounceTick] = useState<number>(0);
+
+  useEffect(() => {
+    return () => {
+      if (storefrontBounceTimerRef.current) {
+        window.clearTimeout(storefrontBounceTimerRef.current);
+      }
+    };
+  }, []);
 
   // Customer local recent order codes
   const [myOrderCodes, setMyOrderCodes] = useState<string[]>(() => {
@@ -310,11 +329,43 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
     setDetailQty(1);
   };
 
+  const triggerStorefrontFly = (product: Product, explicitSourceEl?: HTMLElement | null) => {
+    const sourceEl =
+      explicitSourceEl ||
+      (typeof document !== 'undefined'
+        ? document.getElementById(`storefront-card-${product.id}`)
+        : null);
+    const coords = computeFlyCoords(sourceEl, cartButtonRef.current);
+    if (coords) {
+      const particleId = `sf_fly_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      setFlyingParticles((prev) => [
+        ...prev.slice(-8),
+        {
+          id: particleId,
+          ...coords,
+          imageUrl: product.imageUrl,
+          label: product.name,
+          accentColor: '#0f766e',
+          isService: product.productType === 'JASA',
+        },
+      ]);
+      if (storefrontBounceTimerRef.current) {
+        window.clearTimeout(storefrontBounceTimerRef.current);
+      }
+      storefrontBounceTimerRef.current = window.setTimeout(() => {
+        setCartBounceTick((t) => t + 1);
+      }, 390);
+    } else {
+      setCartBounceTick((t) => t + 1);
+    }
+  };
+
   const handleAddItemToCart = (
     product: Product,
     unit: ProductUnit,
     qtyToAdd = 1,
-    variantName?: string
+    variantName?: string,
+    sourceEl?: HTMLElement | null
   ) => {
     const isService = product.productType === 'JASA';
     const maxUnits = isService
@@ -329,6 +380,10 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
 
     const cartKey = `${product.id}__${unit.id}__${variantName || ''}`;
     const unitPrice = resolveUnitPrice(product, unit, variantName);
+    const existingItem = cart.find((i) => i.cartKey === cartKey);
+    if (!existingItem || isService || existingItem.quantity < maxUnits) {
+      triggerStorefrontFly(product, sourceEl);
+    }
 
     setCart((prev) => {
       const idx = prev.findIndex((i) => i.cartKey === cartKey);
@@ -725,6 +780,7 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
             </button>
 
             <button
+              ref={cartButtonRef}
               type="button"
               onClick={() => {
                 sound.playTap();
@@ -732,7 +788,15 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
               }}
               className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-stone-900 hover:bg-stone-800 text-white text-xs sm:text-sm font-bold shadow-xs transition-all cursor-pointer"
             >
-              <ShoppingBag className="w-4 h-4 text-teal-300" />
+              <motion.span
+                key={`sf-cart-icon-${cartBounceTick}`}
+                initial={false}
+                animate={cartBounceTick > 0 ? { scale: [1, 1.25, 0.94, 1] } : undefined}
+                transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+                className="inline-flex items-center justify-center"
+              >
+                <ShoppingBag className="w-4 h-4 text-teal-300" />
+              </motion.span>
               <span>Keranjang</span>
               <span className="px-2 py-0.5 rounded-lg bg-teal-600 text-white font-mono text-xs tabular-nums">
                 {cartItemCount}
@@ -1014,36 +1078,38 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
                     return (
                       <article
                         key={product.id}
+                        id={`storefront-card-${product.id}`}
                         className="group bg-white rounded-2xl border border-stone-200/90 overflow-hidden flex flex-col transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
                       >
                         {/* 65-75% Visual Lead Container with uniform 4:3 aspect ratio */}
                         <button
                           type="button"
                           onClick={() => handleOpenProductDetail(product)}
-                          className="relative aspect-4/3 w-full bg-[#F5F3EE] overflow-hidden text-left cursor-pointer"
+                          className="fly-cart-origin relative aspect-4/3 w-full bg-[#F5F3EE] overflow-hidden text-left cursor-pointer"
                         >
-                          {product.imageUrl ? (
-                            <img
-                              src={product.imageUrl}
-                              alt={product.name}
-                              className={`w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03] ${
-                                isOutOfStock ? 'opacity-50 grayscale' : ''
-                              }`}
-                            />
-                          ) : (
-                            <div className="w-full h-full flex flex-col items-center justify-center p-6 bg-gradient-to-br from-[#F5F3EE] to-[#EAE5DC]">
-                              <div className="w-16 h-16 rounded-2xl bg-white/90 border border-stone-200/80 shadow-2xs flex items-center justify-center text-teal-800 font-extrabold text-xl tracking-tight">
-                                {isService ? (
-                                  <Wrench className="w-7 h-7" />
-                                ) : (
-                                  product.name.slice(0, 2).toUpperCase()
-                                )}
+                          <LazyProductImage
+                            src={product.imageUrl}
+                            alt={product.name}
+                            className={`w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03] ${
+                              isOutOfStock ? 'opacity-50 grayscale' : ''
+                            }`}
+                            containerClassName="w-full h-full relative"
+                            unloadFarOffscreen={true}
+                            fallback={
+                              <div className="w-full h-full flex flex-col items-center justify-center p-6 bg-gradient-to-br from-[#F5F3EE] to-[#EAE5DC]">
+                                <div className="w-16 h-16 rounded-2xl bg-white/90 border border-stone-200/80 shadow-2xs flex items-center justify-center text-teal-800 font-extrabold text-xl tracking-tight">
+                                  {isService ? (
+                                    <Wrench className="w-7 h-7" />
+                                  ) : (
+                                    product.name.slice(0, 2).toUpperCase()
+                                  )}
+                                </div>
+                                <span className="mt-2.5 text-[11px] font-semibold uppercase tracking-widest text-stone-500">
+                                  {product.category}
+                                </span>
                               </div>
-                              <span className="mt-2.5 text-[11px] font-semibold uppercase tracking-widest text-stone-500">
-                                {product.category}
-                              </span>
-                            </div>
-                          )}
+                            }
+                          />
 
                           {/* Single clean availability tag */}
                           <span
@@ -1111,7 +1177,7 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
                               <button
                                 type="button"
                                 disabled={isStoreClosed || isOutOfStock}
-                                onClick={() => handleAddItemToCart(product, baseUnitObj, 1)}
+                                onClick={(e) => handleAddItemToCart(product, baseUnitObj, 1, undefined, e.currentTarget)}
                                 className="px-3.5 py-2 rounded-xl bg-teal-700 hover:bg-teal-800 disabled:bg-stone-200 disabled:text-stone-400 text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:cursor-not-allowed shrink-0"
                               >
                                 <Plus className="w-3.5 h-3.5" />
@@ -1681,8 +1747,8 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
                 <button
                   type="button"
                   disabled={isStoreClosed || detailMaxUnits <= 0}
-                  onClick={() => {
-                    handleAddItemToCart(selectedProduct, detailUnit, detailQty, detailVariant);
+                  onClick={(e) => {
+                    handleAddItemToCart(selectedProduct, detailUnit, detailQty, detailVariant, e.currentTarget);
                     setSelectedProduct(null);
                   }}
                   className="flex-1 py-3 px-4 rounded-xl bg-teal-700 hover:bg-teal-800 disabled:bg-stone-200 disabled:text-stone-400 text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed"
@@ -2114,6 +2180,14 @@ export const OnlineStorefrontPage: React.FC<OnlineStorefrontPageProps> = ({
           </div>
         </div>
       )}
+
+      {/* GPU-Composited Fly-to-Cart Particle Overlay */}
+      <FlyToCartOverlay
+        particles={flyingParticles}
+        onParticleComplete={(id) =>
+          setFlyingParticles((prev) => prev.filter((p) => p.id !== id))
+        }
+      />
     </div>
   );
 };

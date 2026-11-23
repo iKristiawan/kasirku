@@ -3,6 +3,7 @@ import autoTable from 'jspdf-autotable';
 import { Customer, Product, StoreSettings, Transaction } from '../types/pos';
 import { formatDateOnly, formatDateTime, formatNumber, formatRupiah, formatWhatsAppUrl } from './formatters';
 import { getItemFifoCogs } from './fifoUtils';
+import { addStandardPdfFooters, buildStoreContactLine, drawPdfStoreHeader } from './pdfLogoHelper';
 
 /**
  * Returns local calendar date key in YYYY-MM-DD format (avoids UTC timezone shifts).
@@ -71,27 +72,7 @@ function resolveCustomerName(tx: Transaction, customers: Customer[] = []): strin
 }
 
 function addPdfPageFooters(doc: jsPDF, footerNote: string) {
-  const pageCount = doc.getNumberOfPages();
-  const pageWidth = doc.internal.pageSize.getWidth();
-  const pageHeight = doc.internal.pageSize.getHeight();
-  const footerLines = (footerNote || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 2);
-
-  for (let i = 1; i <= pageCount; i++) {
-    doc.setPage(i);
-    doc.setFontSize(8);
-    doc.setTextColor(100, 116, 139);
-    if (footerLines.length > 1) {
-      doc.text(footerLines[0], 14, pageHeight - 10.5);
-      doc.text(footerLines[1], 14, pageHeight - 6.5);
-    } else if (footerLines.length === 1) {
-      doc.text(footerLines[0], 14, pageHeight - 8);
-    }
-    doc.text(`Halaman ${i} dari ${pageCount}`, pageWidth - 14, pageHeight - 8, { align: 'right' });
-  }
+  addStandardPdfFooters(doc, footerNote);
 }
 
 export function computeDailyProfitLossData(
@@ -217,7 +198,7 @@ export function computeDailyProfitLossData(
   };
 }
 
-export function generateSelectedTransactionsPdf(
+export async function generateSelectedTransactionsPdf(
   selectedTransactions: Transaction[],
   storeSettings?: StoreSettings,
   products: Product[] = [],
@@ -231,8 +212,7 @@ export function generateSelectedTransactionsPdf(
   const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
   const productMap = buildProductMap(products);
   const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
-  const storeAddress = storeSettings?.storeAddress || '';
-  const storePhone = storeSettings?.storePhone || '';
+  const contactLine = buildStoreContactLine(storeSettings);
   const printedAt = formatDateTime(Date.now());
 
   let totalRevenue = 0;
@@ -263,36 +243,21 @@ export function generateSelectedTransactionsPdf(
   const totalGrossProfit = totalRevenue - totalFifoCogs;
   const marginPercent = totalRevenue > 0 ? (totalGrossProfit / totalRevenue) * 100 : 0;
 
-  // Header Banner
-  doc.setFillColor(15, 23, 42);
-  doc.rect(0, 0, 297, 26, 'F');
-
-  doc.setFontSize(15);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(255, 255, 255);
-  doc.text(options?.titleLabel || 'LAPORAN TRANSAKSI PENJUALAN', 14, 11);
-
-  doc.setFontSize(9.5);
-  doc.setFont('helvetica', 'normal');
-  doc.setTextColor(186, 230, 253);
-  doc.text(storeTitle.toUpperCase(), 14, 17);
-
-  const contactLine = [storeAddress, storePhone ? `Telp/WA: ${storePhone}` : ''].filter(Boolean).join(' • ');
-  if (contactLine) {
-    doc.setFontSize(8);
-    doc.setTextColor(203, 213, 225);
-    doc.text(contactLine, 14, 22);
-  }
-
-  doc.setFontSize(8);
-  doc.setTextColor(226, 232, 240);
-  doc.text(`Dicetak: ${printedAt}`, 283, 11, { align: 'right' });
-  if (options?.filterSubtitle) {
-    doc.text(options.filterSubtitle, 283, 17, { align: 'right' });
-  }
+  const { bannerHeight } = await drawPdfStoreHeader({
+    doc,
+    title: options?.titleLabel || 'LAPORAN TRANSAKSI PENJUALAN',
+    subtitle: storeTitle.toUpperCase(),
+    contactLine,
+    rightTopText: `Dicetak: ${printedAt}`,
+    rightBottomText: options?.filterSubtitle,
+    storeSettings,
+    bannerColor: [15, 23, 42],
+    accentStripeColor: [2, 132, 199],
+    bannerHeight: 28,
+  });
 
   // KPI Summary Strip
-  const kpiY = 31;
+  const kpiY = bannerHeight + 4;
   const kpiWidth = 52;
   const kpiGap = 3.5;
   const kpis = [
@@ -473,7 +438,7 @@ export function generateSelectedTransactionsPdf(
   };
 }
 
-export function generateDailyProfitLossPdf(
+export async function generateDailyProfitLossPdf(
   allTransactions: Transaction[],
   targetDateKey: string,
   storeSettings?: StoreSettings,
@@ -484,38 +449,27 @@ export function generateDailyProfitLossPdf(
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
 
   const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
-  const storeAddress = storeSettings?.storeAddress || '';
-  const storePhone = storeSettings?.storePhone || '';
+  const contactStr = buildStoreContactLine(storeSettings);
   const printedAt = formatDateTime(Date.now());
 
-  // Header Banner
-  doc.setFillColor(6, 95, 70);
-  doc.rect(0, 0, 210, 30, 'F');
-
-  doc.setFontSize(14);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(255, 255, 255);
-  doc.text('LAPORAN RINGKASAN LABA RUGI HARIAN (FIFO)', 14, 12);
-
-  doc.setFontSize(9.5);
-  doc.setFont('helvetica', 'normal');
-  doc.setTextColor(209, 250, 229);
-  doc.text(`${storeTitle} • Periode: ${dailyData.formattedDate}`, 14, 18.5);
-
-  const contactStr = [storeAddress, storePhone ? `Telp/WA: ${storePhone}` : ''].filter(Boolean).join(' • ');
-  if (contactStr) {
-    doc.setFontSize(8);
-    doc.setTextColor(236, 253, 245);
-    doc.text(contactStr, 14, 24.5);
-  }
-  doc.setFontSize(7.5);
-  doc.text(`Dicetak: ${printedAt}`, 196, 12, { align: 'right' });
+  const { bannerHeight } = await drawPdfStoreHeader({
+    doc,
+    title: 'RINGKASAN LABA RUGI HARIAN (FIFO)',
+    subtitle: `${storeTitle} · Tanggal: ${dailyData.formattedDate}`,
+    contactLine: contactStr,
+    rightTopText: `Dicetak: ${printedAt}`,
+    rightBottomText: `${dailyData.transactionCount} Transaksi`,
+    storeSettings,
+    bannerColor: [6, 95, 70],
+    accentStripeColor: [16, 185, 129],
+    bannerHeight: 30,
+  });
 
   // Section 1: Ikhtisar Laba Rugi Harian
   doc.setFontSize(10.5);
   doc.setFont('helvetica', 'bold');
   doc.setTextColor(15, 23, 42);
-  doc.text('1. Ikhtisar Laba Rugi Harian', 14, 38);
+  doc.text('1. Ikhtisar Laba Rugi Harian', 14, bannerHeight + 7);
 
   const pnlRows: Array<[string, string]> = [
     ['Jumlah Transaksi Diproses', `${formatNumber(dailyData.transactionCount)} Nota (${formatNumber(dailyData.totalItemsQty)} item)`],
@@ -712,7 +666,7 @@ export function generateDailyProfitLossPdf(
   };
 }
 
-export function generateSingleTransactionPdf(
+export async function generateSingleTransactionPdf(
   tx: Transaction,
   storeSettings?: StoreSettings,
   products: Product[] = [],
@@ -721,39 +675,34 @@ export function generateSingleTransactionPdf(
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const productMap = buildProductMap(products);
   const storeTitle = storeSettings?.storeName || 'KasirKu Tablet POS';
-  const storeAddress = storeSettings?.storeAddress || '';
-  const storePhone = storeSettings?.storePhone || '';
+  const contact = buildStoreContactLine(storeSettings);
   const customerName = resolveCustomerName(tx, customers);
 
-  // Header
-  doc.setFillColor(15, 23, 42);
-  doc.rect(0, 0, 210, 28, 'F');
-  doc.setFontSize(14);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(255, 255, 255);
-  doc.text('BUKTI TRANSAKSI / INVOICE DIGITAL', 14, 12);
-  doc.setFontSize(9.5);
-  doc.setFont('helvetica', 'normal');
-  doc.setTextColor(186, 230, 253);
-  doc.text(storeTitle.toUpperCase(), 14, 18.5);
-  const contact = [storeAddress, storePhone ? `Telp/WA: ${storePhone}` : ''].filter(Boolean).join(' • ');
-  if (contact) {
-    doc.setFontSize(8);
-    doc.setTextColor(203, 213, 225);
-    doc.text(contact, 14, 24);
-  }
+  const { bannerHeight } = await drawPdfStoreHeader({
+    doc,
+    title: 'BUKTI TRANSAKSI / INVOICE DIGITAL',
+    subtitle: storeTitle.toUpperCase(),
+    contactLine: contact,
+    rightTopText: tx.invoiceNumber,
+    rightBottomText: formatDateTime(tx.timestamp),
+    storeSettings,
+    bannerColor: [15, 23, 42],
+    accentStripeColor: [2, 132, 199],
+    bannerHeight: 28,
+  });
 
   // Metadata Box
+  const metaY = bannerHeight + 8;
   doc.setFontSize(9);
   doc.setTextColor(15, 23, 42);
   doc.setFont('helvetica', 'bold');
-  doc.text(`No. Invoice : ${tx.invoiceNumber}`, 14, 38);
+  doc.text(`No. Invoice : ${tx.invoiceNumber}`, 14, metaY);
   doc.setFont('helvetica', 'normal');
-  doc.text(`Waktu       : ${formatDateTime(tx.timestamp)}`, 14, 43.5);
-  doc.text(`Kasir       : ${tx.cashierName}`, 14, 49);
-  doc.text(`Pelanggan   : ${customerName}`, 120, 38);
-  doc.text(`Metode      : ${(tx.paymentMethod || 'CASH').replace(/_/g, ' ')}`, 120, 43.5);
-  doc.text(`Status      : ${tx.paymentStatus}`, 120, 49);
+  doc.text(`Waktu       : ${formatDateTime(tx.timestamp)}`, 14, metaY + 5.5);
+  doc.text(`Kasir       : ${tx.cashierName}`, 14, metaY + 11);
+  doc.text(`Pelanggan   : ${customerName}`, 120, metaY);
+  doc.text(`Metode      : ${(tx.paymentMethod || 'CASH').replace(/_/g, ' ')}`, 120, metaY + 5.5);
+  doc.text(`Status      : ${tx.paymentStatus}`, 120, metaY + 11);
 
   // Items table
   const itemRows = (tx.items || []).map((item, idx) => {

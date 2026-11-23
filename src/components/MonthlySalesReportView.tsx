@@ -30,18 +30,29 @@ import {
   Filter, 
   Award,
   ChevronRight,
-  Download
+  Download,
+  CheckCircle2,
+  X
 } from 'lucide-react';
-import { Transaction, Product, ProductCategory, UserRole } from '../types/pos';
+import { Transaction, Product, ProductCategory, UserRole, StoreSettings, CashflowRecord, RestockOrder, TaxRecord, TaxAdjustment, BalanceSheetEntry } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateTime } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { getItemFifoCogs } from '../utils/fifoUtils';
+import { exportStockAndProfitLossPdf } from '../utils/balanceSheetUtils';
+import { addStandardPdfFooters, buildStoreContactLine, drawPdfStoreHeader } from '../utils/pdfLogoHelper';
+import { INITIAL_STORE_SETTINGS } from '../utils/mockData';
 
 interface MonthlySalesReportViewProps {
   transactions: Transaction[];
   products: Product[];
   categories?: ProductCategory[];
   storeName?: string;
+  storeSettings?: StoreSettings;
+  cashflows?: CashflowRecord[];
+  purchases?: RestockOrder[];
+  taxRecords?: TaxRecord[];
+  taxAdjustments?: TaxAdjustment[];
+  balanceSheetEntries?: BalanceSheetEntry[];
   currentUserRole?: UserRole;
 }
 
@@ -60,12 +71,21 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
   products,
   categories = [],
   storeName = 'KasirKu Tablet POS',
+  storeSettings,
+  cashflows = [],
+  purchases = [],
+  taxRecords = [],
+  taxAdjustments = [],
+  balanceSheetEntries = [],
   currentUserRole = 'ADMIN',
 }) => {
   const currentYear = new Date().getFullYear();
   const [selectedYear, setSelectedYear] = useState<number>(currentYear);
+  const [selectedExportMonth, setSelectedExportMonth] = useState<number>(new Date().getMonth());
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [chartMetric, setChartMetric] = useState<'COMBINED' | 'REVENUE' | 'PROFIT' | 'TRANSACTIONS'>('COMBINED');
+  const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
+  const [pdfExportNotice, setPdfExportNotice] = useState<string | null>(null);
 
   // Product map for category & COGS calculation
   const productMap = useMemo(() => {
@@ -253,82 +273,125 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
     }));
   }, [monthlyData]);
 
-  // Export to PDF
-  const handleExportPdf = () => {
+  // Export Annual Monthly Summary PDF with Store Logo
+  const handleExportPdf = async () => {
+    if (isExportingPdf) return;
     sound.playTap();
-    const doc = new jsPDF({ orientation: 'landscape' });
-    const dateFormatted = new Date().toLocaleDateString('id-ID', { dateStyle: 'full' });
+    setIsExportingPdf(true);
+    setPdfExportNotice(null);
+    try {
+      const effectiveSettings = storeSettings || { ...INITIAL_STORE_SETTINGS, storeName };
+      const doc = new jsPDF({ orientation: 'landscape' });
+      const dateFormatted = new Date().toLocaleDateString('id-ID', { dateStyle: 'full' });
 
-    doc.setFontSize(16);
-    doc.setTextColor(15, 23, 42);
-    doc.text(`LAPORAN KEUANGAN & PENJUALAN BULANAN TAHUN ${selectedYear}`, 14, 15);
+      const { bannerHeight } = await drawPdfStoreHeader({
+        doc,
+        title: `LAPORAN KEUANGAN & PENJUALAN BULANAN TAHUN ${selectedYear}`,
+        subtitle: `${(effectiveSettings.storeName || storeName).toUpperCase()} · Filter Kategori: ${selectedCategoryLabel}`,
+        contactLine: buildStoreContactLine(effectiveSettings),
+        rightTopText: `Total Omzet: ${formatRupiah(annualSummary.totalRevenue)}`,
+        rightBottomText: `Laba Kotor: ${formatRupiah(annualSummary.totalProfit)} · Dicetak: ${dateFormatted}`,
+        storeSettings: effectiveSettings,
+        bannerColor: [15, 23, 42],
+        accentStripeColor: [79, 70, 229],
+        bannerHeight: 28,
+      });
 
-    doc.setFontSize(9);
-    doc.setTextColor(100, 116, 139);
-    doc.text(`${storeName} • Kategori: ${selectedCategoryLabel} • Tanggal Cetak: ${dateFormatted}`, 14, 21);
-    doc.text(
-      `Total Omzet: ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Bersih: ${formatRupiah(annualSummary.totalProfit)} | Total Transaksi: ${formatNumber(annualSummary.totalTransactions)} Nota`,
-      14,
-      26
-    );
+      const tableData = monthlyData.map((m, idx) => [
+        (idx + 1).toString(),
+        m.monthName,
+        `${formatNumber(m.transactionCount)} Nota`,
+        formatRupiah(m.totalRevenue),
+        formatRupiah(m.totalCOGS),
+        formatRupiah(m.grossProfit),
+        `${m.grossMarginPercent.toFixed(1)}%`,
+        formatRupiah(m.averageBasket),
+        `${formatNumber(m.totalUnitsSold)} Unit`,
+      ]);
 
-    const tableData = monthlyData.map((m, idx) => [
-      (idx + 1).toString(),
-      m.monthName,
-      `${formatNumber(m.transactionCount)} Nota`,
-      formatRupiah(m.totalRevenue),
-      formatRupiah(m.totalCOGS),
-      formatRupiah(m.grossProfit),
-      `${m.grossMarginPercent.toFixed(1)}%`,
-      formatRupiah(m.averageBasket),
-      `${formatNumber(m.totalUnitsSold)} Unit`,
-    ]);
-
-    autoTable(doc, {
-      startY: 31,
-      head: [
-        [
-          'No',
-          'Bulan',
-          'Jumlah Transaksi',
-          'Total Omzet (Revenue)',
-          'Beban HPP (COGS)',
-          'Laba Kotor (Profit)',
-          'Margin (%)',
-          'Rata-rata Nota',
-          'Barang Terjual',
+      autoTable(doc, {
+        startY: bannerHeight + 5,
+        margin: { left: 14, right: 14 },
+        head: [
+          [
+            'No',
+            'Bulan',
+            'Jumlah Transaksi',
+            'Total Omzet (Revenue)',
+            'Beban HPP (COGS)',
+            'Laba Kotor (Profit)',
+            'Margin (%)',
+            'Rata-rata Nota',
+            'Barang Terjual',
+          ],
         ],
-      ],
-      body: tableData,
-      theme: 'grid',
-      headStyles: {
-        fillColor: [15, 23, 42],
-        fontSize: 8.5,
-        fontStyle: 'bold',
-      },
-      styles: {
-        fontSize: 8,
-        cellPadding: 2.5,
-      },
-      alternateRowStyles: {
-        fillColor: [248, 250, 252],
-      },
-    });
+        body: tableData,
+        theme: 'grid',
+        headStyles: {
+          fillColor: [15, 23, 42],
+          fontSize: 8.5,
+          fontStyle: 'bold',
+        },
+        styles: {
+          fontSize: 8,
+          cellPadding: 2.5,
+        },
+        alternateRowStyles: {
+          fillColor: [248, 250, 252],
+        },
+      });
 
-    const finalY = (doc as any).lastAutoTable?.finalY || 120;
-    doc.setFontSize(9);
-    doc.setFont('helvetica', 'bold');
-    doc.text(
-      `RINGKASAN TAHUN ${selectedYear} (${selectedCategoryLabel}): Total Omzet ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Bersih ${formatRupiah(annualSummary.totalProfit)} (Margin ${annualSummary.avgMargin.toFixed(1)}%)`,
-      14,
-      finalY + 8
-    );
+      const finalY = (doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY || 120;
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(15, 23, 42);
+      doc.text(
+        `RINGKASAN TAHUN ${selectedYear} (${selectedCategoryLabel}): Total Omzet ${formatRupiah(annualSummary.totalRevenue)} | Total Laba Kotor ${formatRupiah(annualSummary.totalProfit)} (Margin ${annualSummary.avgMargin.toFixed(1)}%)`,
+        14,
+        finalY + 8
+      );
 
-    const catSlug =
-      selectedCategory === 'ALL'
-        ? 'semua-kategori'
-        : selectedCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    doc.save(`laporan-penjualan-bulanan-${selectedYear}-${catSlug}.pdf`);
+      addStandardPdfFooters(doc, `${effectiveSettings.storeName || storeName} — Rekapitulasi Penjualan Tahunan ${selectedYear}`);
+
+      const catSlug =
+        selectedCategory === 'ALL'
+          ? 'semua-kategori'
+          : selectedCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const filename = `laporan-penjualan-bulanan-${selectedYear}-${catSlug}.pdf`;
+      doc.save(filename);
+      sound.playSuccessChime();
+      setPdfExportNotice(`Rekap Penjualan Tahunan (${filename}) berhasil diunduh.`);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
+  // Export Executive Monthly Profit & Loss + Stock Report PDF with Store Logo
+  const handleExportOwnerMonthlyPnlAndStockPdf = async () => {
+    if (isExportingPdf) return;
+    sound.playTap();
+    setIsExportingPdf(true);
+    setPdfExportNotice(null);
+    try {
+      const effectiveSettings = storeSettings || { ...INITIAL_STORE_SETTINGS, storeName };
+      const periodMonth = `${selectedYear}-${String(selectedExportMonth + 1).padStart(2, '0')}`;
+      const { filename } = await exportStockAndProfitLossPdf({
+        periodMonth,
+        transactions,
+        products,
+        purchases,
+        cashflows,
+        taxRecords,
+        taxAdjustments,
+        manualEntries: balanceSheetEntries,
+        storeSettings: effectiveSettings,
+        preparedBy: currentUserRole === 'ADMIN' ? 'Admin' : 'Store Manager',
+      });
+      sound.playSuccessChime();
+      setPdfExportNotice(`Laporan PDF Ringkasan Laba Rugi Bulanan & Stok (${filename}) berhasil diunduh.`);
+    } finally {
+      setIsExportingPdf(false);
+    }
   };
 
   return (
@@ -408,17 +471,66 @@ export const MonthlySalesReportView: React.FC<MonthlySalesReportViewProps> = ({
               </select>
             </div>
 
+            <div className="flex items-center gap-1.5 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-700">
+              <CalendarRange className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Bulan PDF:</span>
+              <select
+                value={selectedExportMonth}
+                aria-label="Pilih Bulan untuk Ekspor PDF Laba Rugi dan Stok"
+                onChange={(e) => {
+                  sound.playTap();
+                  setSelectedExportMonth(parseInt(e.target.value, 10));
+                }}
+                className="bg-transparent font-bold text-slate-900 focus:outline-none cursor-pointer"
+              >
+                {MONTH_NAMES.map((mName, idx) => (
+                  <option key={mName} value={idx}>
+                    {mName}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleExportOwnerMonthlyPnlAndStockPdf}
+              disabled={isExportingPdf}
+              className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-xs transition-colors cursor-pointer"
+              title="Unduh PDF Ringkasan Laba Rugi Bulanan & Laporan Stok dengan Logo Toko untuk Pemilik Bisnis"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-200" />
+              <span>{isExportingPdf ? 'Menyusun PDF...' : 'PDF Laba Rugi & Stok'}</span>
+            </button>
+
             <button
               type="button"
               onClick={handleExportPdf}
-              className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-xs transition-colors cursor-pointer"
-              title="Unduh Laporan Penjualan Bulanan ke PDF (jsPDF)"
+              disabled={isExportingPdf}
+              className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-xs transition-colors cursor-pointer"
+              title="Unduh Rekap Penjualan Tahunan ke PDF dengan Logo Toko"
             >
               <FileDown className="w-3.5 h-3.5 text-sky-400" />
-              <span>Ekspor PDF</span>
+              <span>PDF Tahunan</span>
             </button>
           </div>
         </div>
+
+        {pdfExportNotice && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-medium">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{pdfExportNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPdfExportNotice(null)}
+              className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+              aria-label="Tutup notifikasi PDF"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* 4 Annual Summary Metric Cards */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">

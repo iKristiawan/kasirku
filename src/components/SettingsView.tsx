@@ -54,7 +54,11 @@ import {
   StickyNote,
   Globe,
   Layers,
-  Search
+  Search,
+  Activity,
+  Server,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 import { 
   StoreSettings, 
@@ -80,6 +84,10 @@ import {
   CustomerCategoryItem,
   OnlineOrder,
   EmployeeActivityLog,
+  TaxRecord,
+  TaxAuditLog,
+  TaxAdjustment,
+  BalanceSheetEntry,
 } from '../types/pos';
 import {
   DEFAULT_PAYMENT_METHODS,
@@ -131,6 +139,17 @@ import {
   computeTodaySalesClosingSummary,
   buildDailySalesClosingWhatsAppMessage,
 } from '../utils/adminDailySalesAlert';
+import {
+  FirestoreConnectionLogEntry,
+  FirestoreVerificationResult,
+  getFirestoreConnectionLogs,
+  clearFirestoreConnectionLogs,
+  subscribeFirestoreConnectionLogs,
+  verifyFirestoreServerConnection,
+} from '../utils/firebaseSync';
+import { GoogleDriveBackupPanel } from './GoogleDriveBackupPanel';
+import { buildFullBackupPayload as createFullBackupPayload } from '../utils/backupPayload';
+import { firebaseProjectId, firebaseDatabaseId } from '../firebase';
 
 const PRESET_LOGOS = [
   {
@@ -165,12 +184,26 @@ interface SettingsViewProps {
   stockOpnames?: StockOpnameRecord[];
   onlineOrders?: OnlineOrder[];
   activityLogs?: EmployeeActivityLog[];
+  taxRecords?: TaxRecord[];
+  taxAuditLogs?: TaxAuditLog[];
+  taxAdjustments?: TaxAdjustment[];
+  balanceSheetEntries?: BalanceSheetEntry[];
   currentUserRole?: UserRole;
+  currentUserName?: string;
   onUpdateStoreSettings: (settings: StoreSettings) => void;
   onUpdateUsers: (users: User[]) => void;
   onResetToDemoData: () => void;
   onRestoreBackup: (backup: BackupPayload) => Promise<void> | void;
   onClearDatabaseExceptUsers?: () => Promise<void> | void;
+  cloudSyncStatus?: 'SYNCED' | 'CONNECTING' | 'OFFLINE';
+  cloudSyncError?: string | null;
+  pendingSyncQueueCount?: number;
+  offlineQueueCount?: number;
+  onOpenOfflineQueueModal?: () => void;
+  focusFirestoreSettingsNonce?: number;
+  onForceVerifyCloudSync?: () => Promise<FirestoreVerificationResult>;
+  onOpenSyncHealth?: () => void;
+  onOpenSyncLogs?: () => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -188,12 +221,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   stockOpnames = [],
   onlineOrders = [],
   activityLogs = [],
+  taxRecords = [],
+  taxAuditLogs = [],
+  taxAdjustments = [],
+  balanceSheetEntries = [],
   currentUserRole = 'ADMIN',
+  currentUserName = 'Admin',
   onUpdateStoreSettings,
   onUpdateUsers,
   onResetToDemoData,
   onRestoreBackup,
   onClearDatabaseExceptUsers,
+  cloudSyncStatus = 'SYNCED',
+  cloudSyncError = null,
+  pendingSyncQueueCount = 0,
+  offlineQueueCount = 0,
+  onOpenOfflineQueueModal,
+  focusFirestoreSettingsNonce = 0,
+  onForceVerifyCloudSync,
+  onOpenSyncHealth,
+  onOpenSyncLogs,
 }) => {
   const isAdminUser = currentUserRole === 'ADMIN';
   const [formSettings, setFormSettings] = useState<StoreSettings>({
@@ -237,6 +284,85 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     onlineStorePickupEnabled: storeSettings.onlineStorePickupEnabled ?? true,
     onlineStoreDeliveryEnabled: storeSettings.onlineStoreDeliveryEnabled ?? true,
   });
+
+  // Firestore Connection Diagnostics & Logs state
+  const [firestoreLogs, setFirestoreLogs] = useState<FirestoreConnectionLogEntry[]>(() =>
+    getFirestoreConnectionLogs()
+  );
+  const [isVerifyingFirestore, setIsVerifyingFirestore] = useState(false);
+  const [lastVerificationResult, setLastVerificationResult] = useState<FirestoreVerificationResult | null>(null);
+  const [showFirestoreLogs, setShowFirestoreLogs] = useState(true);
+  const [isFirestoreHighlighted, setIsFirestoreHighlighted] = useState(false);
+  const firestoreDiagnosticsRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    return subscribeFirestoreConnectionLogs((logs) => {
+      setFirestoreLogs(logs);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (focusFirestoreSettingsNonce > 0) {
+      const timer = setTimeout(() => {
+        firestoreDiagnosticsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setIsFirestoreHighlighted(true);
+      }, 120);
+      const clearHighlightTimer = setTimeout(() => {
+        setIsFirestoreHighlighted(false);
+      }, 2400);
+      return () => {
+        clearTimeout(timer);
+        clearTimeout(clearHighlightTimer);
+      };
+    }
+  }, [focusFirestoreSettingsNonce]);
+
+  const latestSuccessLog = useMemo(
+    () => firestoreLogs.find((l) => l.status === 'SUCCESS') || null,
+    [firestoreLogs]
+  );
+
+  const latestErrorLog = useMemo(
+    () => firestoreLogs.find((l) => l.status === 'ERROR') || null,
+    [firestoreLogs]
+  );
+
+  const formatLogTimestamp = (ts: number) => {
+    try {
+      return new Date(ts).toLocaleString('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return formatDateTime(ts);
+    }
+  };
+
+  const handleForceSyncNow = async () => {
+    sound.playTap();
+    if (isVerifyingFirestore) return;
+    setIsVerifyingFirestore(true);
+    if (formSettings.manualOfflineMode) {
+      setFormSettings((prev) => ({ ...prev, manualOfflineMode: false }));
+    }
+    try {
+      const result = onForceVerifyCloudSync
+        ? await onForceVerifyCloudSync()
+        : await verifyFirestoreServerConnection({
+            forceResumeNetwork: true,
+            flushPendingQueue: true,
+            operationLabel: 'FORCE SYNC NOW',
+          });
+      setLastVerificationResult(result);
+    } finally {
+      setIsVerifyingFirestore(false);
+    }
+  };
+
   const [dailyLowStockLedger, setDailyLowStockLedger] = useState(() => loadDailyLowStockLedger());
   const [scheduledDispatchState, setScheduledDispatchState] = useState(() =>
     loadScheduledLowStockDispatch()
@@ -719,25 +845,92 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   // Logo file upload ref & handler
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setLogoUploadError(null);
 
     if (file.size > 2 * 1024 * 1024) {
-      alert('Ukuran file maksimal 2MB untuk performa cetak thermal yang optimal.');
+      setLogoUploadError('Ukuran file maksimal 2MB untuk performa cetak & sinkronisasi optimal.');
+      e.target.value = '';
       return;
     }
 
     sound.playTap();
+    const isSvg = file.type === 'image/svg+xml' || file.name.toLowerCase().endsWith('.svg');
     const reader = new FileReader();
     reader.onload = (event) => {
       const result = event.target?.result as string;
-      setFormSettings((prev) => ({
-        ...prev,
-        storeLogo: result,
-        showLogoOnReceipt: true,
-      }));
+      if (!result) return;
+
+      if (isSvg) {
+        if (result.length > 450000) {
+          setLogoUploadError('File SVG terlalu kompleks (>450KB). Mohon sederhanakan atau unggah PNG/JPG.');
+          return;
+        }
+        setFormSettings((prev) => ({
+          ...prev,
+          storeLogo: result,
+          showLogoOnReceipt: true,
+        }));
+        return;
+      }
+
+      if (result.length <= 350000) {
+        setFormSettings((prev) => ({
+          ...prev,
+          storeLogo: result,
+          showLogoOnReceipt: true,
+        }));
+        return;
+      }
+
+      // Automatically resize & compress large raster logos to keep Firestore sync fast & compliant
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const maxDim = 480;
+          let targetW = img.width || maxDim;
+          let targetH = img.height || maxDim;
+          if (targetW > maxDim || targetH > maxDim) {
+            const ratio = Math.min(maxDim / targetW, maxDim / targetH);
+            targetW = Math.max(1, Math.round(targetW * ratio));
+            targetH = Math.max(1, Math.round(targetH * ratio));
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = targetW;
+          canvas.height = targetH;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            setLogoUploadError('Browser gagal memproses kompresi gambar logo.');
+            return;
+          }
+          ctx.drawImage(img, 0, 0, targetW, targetH);
+          let compressed = canvas.toDataURL('image/png');
+          if (compressed.length > 400000) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, targetW, targetH);
+            ctx.drawImage(img, 0, 0, targetW, targetH);
+            compressed = canvas.toDataURL('image/jpeg', 0.85);
+          }
+          if (compressed.length > 480000) {
+            compressed = canvas.toDataURL('image/jpeg', 0.65);
+          }
+          setFormSettings((prev) => ({
+            ...prev,
+            storeLogo: compressed,
+            showLogoOnReceipt: true,
+          }));
+        } catch {
+          setLogoUploadError('Gagal memproses gambar logo. Gunakan gambar dengan ukuran lebih kecil.');
+        }
+      };
+      img.onerror = () => {
+        setLogoUploadError('Format file gambar logo tidak dapat dibaca.');
+      };
+      img.src = result;
     };
     reader.readAsDataURL(file);
     // Reset file input so same file can be re-selected if desired
@@ -1055,63 +1248,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   // =========================================================================
   // BACKUP & RESTORE HANDLERS
   // =========================================================================
-  const buildFullBackupPayload = (fileNamePrefix: string): {
+  const buildFullBackupPayload = (fileNamePrefix = 'KasirKu-Backup'): {
     fileName: string;
     payload: BackupPayload;
     dateFormatted: string;
   } => {
-    const now = new Date();
-    const pad = (n: number) => String(n).padStart(2, '0');
-    const dateStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
-    const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-    const fileName = `${fileNamePrefix}-${dateStr}-${timeStr}.json`;
-
-    const payload: BackupPayload = {
-      app: 'Kasir Toko Tablet POS',
-      version: '2.0',
-      exportedAt: now.toISOString(),
-      timestamp: now.getTime(),
-      stats: {
-        productCount: products.length,
-        customerCount: customers.length,
-        supplierCount: suppliers.length,
-        purchaseCount: purchases.length,
-        transactionCount: transactions.length,
-        cashflowCount: cashflows.length,
-        attendanceCount: attendances.length,
-        userCount: userList.length,
-        categoryCount: categories.length,
-        customerCategoryCount: customerCategories.length,
-        stockOpnameCount: stockOpnames.length,
-        onlineOrderCount: onlineOrders.length,
-        activityLogCount: activityLogs.length,
+    return createFullBackupPayload({
+      fileNamePrefix,
+      products,
+      categories,
+      customerCategories,
+      customers,
+      suppliers,
+      purchases,
+      transactions,
+      cashflows,
+      attendances,
+      stockOpnames,
+      onlineOrders,
+      activityLogs,
+      taxRecords,
+      taxAuditLogs,
+      taxAdjustments,
+      balanceSheetEntries,
+      storeSettings: {
+        ...formSettings,
+        customPaymentMethods: paymentMethods,
       },
-      data: {
-        products,
-        categories,
-        customerCategories,
-        customers,
-        suppliers,
-        purchases,
-        transactions,
-        cashflows,
-        attendances,
-        stockOpnames,
-        onlineOrders,
-        activityLogs,
-        storeSettings: {
-          ...formSettings,
-          customPaymentMethods: paymentMethods,
-        },
-        users: userList,
-      },
-    };
-
-    return {
-      fileName,
-      payload,
-      dateFormatted: now.toLocaleString('id-ID', { dateStyle: 'full', timeStyle: 'short' }),
-    };
+      users: userList,
+    });
   };
 
   const handleExportBackup = () => {
@@ -1293,6 +1458,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           'customerCategories',
           'onlineOrders',
           'activityLogs',
+          'taxRecords',
+          'taxAuditLogs',
+          'taxAdjustments',
+          'balanceSheetEntries',
           'users',
         ].some((key) => Array.isArray(rawData[key]));
         const hasSettings = Boolean(rawData.storeSettings && typeof rawData.storeSettings === 'object');
@@ -1317,6 +1486,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         const candidateStockOpnames = Array.isArray(rawData.stockOpnames) ? rawData.stockOpnames : [];
         const candidateOnlineOrders = Array.isArray(rawData.onlineOrders) ? rawData.onlineOrders : [];
         const candidateActivityLogs = Array.isArray(rawData.activityLogs) ? rawData.activityLogs : [];
+        const candidateTaxRecords = Array.isArray(rawData.taxRecords) ? rawData.taxRecords : [];
+        const candidateTaxAuditLogs = Array.isArray(rawData.taxAuditLogs) ? rawData.taxAuditLogs : [];
+        const candidateTaxAdjustments = Array.isArray(rawData.taxAdjustments) ? rawData.taxAdjustments : [];
+        const candidateBalanceSheetEntries = Array.isArray(rawData.balanceSheetEntries)
+          ? rawData.balanceSheetEntries
+          : [];
         const candidateSettings = hasSettings ? rawData.storeSettings : formSettings;
         const candidateUsers = Array.isArray(rawData.users) ? rawData.users : undefined;
         const candidateCategories = Array.isArray(rawData.categories) ? rawData.categories : [];
@@ -1343,6 +1518,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             stockOpnameCount: candidateStockOpnames.length,
             onlineOrderCount: candidateOnlineOrders.length,
             activityLogCount: candidateActivityLogs.length,
+            taxRecordCount: candidateTaxRecords.length,
+            taxAuditLogCount: candidateTaxAuditLogs.length,
+            taxAdjustmentCount: candidateTaxAdjustments.length,
+            balanceSheetEntryCount: candidateBalanceSheetEntries.length,
           },
           data: {
             products: candidateProducts,
@@ -1357,6 +1536,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             stockOpnames: candidateStockOpnames,
             onlineOrders: candidateOnlineOrders,
             activityLogs: candidateActivityLogs,
+            taxRecords: candidateTaxRecords,
+            taxAuditLogs: candidateTaxAuditLogs,
+            taxAdjustments: candidateTaxAdjustments,
+            balanceSheetEntries: candidateBalanceSheetEntries,
             storeSettings: candidateSettings,
             users: candidateUsers,
           },
@@ -1655,6 +1838,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           type="button"
                           onClick={() => {
                             sound.playTap();
+                            setLogoUploadError(null);
                             setFormSettings({ ...formSettings, storeLogo: '' });
                           }}
                           className="px-3 py-2 rounded-xl border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-xs flex items-center gap-1.5 transition-colors"
@@ -1664,6 +1848,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         </button>
                       )}
                     </div>
+
+                    {logoUploadError && (
+                      <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
+                        {logoUploadError}
+                      </div>
+                    )}
 
                     <p className="text-[11px] text-slate-500 leading-relaxed">
                       💡 <strong>Saran:</strong> Gunakan gambar logo siluet, badge, atau teks bertransparan/putih. Sistem otomatis menerapkan filter monokrom (*grayscale &amp; high-contrast*) agar hasil bakar thermal head printer tajam dan jelas.
@@ -5108,6 +5298,16 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
               </div>
             </div>
 
+            {/* Google Drive Cloud Backup & Periodic Safeguard */}
+            <GoogleDriveBackupPanel
+              canManageBackup={currentUserRole === 'ADMIN' || currentUserRole === 'STORE_MANAGER'}
+              currentUserName={currentUserName}
+              buildBackupPayload={(prefix) => buildFullBackupPayload(prefix || 'KasirKu-DriveBackup')}
+              onRestoreBackup={async (payload) => {
+                await onRestoreBackup(payload);
+              }}
+            />
+
             {/* Recurring Sunday Midnight Backup Scheduler */}
             <div className="p-4 bg-gradient-to-br from-indigo-50/70 via-white to-sky-50/60 rounded-2xl border border-indigo-200/80 space-y-3.5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -5296,45 +5496,350 @@ ${typeof window !== 'undefined' ? window.location.origin : 'https://toko.id'}/?i
               </div>
             </div>
 
-            {/* Cloud Backend (Firebase Firestore) Info */}
-            <div className={`p-3.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs transition-colors ${
-              formSettings.manualOfflineMode
-                ? 'bg-slate-100/80 border-slate-300'
-                : 'bg-gradient-to-r from-amber-50/70 to-orange-50/70 border-amber-200/80'
-            }`}>
-              <div className="flex items-center gap-2.5">
-                <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black text-sm shadow-xs ${
-                  formSettings.manualOfflineMode ? 'bg-slate-400 text-white' : 'bg-amber-500 text-white'
-                }`}>
-                  🔥
+            {/* Cloud Backend (Firebase Firestore) Info & Connection Diagnostics */}
+            <div
+              ref={firestoreDiagnosticsRef}
+              id="firestore-diagnostics-panel"
+              className={`p-4 rounded-xl border text-xs transition-all space-y-3.5 ${
+                isFirestoreHighlighted
+                  ? 'ring-2 ring-sky-500 ring-offset-2 shadow-md'
+                  : ''
+              } ${
+                formSettings.manualOfflineMode
+                  ? 'bg-slate-100/80 border-slate-300'
+                  : cloudSyncStatus === 'OFFLINE'
+                  ? 'bg-rose-50/70 border-rose-200'
+                  : 'bg-gradient-to-r from-amber-50/70 to-orange-50/70 border-amber-200/80'
+              }`}
+            >
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div className="flex items-start sm:items-center gap-2.5">
+                  <div className={`w-9 h-9 rounded-lg flex items-center justify-center font-black text-sm shadow-xs shrink-0 ${
+                    formSettings.manualOfflineMode
+                      ? 'bg-slate-400 text-white'
+                      : cloudSyncStatus === 'OFFLINE'
+                      ? 'bg-rose-500 text-white'
+                      : 'bg-amber-500 text-white'
+                  }`}>
+                    <Server className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-slate-900">Diagnostik &amp; Status Server Firebase Firestore</span>
+                      {formSettings.manualOfflineMode ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300 flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                          <span>Local Only (Dijeda)</span>
+                        </span>
+                      ) : cloudSyncStatus === 'SYNCED' ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                          <span>Terhubung Real-Time</span>
+                        </span>
+                      ) : cloudSyncStatus === 'CONNECTING' ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-100 text-sky-800 border border-sky-300 flex items-center gap-1">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                          <span>Menghubungkan...</span>
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300 flex items-center gap-1">
+                          <WifiOff className="w-2.5 h-2.5" />
+                          <span>Offline / Terputus</span>
+                        </span>
+                      )}
+                      {typeof navigator !== 'undefined' && (
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border flex items-center gap-1 ${
+                          navigator.onLine
+                            ? 'bg-white/80 text-slate-700 border-slate-300'
+                            : 'bg-rose-100 text-rose-800 border-rose-300'
+                        }`}>
+                          {navigator.onLine ? <Wifi className="w-2.5 h-2.5 text-emerald-600" /> : <WifiOff className="w-2.5 h-2.5 text-rose-600" />}
+                          <span>{navigator.onLine ? 'Internet Aktif' : 'Internet Terputus'}</span>
+                        </span>
+                      )}
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                          pendingSyncQueueCount > 0
+                            ? 'bg-amber-100 text-amber-900 border-amber-300'
+                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        }`}
+                      >
+                        {pendingSyncQueueCount > 0
+                          ? `Antrean Sync: ${pendingSyncQueueCount} Tertunda`
+                          : 'Antrean Sync: Bersih'}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-600 mt-0.5 font-mono break-all">
+                      Project: <span className="font-bold text-slate-800">{firebaseProjectId}</span> | Database: <span className="font-bold text-slate-800">{firebaseDatabaseId}</span>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-bold text-slate-900">Cloud Database: Google Firebase Firestore</span>
-                    {formSettings.manualOfflineMode ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300 flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                        <span>Local Only (Dijeda)</span>
-                      </span>
+
+                <div className="flex items-center gap-2 flex-wrap shrink-0">
+                  {onOpenSyncHealth && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        onOpenSyncHealth();
+                      }}
+                      className="px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 border border-slate-200 bg-white text-slate-800 hover:bg-slate-50 transition-colors cursor-pointer"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5 text-sky-600" />
+                      <span>Kesehatan Sync</span>
+                    </button>
+                  )}
+                  {onOpenSyncLogs && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        onOpenSyncLogs();
+                      }}
+                      className="px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 border border-slate-200 bg-white text-slate-800 hover:bg-slate-50 transition-colors cursor-pointer"
+                    >
+                      <Activity className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Log per Modul</span>
+                    </button>
+                  )}
+                  {onOpenOfflineQueueModal && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        onOpenOfflineQueueModal();
+                      }}
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition-colors cursor-pointer ${
+                        offlineQueueCount > 0
+                          ? 'bg-amber-50 border-amber-300 text-amber-900 hover:bg-amber-100'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <Database className="w-3.5 h-3.5" />
+                      <span>Antrean Offline ({offlineQueueCount})</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleForceSyncNow}
+                    disabled={isVerifyingFirestore}
+                    className="px-4 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed bg-sky-600 hover:bg-sky-500 text-white"
+                    title="Paksa pengecekan server Firestore, bersihkan status antrean sync, dan perbarui status koneksi secara instan"
+                  >
+                    {isVerifyingFirestore ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Menyinkronkan Server...</span>
+                      </>
                     ) : (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                        <span>Terhubung (Active)</span>
-                      </span>
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Force Sync Now</span>
+                      </>
                     )}
-                  </div>
-                  <div className="text-[11px] text-slate-600 mt-0.5 font-mono">
-                    Project: <span className="font-bold text-slate-800">gen-lang-client-0685545221</span> | Database: <span className="font-bold text-slate-800">ai-studio-kasirkutabletpos-df944ff3-add9-4d5c-af9d-8834a53215a0</span>
-                  </div>
+                  </button>
                 </div>
               </div>
-              <span className={`text-[11px] font-medium px-2.5 py-1 rounded-lg self-start sm:self-auto border ${
-                formSettings.manualOfflineMode
-                  ? 'text-slate-700 bg-white border-slate-300'
-                  : 'text-amber-900 bg-amber-100/70 border-amber-200'
-              }`}>
-                {formSettings.manualOfflineMode ? 'Penyimpanan Lokal Perangkat Aktif' : 'Aturan Keamanan Aktif & Terverifikasi'}
-              </span>
+
+              {/* Active Error / Latest Verification Result Callout */}
+              {(cloudSyncError || lastVerificationResult) && (
+                <div className={`p-3 rounded-xl border text-[11px] flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                  lastVerificationResult && !lastVerificationResult.ok
+                    ? 'bg-rose-50 border-rose-300 text-rose-900'
+                    : cloudSyncError && cloudSyncStatus === 'OFFLINE' && !formSettings.manualOfflineMode
+                    ? 'bg-rose-50 border-rose-300 text-rose-900'
+                    : 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                }`}>
+                  <div className="flex items-start gap-2">
+                    {((lastVerificationResult && !lastVerificationResult.ok) ||
+                      (cloudSyncError && cloudSyncStatus === 'OFFLINE' && !formSettings.manualOfflineMode)) ? (
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    )}
+                    <div className="space-y-0.5">
+                      <div className="font-bold">
+                        {lastVerificationResult
+                          ? lastVerificationResult.ok
+                            ? 'Force Sync & Verifikasi Server Berhasil'
+                            : 'Verifikasi Koneksi Server Gagal'
+                          : 'Diagnosis Koneksi Sinkronisasi'}
+                      </div>
+                      <p className="leading-relaxed">
+                        {lastVerificationResult?.message || cloudSyncError}
+                      </p>
+                      {lastVerificationResult && (
+                        <div className="flex items-center gap-2 flex-wrap pt-1 text-[10px] font-semibold">
+                          <span className={`px-2 py-0.5 rounded-md border ${
+                            lastVerificationResult.docReadOk
+                              ? 'bg-emerald-100/80 text-emerald-800 border-emerald-300'
+                              : 'bg-rose-100/80 text-rose-800 border-rose-300'
+                          }`}>
+                            Baca Dokumen: {lastVerificationResult.docReadOk ? 'OK' : 'Gagal'}
+                          </span>
+                          <span className={`px-2 py-0.5 rounded-md border ${
+                            lastVerificationResult.listQueryOk
+                              ? 'bg-emerald-100/80 text-emerald-800 border-emerald-300'
+                              : 'bg-rose-100/80 text-rose-800 border-rose-300'
+                          }`}>
+                            Kueri Koleksi: {lastVerificationResult.listQueryOk ? 'OK' : 'Gagal'}
+                          </span>
+                          <span className={`px-2 py-0.5 rounded-md border ${
+                            lastVerificationResult.queueCleared
+                              ? 'bg-emerald-100/80 text-emerald-800 border-emerald-300'
+                              : 'bg-amber-100/80 text-amber-800 border-amber-300'
+                          }`}>
+                            Antrean Sync:{' '}
+                            {lastVerificationResult.queueCleared
+                              ? 'Dibersihkan'
+                              : lastVerificationResult.queueFlushStatus === 'SKIPPED' && pendingSyncQueueCount === 0
+                              ? 'Belum Diverifikasi'
+                              : 'Tertunda'}
+                          </span>
+                          {lastVerificationResult.latencyMs > 0 && (
+                            <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-slate-700 font-mono">
+                              Latensi: {lastVerificationResult.latencyMs} ms
+                            </span>
+                          )}
+                          {lastVerificationResult.errorCode && (
+                            <span className="px-2 py-0.5 rounded-md bg-rose-100 border border-rose-300 text-rose-800 font-mono">
+                              Kode: {lastVerificationResult.errorCode}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  {lastVerificationResult && (
+                    <span className="text-[10px] font-mono opacity-80 shrink-0 self-end sm:self-center">
+                      {formatLogTimestamp(lastVerificationResult.timestamp)}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Quick Sync History Summary Strip */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="px-3 py-2 rounded-xl bg-white/90 border border-slate-200/90 flex items-center justify-between gap-2">
+                  <span className="text-[10.5px] font-semibold text-slate-600">Koneksi Berhasil Terakhir:</span>
+                  <span className="text-[10.5px] font-mono font-bold text-emerald-700">
+                    {latestSuccessLog ? formatLogTimestamp(latestSuccessLog.timestamp) : 'Belum tercatat'}
+                  </span>
+                </div>
+                <div className="px-3 py-2 rounded-xl bg-white/90 border border-slate-200/90 flex items-center justify-between gap-2">
+                  <span className="text-[10.5px] font-semibold text-slate-600">Kegagalan Terakhir:</span>
+                  <span className={`text-[10.5px] font-mono font-bold ${latestErrorLog ? 'text-rose-700' : 'text-slate-400'}`}>
+                    {latestErrorLog ? formatLogTimestamp(latestErrorLog.timestamp) : 'Tidak ada kegagalan'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Connection History Log Panel */}
+              <div className="rounded-xl border border-slate-200/90 bg-white overflow-hidden">
+                <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTap();
+                      setShowFirestoreLogs((prev) => !prev);
+                    }}
+                    className="flex items-center gap-2 text-left cursor-pointer group"
+                  >
+                    <Activity className="w-3.5 h-3.5 text-sky-600" />
+                    <span className="text-[11px] font-bold text-slate-800 group-hover:text-sky-700 transition-colors">
+                      Log Koneksi Terakhir Firebase Firestore
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded-md bg-slate-200/80 text-slate-700 text-[10px] font-bold">
+                      {firestoreLogs.length}
+                    </span>
+                  </button>
+                  <div className="flex items-center gap-2">
+                    {firestoreLogs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          sound.playTap();
+                          clearFirestoreConnectionLogs();
+                          setLastVerificationResult(null);
+                        }}
+                        className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-rose-50 hover:text-rose-700 hover:border-rose-200 text-[10px] font-semibold text-slate-600 transition-colors cursor-pointer"
+                      >
+                        Bersihkan Log
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playTap();
+                        setShowFirestoreLogs((prev) => !prev);
+                      }}
+                      className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[10px] font-semibold text-slate-600 transition-colors cursor-pointer"
+                    >
+                      {showFirestoreLogs ? 'Sembunyikan' : 'Tampilkan'}
+                    </button>
+                  </div>
+                </div>
+
+                {showFirestoreLogs && (
+                  <div className="max-h-60 overflow-y-auto divide-y divide-slate-100">
+                    {firestoreLogs.length === 0 ? (
+                      <div className="p-4 text-center text-[11px] text-slate-500">
+                        Belum ada log koneksi tercatat. Klik <span className="font-bold text-slate-700">Force Sync Now</span> untuk menguji koneksi secara langsung.
+                      </div>
+                    ) : (
+                      firestoreLogs.map((log) => (
+                        <div
+                          key={log.id}
+                          className="px-3 py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-[11px] hover:bg-slate-50/70 transition-colors"
+                        >
+                          <div className="flex items-start gap-2 min-w-0">
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[9.5px] font-black tracking-wide shrink-0 mt-0.5 border ${
+                                log.status === 'SUCCESS'
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  : log.status === 'ERROR'
+                                  ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                  : log.status === 'PAUSED'
+                                  ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                  : 'bg-sky-50 text-sky-700 border-sky-200'
+                              }`}
+                            >
+                              {log.status === 'SUCCESS'
+                                ? 'BERHASIL'
+                                : log.status === 'ERROR'
+                                ? 'GAGAL'
+                                : log.status === 'PAUSED'
+                                ? 'DIJEDA'
+                                : 'INFO'}
+                            </span>
+                            <div className="min-w-0 space-y-0.5">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="font-bold text-slate-800 font-mono text-[10px]">
+                                  {log.operation}
+                                </span>
+                                {log.latencyMs !== undefined && log.latencyMs > 0 && (
+                                  <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 font-mono text-[9.5px]">
+                                    {log.latencyMs} ms
+                                  </span>
+                                )}
+                                {log.errorCode && (
+                                  <span className="px-1.5 py-0.2 rounded bg-rose-100/80 text-rose-700 font-mono text-[9.5px]">
+                                    {log.errorCode}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-slate-600 leading-snug break-words">{log.message}</p>
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-mono text-slate-500 shrink-0 self-end sm:self-center">
+                            {formatLogTimestamp(log.timestamp)}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 

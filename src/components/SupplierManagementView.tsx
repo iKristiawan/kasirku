@@ -28,6 +28,58 @@ interface SupplierManagementViewProps {
   onCompleteRestock: (supplier: Supplier, items: RestockItem[]) => void;
 }
 
+const buildSupplierOrderTemplateMessage = (sup: Supplier, products: Product[]): string => {
+  const todayStr = new Date().toLocaleDateString('id-ID', {
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric',
+  });
+
+  const supCategoriesLower = new Set(
+    (sup.suppliedCategories || []).map((c) => c.trim().toLowerCase()).filter(Boolean)
+  );
+
+  // Suggest low-stock items associated with this supplier or its supplied categories
+  const matchedLowStock = products
+    .filter((p) => {
+      if (p.productType === 'JASA') return false;
+      const matchesSupplier = p.supplierId === sup.id;
+      const matchesCategory = supCategoriesLower.has((p.category || '').trim().toLowerCase());
+      const isLow = p.stockInBaseUnit <= p.minStockAlert;
+      return isLow && (matchesSupplier || matchesCategory);
+    })
+    .slice(0, 8);
+
+  const lines: string[] = [
+    `*PEMESANAN BARANG (PURCHASE ORDER)*`,
+    `Kepada Yth: *${sup.name}*`,
+    sup.contactPerson ? `Up: ${sup.contactPerson}` : '',
+    `Tanggal: ${todayStr}`,
+    `--------------------------------`,
+    `Halo, kami ingin melakukan pemesanan barang toko dengan rincian berikut:`,
+  ].filter(Boolean);
+
+  if (matchedLowStock.length > 0) {
+    matchedLowStock.forEach((p, idx) => {
+      const targetQty = Math.max(1, p.minStockAlert * 2 - p.stockInBaseUnit);
+      lines.push(`${idx + 1}. ${p.name} — Pesan: ${formatNumber(targetQty)} ${p.baseUnit} (sisa stok ${formatNumber(p.stockInBaseUnit)})`);
+    });
+  } else {
+    const catHint = (sup.suppliedCategories || []).join(', ');
+    if (catHint) {
+      lines.push(`Kategori kebutuhan: ${catHint}`);
+    }
+    lines.push(`1. [Nama Barang] — [Jumlah] [Satuan]`);
+    lines.push(`2. [Nama Barang] — [Jumlah] [Satuan]`);
+  }
+
+  lines.push(`--------------------------------`);
+  lines.push(`Mohon konfirmasi ketersediaan stok, harga terbaru, dan jadwal pengirimannya.`);
+  lines.push(`Terima kasih.`);
+
+  return lines.join('\n');
+};
+
 export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
   suppliers,
   products,
@@ -40,6 +92,7 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
   const [search, setSearch] = useState('');
   const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
   const [isAddingNew, setIsAddingNew] = useState(false);
+  const [restockNotice, setRestockNotice] = useState<string | null>(null);
 
   // Supplier Form
   const [name, setName] = useState('');
@@ -143,14 +196,15 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
 
   const totalRestockAmount = restockItems.reduce((acc, item) => acc + item.total, 0);
 
-  const handleSendPOViaWhatsApp = () => {
-    if (!activeRestockSupplier || restockItems.length === 0) return;
-    sound.playTap();
+  const poWhatsAppUrl = React.useMemo(() => {
+    if (!activeRestockSupplier || restockItems.length === 0) return '';
+    const targetWa = activeRestockSupplier.whatsapp || activeRestockSupplier.phone;
+    if (!targetWa) return '';
 
     const poNumber = generatePONumber();
     const lines = [
       `*PURCHASE ORDER (PO) BARANG*`,
-      `Kepada: ${activeRestockSupplier.name} (Up: ${activeRestockSupplier.contactPerson})`,
+      `Kepada: ${activeRestockSupplier.name} (Up: ${activeRestockSupplier.contactPerson || 'Tim Sales'})`,
       `No. PO: ${poNumber}`,
       `Tanggal: ${new Date().toLocaleDateString('id-ID')}`,
       `--------------------------------`,
@@ -166,15 +220,14 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
     lines.push(`*Total Estimasi: ${formatRupiah(totalRestockAmount)}*`);
     lines.push(`Mohon konfirmasi ketersediaan stok & jadwal pengiriman. Terima kasih.`);
 
-    const url = formatWhatsAppUrl(activeRestockSupplier.whatsapp, lines.join('\n'));
-    window.open(url, '_blank');
-  };
+    return formatWhatsAppUrl(targetWa, lines.join('\n'));
+  }, [activeRestockSupplier, restockItems, totalRestockAmount]);
 
   const handleConfirmReceiveStock = () => {
     if (!activeRestockSupplier || restockItems.length === 0) return;
     sound.playSuccessChime();
     onCompleteRestock(activeRestockSupplier, restockItems);
-    alert('Stok barang berhasil diperbarui ke inventaris toko!');
+    setRestockNotice(`Stok masuk dari ${activeRestockSupplier.name} (${restockItems.length} item) berhasil diperbarui ke inventaris toko.`);
     setActiveRestockSupplier(null);
   };
 
@@ -211,6 +264,23 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
             <span>Tambah Supplier Baru</span>
           </button>
         </div>
+
+        {restockNotice && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-3 text-xs text-emerald-900 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-bold">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{restockNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRestockNotice(null)}
+              className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+              title="Tutup notifikasi"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Search */}
         <div className="relative">
@@ -300,9 +370,38 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
 
               {/* Restock & WhatsApp Buttons */}
               <div className="pt-2 space-y-1.5">
+                {(() => {
+                  const targetWa = (sup.whatsapp || sup.phone || '').trim();
+                  const orderWaUrl = targetWa
+                    ? formatWhatsAppUrl(targetWa, buildSupplierOrderTemplateMessage(sup, products))
+                    : '';
+                  return targetWa ? (
+                    <a
+                      href={orderWaUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => sound.playTap()}
+                      className="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                      title={`Buka WhatsApp ${sup.name} dengan template pemesanan barang otomatis`}
+                    >
+                      <MessageCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>Hubungi Supplier via WhatsApp</span>
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled
+                      className="w-full py-2 px-3 rounded-xl bg-slate-100 text-slate-400 text-xs font-bold flex items-center justify-center gap-1.5 cursor-not-allowed"
+                    >
+                      <MessageCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>No. WhatsApp Belum Diisi</span>
+                    </button>
+                  );
+                })()}
+
                 <button
                   onClick={() => handleOpenRestock(sup)}
-                  className="w-full py-2 px-3 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-800 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors border border-sky-200/60"
+                  className="w-full py-2 px-3 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-800 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors border border-sky-200/60 cursor-pointer"
                 >
                   <PackagePlus className="w-3.5 h-3.5 text-sky-600" />
                   <span>Buat PO / Restock Barang</span>
@@ -462,15 +561,27 @@ export const SupplierManagementView: React.FC<SupplierManagementViewProps> = ({
 
             {/* Bottom Actions */}
             <div className="pt-3 border-t border-slate-100 flex flex-wrap justify-between gap-2">
-              <button
-                type="button"
-                onClick={handleSendPOViaWhatsApp}
-                disabled={restockItems.length === 0}
-                className="py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5 transition-colors"
-              >
-                <MessageCircle className="w-4 h-4" />
-                <span>Kirim PO ke WhatsApp Supplier</span>
-              </button>
+              {poWhatsAppUrl ? (
+                <a
+                  href={poWhatsAppUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => sound.playTap()}
+                  className="py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  <MessageCircle className="w-4 h-4" />
+                  <span>Kirim PO ke WhatsApp Supplier</span>
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  disabled
+                  className="py-2.5 px-4 rounded-xl bg-emerald-600 opacity-40 text-white text-xs font-bold flex items-center gap-1.5 cursor-not-allowed"
+                >
+                  <MessageCircle className="w-4 h-4" />
+                  <span>Kirim PO ke WhatsApp Supplier</span>
+                </button>
+              )}
 
               <div className="flex gap-2">
                 <button

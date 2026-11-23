@@ -51,7 +51,8 @@ import {
   History,
   User,
   ArrowUpRight,
-  ArrowDownRight
+  ArrowDownRight,
+  BadgePercent
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -75,6 +76,7 @@ import {
   calculatePointsEarned,
   getCustomerMembershipId,
 } from '../utils/customerUtils';
+import { resolveProductDiscount, productHasAnyDiscount } from '../utils/promoUtils';
 import { 
   isNotificationSupported, 
   requestNotificationPermission, 
@@ -84,6 +86,13 @@ import {
 import { StockAlertWidget } from './StockAlertWidget';
 import { StockNotificationToast } from './StockNotificationToast';
 import { TouchKeypadModal } from './TouchKeypadModal';
+import { LazyProductImage } from './LazyProductImage';
+import {
+  FlyToCartOverlay,
+  FlyingCartParticle,
+  computeFlyCoords,
+  resolveVisibleTargetElement,
+} from './FlyToCartOverlay';
 
 interface TabletPOSViewProps {
   products: Product[];
@@ -132,7 +141,7 @@ interface TabletPOSViewProps {
   onDismissSpecialPriceNotice?: () => void;
 }
 
-const POS_VISIBLE_BATCH = 48;
+const POS_VISIBLE_BATCH = 36;
 
 const escapeSearchRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -166,9 +175,10 @@ interface POSProductCardProps {
   product: Product;
   catColor: string;
   customerCategory?: string;
+  selectedCustomer?: Customer | null;
   isHighlighted: boolean;
   searchQuery?: string;
-  onSelect: (product: Product) => void;
+  onSelect: (product: Product, sourceEl?: HTMLElement | null) => void;
   onNavigateToSuppliers?: () => void;
 }
 
@@ -176,6 +186,7 @@ const POSProductCard = memo<POSProductCardProps>(({
   product,
   catColor,
   customerCategory,
+  selectedCustomer,
   isHighlighted,
   searchQuery,
   onSelect,
@@ -206,6 +217,13 @@ const POSProductCard = memo<POSProductCardProps>(({
       )
     : undefined;
 
+  const discountInfo = resolveProductDiscount(
+    product,
+    defaultUnit,
+    undefined,
+    selectedCustomer || null,
+    1
+  );
   const activeSpecial = customerCategory
     ? findCustomerSpecialPrice(product, customerCategory, defaultUnit, 1)
     : null;
@@ -216,14 +234,16 @@ const POSProductCard = memo<POSProductCardProps>(({
   return (
     <div
       id={`product-card-${product.id}`}
-      onClick={() => !isOutOfStock && onSelect(product)}
-      className={`group bg-white rounded-2xl border p-3 flex flex-col justify-between transition-colors duration-150 relative select-none ${
+      onClick={(e) => !isOutOfStock && onSelect(product, e.currentTarget)}
+      className={`group bg-white rounded-2xl border p-3 flex flex-col justify-between transition-all duration-150 relative select-none ${
         isHighlighted
           ? 'ring-4 ring-sky-500 shadow-xl z-20 border-sky-500 bg-sky-50/20'
           : isOutOfStock
           ? 'opacity-75 cursor-not-allowed border-rose-300 bg-rose-50/20 ring-1 ring-rose-400/30'
           : isLowStock
           ? 'border-amber-400 bg-amber-50/20 shadow-xs ring-2 ring-amber-400/40 hover:border-amber-500'
+          : discountInfo.hasDiscount
+          ? 'border-rose-300/90 bg-gradient-to-b from-rose-50/35 to-white hover:border-rose-500 hover:shadow-md cursor-pointer active:scale-[0.98]'
           : isService
           ? 'hover:border-purple-500 hover:shadow-md cursor-pointer border-purple-100 bg-purple-50/10 active:scale-[0.98]'
           : 'hover:border-sky-500 hover:shadow-md cursor-pointer border-slate-200/90 active:scale-[0.98]'
@@ -231,7 +251,7 @@ const POSProductCard = memo<POSProductCardProps>(({
     >
       <div>
         {/* Image & Badges */}
-        <div className="relative aspect-4/3 rounded-xl bg-slate-100 overflow-hidden mb-2.5">
+        <div className="fly-cart-origin relative aspect-4/3 rounded-xl bg-slate-100 overflow-hidden mb-2.5">
           {isHighlighted && (
             <div className="absolute top-1.5 left-1.5 px-2 py-0.5 rounded-md bg-sky-600 text-white text-[10px] font-black tracking-wide shadow-md flex items-center gap-1 z-20">
               <Sparkles className="w-3 h-3" />
@@ -263,36 +283,34 @@ const POSProductCard = memo<POSProductCardProps>(({
             </div>
           )}
 
-          {product.imageUrl ? (
-            <img
-              src={product.imageUrl}
-              alt={product.name}
-              loading="lazy"
-              decoding="async"
-              referrerPolicy="no-referrer"
-              className="w-full h-full object-cover"
-            />
-          ) : (
-            <div
-              className="w-full h-full flex flex-col items-center justify-center font-bold text-xs"
-              style={{
-                backgroundColor: isService ? '#9333ea15' : `${catColor}12`,
-                color: isService ? '#7e22ce' : catColor,
-              }}
-            >
-              {isService ? (
-                <>
-                  <Wrench className="w-8 h-8 mb-1 opacity-80" />
-                  <span className="text-[10px] font-bold">Layanan Jasa</span>
-                </>
-              ) : (
-                <>
-                  <span className="text-lg font-black">{product.name.charAt(0)}</span>
-                  <span className="text-[10px] opacity-80">{product.category}</span>
-                </>
-              )}
-            </div>
-          )}
+          <LazyProductImage
+            src={product.imageUrl}
+            alt={product.name}
+            className="w-full h-full object-cover"
+            containerClassName="w-full h-full relative"
+            unloadFarOffscreen={true}
+            fallback={
+              <div
+                className="w-full h-full flex flex-col items-center justify-center font-bold text-xs"
+                style={{
+                  backgroundColor: isService ? '#9333ea15' : `${catColor}12`,
+                  color: isService ? '#7e22ce' : catColor,
+                }}
+              >
+                {isService ? (
+                  <>
+                    <Wrench className="w-8 h-8 mb-1 opacity-80" />
+                    <span className="text-[10px] font-bold">Layanan Jasa</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-lg font-black">{product.name.charAt(0)}</span>
+                    <span className="text-[10px] opacity-80">{product.category}</span>
+                  </>
+                )}
+              </div>
+            }
+          />
 
           {/* Stock indicator badge */}
           <div className={`absolute bottom-1.5 left-1.5 px-2 py-0.5 rounded-md text-[10px] font-bold shadow-xs font-mono ${
@@ -307,8 +325,14 @@ const POSProductCard = memo<POSProductCardProps>(({
             {isService ? `Non-Stok (∞) / ${product.baseUnit}` : `Stok: ${formatNumber(product.stockInBaseUnit)} ${product.baseUnit}`}
           </div>
 
-          {/* Multi-unit and/or Variant badge */}
+          {/* Multi-unit, Variant, and Promo Discount badges */}
           <div className="absolute top-1.5 right-1.5 flex flex-col items-end gap-1 z-10">
+            {discountInfo.hasDiscount && !isOutOfStock && (
+              <div className="px-2 py-0.5 rounded-md text-white text-[10px] font-black shadow-sm flex items-center gap-1 bg-rose-600 tabular-nums">
+                <BadgePercent className="w-3 h-3" />
+                <span>-{discountInfo.discountPercent}%</span>
+              </div>
+            )}
             {product.units.length > 1 && (
               <div className={`px-1.5 py-0.5 rounded text-white text-[10px] font-bold shadow-xs flex items-center gap-1 ${
                 isService ? 'bg-purple-600' : 'bg-sky-500'
@@ -386,31 +410,41 @@ const POSProductCard = memo<POSProductCardProps>(({
               {isService ? 'Tarif / ' : ''}
               <HighlightMatchText text={defaultUnit.unitName} query={trimmedQuery} />
             </span>
-            {activeSpecial && (
+            {discountInfo.source === 'CUSTOMER_SPECIAL' && (
               <span className="px-1 py-0.2 rounded bg-purple-100 text-purple-800 border border-purple-200 text-[8.5px] font-black">
-                🏷️ {customerCategory}
+                {customerCategory}
+              </span>
+            )}
+            {discountInfo.source === 'PRODUCT_PROMO' && (
+              <span className="px-1 py-0.2 rounded bg-rose-100 text-rose-800 border border-rose-200 text-[8.5px] font-black">
+                {discountInfo.promoLabel || 'PROMO'}
               </span>
             )}
           </div>
           <div className="flex items-baseline gap-1.5 flex-wrap">
             <div className={`text-sm md:text-base font-bold font-mono tabular-nums ${
-              activeSpecial
-                ? 'text-purple-700'
-                : isService
+              discountInfo.source === 'PRODUCT_PROMO'
+                ? 'text-rose-700'
+                : discountInfo.source === 'CUSTOMER_SPECIAL' || isService
                 ? 'text-purple-700'
                 : 'text-sky-700'
             }`}>
-              {formatRupiah(activeSpecial ? activeSpecial.specialPrice : defaultUnit.sellingPrice)}
+              {formatRupiah(discountInfo.effectiveUnitPrice)}
             </div>
-            {activeSpecial && activeSpecial.specialPrice !== defaultUnit.sellingPrice && (
-              <span className="text-[10px] text-slate-400 line-through font-mono">
-                {formatRupiah(defaultUnit.sellingPrice)}
+            {discountInfo.hasDiscount && (
+              <span className="text-[10px] text-slate-400 line-through font-mono tabular-nums">
+                {formatRupiah(discountInfo.baseUnitPrice)}
               </span>
             )}
           </div>
+          {discountInfo.hasDiscount && discountInfo.savingsPerUnit > 0 && (
+            <div className="text-[9.5px] font-bold text-emerald-700 mt-0.5 tabular-nums">
+              Hemat {formatRupiah(discountInfo.savingsPerUnit)}/{defaultUnit.unitName}
+            </div>
+          )}
           {upcomingSpecial && (
             <div className="text-[9.5px] font-bold text-purple-700 bg-purple-50 border border-purple-200 rounded px-1.5 py-0.5 mt-0.5 inline-block truncate max-w-full">
-              🎯 {formatRupiah(upcomingSpecial.nextRule.price)} (Min. {upcomingSpecial.minQuantity} {defaultUnit.unitName})
+              Beli ≥{upcomingSpecial.minQuantity} {defaultUnit.unitName}: {formatRupiah(upcomingSpecial.nextRule.price)}
             </div>
           )}
         </div>
@@ -419,11 +453,14 @@ const POSProductCard = memo<POSProductCardProps>(({
           type="button"
           onClick={(e) => {
             e.stopPropagation();
-            onSelect(product);
+            const cardEl = e.currentTarget.closest(`#product-card-${product.id}`) as HTMLElement | null;
+            onSelect(product, cardEl || e.currentTarget);
           }}
           disabled={isOutOfStock}
           className={`w-8 h-8 rounded-xl flex items-center justify-center transition-colors shadow-xs ${
-            isService
+            discountInfo.hasDiscount
+              ? 'bg-rose-50 group-hover:bg-rose-600 text-rose-600 group-hover:text-white'
+              : isService
               ? 'bg-purple-50 group-hover:bg-purple-600 text-purple-600 group-hover:text-white'
               : 'bg-sky-50 group-hover:bg-sky-600 text-sky-600 group-hover:text-white'
           }`}
@@ -527,6 +564,78 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
   const [quickSaleError, setQuickSaleError] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const quickSaleDescInputRef = useRef<HTMLInputElement>(null);
+  const desktopCartTargetRef = useRef<HTMLDivElement>(null);
+  const portraitCartTabRef = useRef<HTMLButtonElement>(null);
+  const portraitCartCtaRef = useRef<HTMLButtonElement>(null);
+  const cartBounceTimerRef = useRef<number | null>(null);
+  const [flyingParticles, setFlyingParticles] = useState<FlyingCartParticle[]>([]);
+  const [cartBounceTick, setCartBounceTick] = useState<number>(0);
+
+  // Cart row flash, qty pop, and smooth auto-scroll tracking
+  const [flashedCartItemIds, setFlashedCartItemIds] = useState<Record<string, boolean>>({});
+  const prevCartQtyMapRef = useRef<Map<string, number>>(new Map());
+  const cartRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const flyInitiatedAtRef = useRef<number>(0);
+
+  useEffect(() => {
+    const prevMap = prevCartQtyMapRef.current;
+    const nextMap = new Map<string, number>();
+    const newlyChangedIds: string[] = [];
+
+    cart.forEach((item) => {
+      nextMap.set(item.cartItemId, item.quantity);
+      const prevQty = prevMap.get(item.cartItemId);
+      if (prevQty === undefined || item.quantity > prevQty) {
+        newlyChangedIds.push(item.cartItemId);
+      }
+    });
+
+    prevCartQtyMapRef.current = nextMap;
+
+    if (newlyChangedIds.length > 0) {
+      setFlashedCartItemIds((prev) => {
+        const updated = { ...prev };
+        newlyChangedIds.forEach((id) => {
+          updated[id] = true;
+        });
+        return updated;
+      });
+
+      // Trigger immediate bounce if cart changed externally (e.g., barcode scan / Quick Sale)
+      if (Date.now() - flyInitiatedAtRef.current > 450) {
+        setCartBounceTick((t) => t + 1);
+      }
+
+      // Gently scroll the newest added/updated row into view
+      const targetId = newlyChangedIds[newlyChangedIds.length - 1];
+      requestAnimationFrame(() => {
+        const el = cartRowRefs.current.get(targetId);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      });
+
+      const timer = window.setTimeout(() => {
+        setFlashedCartItemIds((prev) => {
+          const copy = { ...prev };
+          newlyChangedIds.forEach((id) => {
+            delete copy[id];
+          });
+          return copy;
+        });
+      }, 820);
+
+      return () => window.clearTimeout(timer);
+    }
+  }, [cart]);
+
+  useEffect(() => {
+    return () => {
+      if (cartBounceTimerRef.current) {
+        window.clearTimeout(cartBounceTimerRef.current);
+      }
+    };
+  }, []);
 
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
@@ -1256,6 +1365,10 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
     setIsCategoryReorderMenuOpen(false);
   };
 
+  const discountedProducts = useMemo(() => {
+    return products.filter((p) => productHasAnyDiscount(p, selectedCustomer));
+  }, [products, selectedCustomer]);
+
   // Filter products by category and deferred search
   const filteredProducts = useMemo(() => {
     const q = deferredSearchQuery.trim().toLowerCase();
@@ -1263,6 +1376,8 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
       let matchCat = true;
       if (selectedCategory === '__LOW_STOCK__') {
         matchCat = p.stockInBaseUnit <= p.minStockAlert;
+      } else if (selectedCategory === '__DISCOUNTED__') {
+        matchCat = productHasAnyDiscount(p, selectedCustomer);
       } else if (selectedCategory !== 'SEMUA') {
         matchCat = p.category === selectedCategory;
       }
@@ -1278,7 +1393,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         (p.variants && p.variants.some((v) => v.name.toLowerCase().includes(q) || (v.barcode && v.barcode.toLowerCase().includes(q))))
       );
     });
-  }, [products, selectedCategory, deferredSearchQuery]);
+  }, [products, selectedCategory, deferredSearchQuery, selectedCustomer]);
 
   // Reset progressive render window when category or search filter changes
   useEffect(() => {
@@ -1353,7 +1468,50 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
   const latestCartRef = useRef(cart);
   latestCartRef.current = cart;
 
-  const handleProductCardClick = useCallback((product: Product) => {
+  const triggerFlyToCart = useCallback(
+    (product: Product, explicitSourceEl?: HTMLElement | null) => {
+      flyInitiatedAtRef.current = Date.now();
+      const sourceEl =
+        explicitSourceEl ||
+        (typeof document !== 'undefined'
+          ? document.getElementById(`product-card-${product.id}`)
+          : null);
+      const targetEl = resolveVisibleTargetElement([
+        desktopCartTargetRef.current,
+        portraitCartTabRef.current,
+        portraitCartCtaRef.current,
+      ]);
+
+      const coords = computeFlyCoords(sourceEl, targetEl);
+      if (coords) {
+        const particleId = `fly_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const accentColor = getCategoryColor(product.category, categories, product);
+        setFlyingParticles((prev) => [
+          ...prev.slice(-8),
+          {
+            id: particleId,
+            ...coords,
+            imageUrl: product.imageUrl,
+            label: product.name,
+            accentColor,
+            isService: product.productType === 'JASA',
+          },
+        ]);
+
+        if (cartBounceTimerRef.current) {
+          window.clearTimeout(cartBounceTimerRef.current);
+        }
+        cartBounceTimerRef.current = window.setTimeout(() => {
+          setCartBounceTick((t) => t + 1);
+        }, 390);
+      } else {
+        setCartBounceTick((t) => t + 1);
+      }
+    },
+    [categories]
+  );
+
+  const handleProductCardClick = useCallback((product: Product, sourceEl?: HTMLElement | null) => {
     sound.playTap();
     if (product.units.length > 1 || (product.variants && product.variants.length > 0)) {
       setUnitSelectModalProduct(product);
@@ -1370,9 +1528,10 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           checkSmartStockWarning(product, addingBaseUnits);
         }
       }
+      triggerFlyToCart(product, sourceEl);
       onAddToCart(product, unit);
     }
-  }, [onAddToCart]);
+  }, [onAddToCart, triggerFlyToCart]);
 
   // Physical Keyboard Shortcuts Support (for Bluetooth/USB keyboards on tablets or PC POS)
   useEffect(() => {
@@ -1529,6 +1688,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           const maxAvail = Math.floor(unitSelectModalProduct.stockInBaseUnit / targetUnit.conversionFactor);
           if (maxAvail > 0) {
             sound.playTap();
+            triggerFlyToCart(unitSelectModalProduct);
             onAddToCart(unitSelectModalProduct, targetUnit, 1);
             setUnitSelectModalProduct(null);
           } else {
@@ -1597,6 +1757,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
     onOpenThresholdSettings,
     onAddToCart,
     onUpdateCartItemQty,
+    triggerFlyToCart,
   ]);
 
   return (
@@ -1631,6 +1792,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
             </button>
 
             <button
+              ref={portraitCartTabRef}
               type="button"
               onClick={() => {
                 sound.playTap();
@@ -1642,10 +1804,18 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                   : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
               }`}
             >
-              <ShoppingCart className="w-3.5 h-3.5" />
-              <span>Keranjang ({cartItemCount})</span>
+              <motion.span
+                key={`portrait-cart-icon-${cartBounceTick}`}
+                initial={false}
+                animate={cartBounceTick > 0 ? { scale: [1, 1.28, 0.94, 1] } : undefined}
+                transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+                className="inline-flex items-center justify-center"
+              >
+                <ShoppingCart className="w-3.5 h-3.5" />
+              </motion.span>
+              <span className="tabular-nums">Keranjang ({cartItemCount})</span>
               {subtotal > 0 && (
-                <span className="font-mono text-[10px] bg-black/30 px-1.5 py-0.2 rounded-md">
+                <span className="font-mono text-[10px] bg-black/30 px-1.5 py-0.2 rounded-md tabular-nums">
                   {formatRupiah(subtotal)}
                 </span>
               )}
@@ -2053,6 +2223,34 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
 
         {/* Category Filter Horizontal Scroll with Color Badges + Low Stock Critical Filter */}
         <div className="pos-category-strip px-3 md:px-4 py-2.5 bg-white border-b border-slate-200 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
+          {/* Dedicated Promo / Discount Filter Tab */}
+          <button
+            type="button"
+            onClick={() => {
+              sound.playTap();
+              setSelectedCategory(selectedCategory === '__DISCOUNTED__' ? 'SEMUA' : '__DISCOUNTED__');
+            }}
+            className={`pos-category-chip px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all flex items-center gap-1.5 border shrink-0 cursor-pointer ${
+              selectedCategory === '__DISCOUNTED__'
+                ? 'bg-rose-600 text-white border-rose-600 shadow-sm'
+                : discountedProducts.length > 0
+                ? 'bg-rose-50 hover:bg-rose-100 text-rose-800 border-rose-200'
+                : 'bg-slate-50 hover:bg-slate-100 text-slate-600 border-slate-200'
+            }`}
+          >
+            <BadgePercent className={`w-3.5 h-3.5 ${selectedCategory === '__DISCOUNTED__' ? 'text-white' : 'text-rose-600'}`} />
+            <span>Sedang Diskon</span>
+            <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-black tabular-nums ${
+              selectedCategory === '__DISCOUNTED__'
+                ? 'bg-white/20 text-white'
+                : discountedProducts.length > 0
+                ? 'bg-rose-200 text-rose-900'
+                : 'bg-slate-200 text-slate-600'
+            }`}>
+              {discountedProducts.length}
+            </span>
+          </button>
+
           {/* Dedicated Low Stock Alert Filter Tab */}
           <button
             type="button"
@@ -2354,6 +2552,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     product={product}
                     catColor={getCategoryColor(product.category, categories, product)}
                     customerCategory={selectedCustomer?.customerCategory}
+                    selectedCustomer={selectedCustomer}
                     isHighlighted={highlightedProductId === product.id}
                     searchQuery={deferredSearchQuery.trim()}
                     onSelect={handleProductCardClick}
@@ -2384,6 +2583,7 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
         {isPortrait && portraitTab === 'CATALOG' && cartItemCount > 0 && (
           <div className="pos-portrait-sticky-cta p-3 bg-white border-t border-slate-200 shadow-lg shrink-0">
             <button
+              ref={portraitCartCtaRef}
               type="button"
               onClick={() => {
                 sound.playTap();
@@ -2760,6 +2960,36 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           </div>
         )}
 
+        {/* Compact Cart Header Target for Fly-to-Cart Feedback */}
+        <div className="px-3 py-2 bg-white border-b border-slate-200 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <motion.div
+              key={`desktop-cart-target-${cartBounceTick}`}
+              ref={desktopCartTargetRef}
+              initial={false}
+              animate={cartBounceTick > 0 ? { scale: [1, 1.24, 0.94, 1] } : undefined}
+              transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+              className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${
+                cartItemCount > 0
+                  ? 'bg-sky-600 text-white shadow-xs'
+                  : 'bg-slate-100 text-slate-500'
+              }`}
+            >
+              <ShoppingCart className="w-3.5 h-3.5" />
+            </motion.div>
+            <span className="text-xs font-bold text-slate-800">Daftar Belanja</span>
+          </div>
+          <div className="flex items-center gap-2 text-xs font-mono tabular-nums">
+            <span className="font-bold text-slate-700">{formatNumber(cartItemCount)} item</span>
+            {subtotal > 0 && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="font-bold text-sky-700">{formatRupiah(subtotal)}</span>
+              </>
+            )}
+          </div>
+        </div>
+
         {/* Cart Items List */}
         <div className="pos-cart-scroll flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain p-3 space-y-2">
           {cart.length === 0 && (
@@ -2793,15 +3023,30 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 : [];
               const latestCustomerSale = selectedCustomerItemHistory[0] || null;
 
+              const isFlashed = Boolean(flashedCartItemIds[item.cartItemId]);
+
               return (
               <motion.div
                 key={item.cartItemId}
+                ref={(el) => {
+                  if (el) {
+                    cartRowRefs.current.set(item.cartItemId, el);
+                  } else {
+                    cartRowRefs.current.delete(item.cartItemId);
+                  }
+                }}
                 layout="position"
-                initial={{ opacity: 0, x: 24, scale: 0.98 }}
+                initial={{ opacity: 0, x: 24, scale: 0.96 }}
                 animate={{ opacity: 1, x: 0, scale: 1 }}
-                exit={{ opacity: 0, x: 18, scale: 0.97, transition: { duration: 0.16, ease: 'easeIn' } }}
+                exit={{ opacity: 0, x: 22, scale: 0.95, transition: { duration: 0.16, ease: 'easeIn' } }}
                 transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
-                className="bg-white rounded-xl border border-slate-200 p-2.5 shadow-2xs hover:border-slate-300 transition-colors"
+                className={`bg-white rounded-xl border p-2.5 shadow-2xs hover:border-slate-300 transition-colors ${
+                  isFlashed
+                    ? 'cart-row-flash border-sky-400'
+                    : item.productDiscountPercent && item.productDiscountPercent > 0
+                    ? 'border-rose-200/90'
+                    : 'border-slate-200'
+                }`}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div 
@@ -2890,14 +3135,30 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                             {item.isCustomerSpecialPrice && (
                               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-black bg-purple-100 text-purple-800 border border-purple-200">
                                 <span>
-                                  🏷️ Khusus {item.customerPriceCategory || 'Kategori'}
+                                  Khusus {item.customerPriceCategory || 'Kategori'}
                                   {activeMinQty > 1 ? ` (Min. ${activeMinQty} ${item.selectedUnit.unitName})` : ''}
                                 </span>
                                 {item.originalUnitPrice && item.originalUnitPrice !== item.unitPrice && (
+                                  <span className="line-through text-slate-400 font-normal tabular-nums">
+                                    {formatRupiah(item.originalUnitPrice)}
+                                  </span>
+                                )}
+                              </span>
+                            )}
+                            {!item.isCustomerSpecialPrice && !item.isCustomPrice && item.productDiscountPercent && item.productDiscountPercent > 0 && (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-200 tabular-nums">
+                                <BadgePercent className="w-2.5 h-2.5 text-rose-600" />
+                                <span>-{item.productDiscountPercent}% {item.promoLabel || 'PROMO'}</span>
+                                {item.originalUnitPrice && item.originalUnitPrice > item.unitPrice && (
                                   <span className="line-through text-slate-400 font-normal">
                                     {formatRupiah(item.originalUnitPrice)}
                                   </span>
                                 )}
+                              </span>
+                            )}
+                            {item.originalUnitPrice && item.originalUnitPrice > item.unitPrice && (
+                              <span className="text-[10px] font-bold text-emerald-700 tabular-nums">
+                                Hemat {formatRupiah((item.originalUnitPrice - item.unitPrice) * item.quantity)}
                               </span>
                             )}
                             {upcomingRuleInfo && (
@@ -3022,8 +3283,12 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                       <Minus className="w-3.5 h-3.5" />
                     </button>
                     
-                    <button
+                    <motion.button
                       type="button"
+                      key={`qty-pill-${item.cartItemId}-${item.quantity}`}
+                      initial={isFlashed ? { scale: 1.24 } : false}
+                      animate={{ scale: 1 }}
+                      transition={{ type: 'spring', stiffness: 420, damping: 24 }}
                       onClick={() => {
                         sound.playTap();
                         setKeypadTarget({
@@ -3033,11 +3298,11 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                           currentQty: item.quantity,
                         });
                       }}
-                      className="pos-stepper-btn px-2 py-0.5 min-w-[32px] text-center text-xs font-black text-slate-900 font-mono bg-white hover:bg-sky-50 hover:text-sky-700 rounded border border-slate-200 transition-colors shadow-2xs cursor-pointer active:scale-95"
+                      className="pos-stepper-btn px-2 py-0.5 min-w-[32px] text-center text-xs font-black text-slate-900 font-mono bg-white hover:bg-sky-50 hover:text-sky-700 rounded border border-slate-200 transition-colors shadow-2xs cursor-pointer active:scale-95 tabular-nums"
                       title="Klik untuk ubah jumlah via Numpad Layar Sentuh Tablet"
                     >
                       {item.quantity}
-                    </button>
+                    </motion.button>
 
                     <button
                       onClick={() => {
@@ -3118,7 +3383,10 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
 
           <div className="pt-2 border-t border-slate-200 flex justify-between items-baseline">
             <span className="text-sm font-bold text-slate-800">Total Tagihan:</span>
-            <span className="text-xl md:text-2xl font-extrabold text-sky-700 font-mono tabular-nums">
+            <span
+              key={`grand-total-${grandTotal}`}
+              className="text-xl md:text-2xl font-extrabold text-sky-700 font-mono tabular-nums animate-cart-price-pop"
+            >
               {formatRupiah(grandTotal)}
             </span>
           </div>
@@ -3558,37 +3826,45 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                 );
                 const isOutOfStock = maxUnitsAvailable <= 0;
 
-                // Calculate displayed price reflecting selected variant custom price
-                const selectedVarObj = unitSelectModalProduct.variants?.find((v) => v.name === selectedVariantForModal);
-                let effectivePrice = unit.sellingPrice;
-                if (selectedVarObj?.price !== undefined && selectedVarObj.price > 0) {
-                  effectivePrice = selectedVarObj.price * (unit.conversionFactor || 1);
-                } else if (selectedVarObj?.priceAdjustment) {
-                  effectivePrice = Math.max(0, unit.sellingPrice + (selectedVarObj.priceAdjustment * (unit.conversionFactor || 1)));
-                }
+                // Resolve price including variant adjustment, promo discount, and customer special pricing
+                const resolvedUnitDiscount = resolveProductDiscount(
+                  unitSelectModalProduct,
+                  unit,
+                  selectedVariantForModal || undefined,
+                  selectedCustomer,
+                  1
+                );
 
                 return (
                   <button
                     key={unit.id}
                     disabled={isOutOfStock}
-                    onClick={() => {
+                    onClick={(e) => {
                       sound.playTap();
                       checkSmartStockWarning(unitSelectModalProduct, (unit.conversionFactor || 1) * 1);
+                      triggerFlyToCart(unitSelectModalProduct, e.currentTarget);
                       onAddToCart(unitSelectModalProduct, unit, 1, selectedVariantForModal || undefined);
                       setUnitSelectModalProduct(null);
                     }}
                     className={`w-full text-left p-3.5 rounded-2xl border transition-all flex items-center justify-between ${
                       isOutOfStock
                         ? 'opacity-40 bg-slate-50 border-slate-200 cursor-not-allowed'
+                        : resolvedUnitDiscount.hasDiscount
+                        ? 'bg-rose-50/35 hover:bg-rose-50/70 hover:border-rose-500 border-rose-200 active:scale-[0.99] shadow-2xs'
                         : 'bg-white hover:bg-sky-50/50 hover:border-sky-500 border-slate-200 active:scale-[0.99] shadow-2xs'
                     }`}
                   >
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <kbd className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-100 text-slate-700 border border-slate-200">
                           [{idx + 1}]
                         </kbd>
                         <span className="font-bold text-sm text-slate-900">{unit.unitName}</span>
+                        {resolvedUnitDiscount.hasDiscount && (
+                          <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-black tabular-nums">
+                            -{resolvedUnitDiscount.discountPercent}%
+                          </span>
+                        )}
                         {selectedVariantForModal && (
                           <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200">
                             {selectedVariantForModal}
@@ -3606,9 +3882,16 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
                     </div>
 
                     <div className="text-right">
-                      <div className="text-base font-extrabold text-sky-700 font-mono tabular-nums">
-                        {formatRupiah(effectivePrice)}
+                      <div className={`text-base font-extrabold font-mono tabular-nums ${
+                        resolvedUnitDiscount.hasDiscount ? 'text-rose-700' : 'text-sky-700'
+                      }`}>
+                        {formatRupiah(resolvedUnitDiscount.effectiveUnitPrice)}
                       </div>
+                      {resolvedUnitDiscount.hasDiscount && (
+                        <div className="text-[11px] text-slate-400 line-through font-mono tabular-nums">
+                          {formatRupiah(resolvedUnitDiscount.baseUnitPrice)}
+                        </div>
+                      )}
                       <span className="text-[11px] font-bold text-sky-600 group-hover:underline">
                         + Tambah
                       </span>
@@ -4923,6 +5206,13 @@ export const TabletPOSView: React.FC<TabletPOSViewProps> = ({
           </div>
         );
       })()}
+      {/* GPU-Composited Fly-to-Cart Particle Overlay */}
+      <FlyToCartOverlay
+        particles={flyingParticles}
+        onParticleComplete={(id) =>
+          setFlyingParticles((prev) => prev.filter((p) => p.id !== id))
+        }
+      />
     </div>
   );
 };

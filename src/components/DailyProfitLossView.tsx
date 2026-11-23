@@ -49,7 +49,7 @@ import {
   ShieldCheck,
   Wrench
 } from 'lucide-react';
-import { Transaction, Product, ProductCategory, UserRole, StoreSettings, CashflowRecord, Customer } from '../types/pos';
+import { Transaction, Product, ProductCategory, UserRole, StoreSettings, CashflowRecord, Customer, RestockOrder, TaxRecord, TaxAdjustment, BalanceSheetEntry } from '../types/pos';
 import { formatRupiah, formatNumber, formatDateTime, formatDateOnly, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { getCategoryColor } from '../utils/categoryColors';
@@ -58,6 +58,8 @@ import { SalesPerformanceDashboard } from './SalesPerformanceDashboard';
 import { getItemFifoCogs, getItemFifoUnitCost, calculateFIFOGrossProfit, reconcileTransactionsFifo, FifoValidationSummary } from '../utils/fifoUtils';
 import { FifoReconciliationModal } from './FifoReconciliationModal';
 import { DailyFifoAuditPanel } from './DailyFifoAuditPanel';
+import { exportStockAndProfitLossPdf } from '../utils/balanceSheetUtils';
+import { INITIAL_STORE_SETTINGS } from '../utils/mockData';
 
 export interface FifoBatchDeductionSummary {
   batchNumber: string;
@@ -102,6 +104,10 @@ interface DailyProfitLossViewProps {
   categories?: ProductCategory[];
   cashflows?: CashflowRecord[];
   customers?: Customer[];
+  purchases?: RestockOrder[];
+  taxRecords?: TaxRecord[];
+  taxAdjustments?: TaxAdjustment[];
+  balanceSheetEntries?: BalanceSheetEntry[];
   currentUserRole: UserRole;
   storeName: string;
   storeSettings?: StoreSettings;
@@ -120,6 +126,10 @@ export const DailyProfitLossView: React.FC<DailyProfitLossViewProps> = ({
   categories = [],
   cashflows = [],
   customers = [],
+  purchases = [],
+  taxRecords = [],
+  taxAdjustments = [],
+  balanceSheetEntries = [],
   currentUserRole,
   storeName,
   storeSettings,
@@ -153,6 +163,8 @@ export const DailyProfitLossView: React.FC<DailyProfitLossViewProps> = ({
   const [validatorFilter, setValidatorFilter] = useState<'ALL' | 'DISCREPANCY_ONLY' | 'WITH_BATCHES_ONLY'>('ALL');
   const [validatorSearchQuery, setValidatorSearchQuery] = useState<string>('');
   const [expandedValidationTxId, setExpandedValidationTxId] = useState<string | null>(null);
+  const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
+  const [pdfExportNotice, setPdfExportNotice] = useState<string | null>(null);
 
   // Run calculateFIFOGrossProfit across all historical transactions
   const fifoValidationSummary: FifoValidationSummary = useMemo(() => {
@@ -710,6 +722,33 @@ export const DailyProfitLossView: React.FC<DailyProfitLossViewProps> = ({
     window.print();
   };
 
+  // Export Executive PDF (Profit & Loss + Stock Valuation with Store Logo)
+  const handleExportOwnerPdf = async () => {
+    if (isExportingPdf) return;
+    sound.playTap();
+    setIsExportingPdf(true);
+    setPdfExportNotice(null);
+    try {
+      const targetPeriodMonth = `${selectedYear}-${String(selectedMonth + 1).padStart(2, '0')}`;
+      const { filename } = await exportStockAndProfitLossPdf({
+        periodMonth: targetPeriodMonth,
+        transactions,
+        products,
+        purchases,
+        cashflows,
+        taxRecords,
+        taxAdjustments,
+        manualEntries: balanceSheetEntries,
+        storeSettings: storeSettings || { ...INITIAL_STORE_SETTINGS, storeName },
+        preparedBy: currentUserRole === 'ADMIN' ? 'Admin' : 'Store Manager',
+      });
+      sound.playSuccessChime();
+      setPdfExportNotice(`Laporan PDF Ringkasan Laba Rugi & Stok (${filename}) berhasil diunduh.`);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
   // Monthly WhatsApp Share Handler
   const handleShareMonthlyWhatsApp = () => {
     sound.playTap();
@@ -909,7 +948,18 @@ export const DailyProfitLossView: React.FC<DailyProfitLossViewProps> = ({
               <span className="hidden sm:inline">Rekonsiliasi Laba</span>
             </button>
 
-            {/* Print & Share Buttons */}
+            {/* Print & Export PDF & Share Buttons */}
+            <button
+              type="button"
+              onClick={handleExportOwnerPdf}
+              disabled={isExportingPdf}
+              className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white font-bold text-xs flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              title="Unduh PDF Ringkasan Laba Rugi Bulanan & Laporan Stok dengan Logo Toko untuk dicetak atau dikirim ke Pemilik Bisnis"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{isExportingPdf ? 'Menyusun PDF...' : 'PDF Laba Rugi & Stok'}</span>
+            </button>
+
             <button
               onClick={handlePrint}
               className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs flex items-center gap-1.5 transition-colors border border-slate-200"
@@ -929,6 +979,23 @@ export const DailyProfitLossView: React.FC<DailyProfitLossViewProps> = ({
             </button>
           </div>
         </div>
+
+        {pdfExportNotice && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-medium">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{pdfExportNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPdfExportNotice(null)}
+              className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+              aria-label="Tutup notifikasi ekspor PDF"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* =========================================================================
             PANEL RINGKASAN HASIL AUDIT LABA FIFO PER HARI & PERBAIKI MASSAL

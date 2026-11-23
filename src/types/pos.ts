@@ -81,6 +81,9 @@ export interface Product {
   expiryDate?: string; // Tanggal Kadaluarsa (YYYY-MM-DD)
   batches?: ProductBatch[]; // FIFO / FEFO inventory stock batches
   customerPrices?: CustomerSpecialPrice[]; // Harga jual khusus per kategori pelanggan
+  branchStocks?: Record<string, number>; // Peta stok per unit cabang toko (unitId -> stockInBaseUnit)
+  discountPercent?: number; // Diskon promo produk (%) 0..100
+  promoLabel?: string; // Label promo opsional misal 'Promo Akhir Pekan'
 }
 
 export interface CustomerSpecialPrice {
@@ -174,6 +177,8 @@ export interface CartItem {
   originalUnitPrice?: number;
   isCustomerSpecialPrice?: boolean;
   customerPriceCategory?: string;
+  productDiscountPercent?: number;
+  promoLabel?: string;
 }
 
 export interface TransactionItem {
@@ -195,6 +200,8 @@ export interface TransactionItem {
   batchDeductions?: BatchDeduction[]; // Audit trail of FIFO batches deducted for this sale
   isCustomerSpecialPrice?: boolean;
   customerPriceCategory?: string;
+  productDiscountPercent?: number;
+  promoLabel?: string;
 }
 
 export interface BatchReturnRestoration {
@@ -397,6 +404,161 @@ export interface StoreSettings {
   onlineStoreDeliveryEnabled?: boolean;
   // Dashboard Chart Color Theme Settings
   chartTheme?: ChartColorThemeConfig;
+  // Tax Management Configuration
+  taxConfig?: TaxConfig;
+  // Multi-Unit / Multi-Branch Store Directory & Cross-Branch Stock Transfers
+  storeUnits?: StoreUnit[];
+  stockTransferRequests?: StockTransferRecord[];
+}
+
+export interface StoreUnit {
+  id: string;
+  name: string;
+  code?: string;
+  address?: string;
+  managerName?: string;
+  whatsapp?: string;
+  isPrimary?: boolean;
+}
+
+export type StockTransferStatus = 'REQUESTED' | 'IN_TRANSIT' | 'COMPLETED';
+
+export interface StockTransferRecord {
+  id: string;
+  transferCode: string;
+  timestamp: number;
+  productId: string;
+  productName: string;
+  baseUnit: string;
+  sourceUnitId: string;
+  sourceUnitName: string;
+  targetUnitId: string;
+  targetUnitName: string;
+  quantity: number;
+  status: StockTransferStatus;
+  requestedBy: string;
+  notes?: string;
+}
+
+export type TaxRegimeType = 'UMKM_OP' | 'UMKM_BADAN' | 'PKP_UMUM' | 'NON_PAJAK';
+export type TaxCalculationMode = 'INCLUSIVE' | 'EXCLUSIVE';
+
+export interface TaxConfig {
+  taxpayerStatus: TaxRegimeType;
+  npwp?: string;
+  taxpayerName?: string;
+  enablePphFinalUmkm?: boolean;
+  pphFinalRatePercent?: number; // Default 0.5%
+  applyUmkmOpThreshold500Jt?: boolean; // Omzet <= Rp 500jt bebas PPh Final untuk WP OP
+  enablePphBadan31E?: boolean; // PPh Badan Pasal 17 (22%) & Fasilitas Pasal 31E
+  applyPasal31EFacility?: boolean; // Terapkan diskon tarif 50% Pasal 31E untuk bagian omzet <= Rp 4,8 Miliar (default true)
+  pphBadanRatePercent?: number; // Tarif umum PPh Badan UU HPP, default 22%
+  pphBadanFiscalAdjustment?: number; // Koreksi fiskal netto (+ / -)
+  pphBadanLossCompensation?: number; // Kompensasi kerugian fiskal tahun sebelumnya
+  enablePpn?: boolean;
+  ppnRatePercent?: number; // Default 11%
+  ppnMode?: TaxCalculationMode;
+  deductInputVatFromPurchases?: boolean;
+  enablePb1?: boolean;
+  pb1RatePercent?: number; // Default 10%
+  excludeCashWithdrawalPrincipal?: boolean;
+  monthlyDueDay?: number; // Default tgl 15
+  dueReminderDaysBefore?: number; // Default H-7 (7 hari sebelum jatuh tempo)
+}
+
+export type TaxRecordType =
+  | 'PPH_FINAL_UMKM'
+  | 'PPH_BADAN'
+  | 'PPN'
+  | 'PB1'
+  | 'PPH_21'
+  | 'LAINNYA';
+export type TaxRecordStatus = 'BELUM_SETOR' | 'SUDAH_SETOR';
+
+export interface TaxRecord {
+  id: string;
+  periodMonth: string; // YYYY-MM
+  taxType: TaxRecordType;
+  taxTypeLabel: string;
+  taxBaseAmount: number;
+  taxRatePercent: number;
+  taxAmountDue: number;
+  paidAmount: number;
+  status: TaxRecordStatus;
+  billingCode?: string;
+  ntpnCode?: string;
+  paidDate?: string; // YYYY-MM-DD
+  paymentMethod?: string;
+  notes?: string;
+  linkedCashflowId?: string;
+  recordedBy: string;
+  timestamp: number;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type TaxAuditCategory =
+  | 'CONFIG_CHANGE'
+  | 'RATE_OVERRIDE'
+  | 'ADJUSTMENT'
+  | 'RECORD_MUTATION';
+
+export interface TaxAuditChangeItem {
+  field: string;
+  label: string;
+  oldValue: string;
+  newValue: string;
+}
+
+export interface TaxAuditLog {
+  id: string;
+  timestamp: number;
+  createdAt: string;
+  category: TaxAuditCategory;
+  actionLabel: string;
+  actorId: string;
+  actorName: string;
+  actorRole: UserRole;
+  summary: string;
+  changes: TaxAuditChangeItem[];
+  reason?: string;
+  periodMonth?: string;
+}
+
+export type TaxAdjustmentReasonType =
+  | 'PEMBATALAN_FAKTUR'
+  | 'KESALAHAN_INPUT'
+  | 'RETUR_NOTA_RETUR'
+  | 'KOREKSI_TARIF_DPP'
+  | 'LAINNYA';
+
+export type TaxAdjustmentTargetType =
+  | 'DPP_OMZET'
+  | 'PPH_FINAL_UMKM'
+  | 'PPN_KELUARAN'
+  | 'PPN_MASUKAN'
+  | 'PB1';
+
+export type TaxAdjustmentDirection = 'DECREASE' | 'INCREASE';
+
+export interface TaxAdjustment {
+  id: string;
+  adjustmentNumber: string;
+  periodMonth: string; // YYYY-MM
+  adjustmentDate: string; // YYYY-MM-DD
+  reasonType: TaxAdjustmentReasonType;
+  affectedTaxType: TaxAdjustmentTargetType;
+  direction: TaxAdjustmentDirection;
+  referenceInvoiceNumber?: string;
+  dppDelta: number; // Signed IDR adjustment to DPP/turnover
+  taxDelta: number; // Signed IDR adjustment to tax due/credit
+  status: 'ACTIVE' | 'VOIDED';
+  notes: string;
+  createdBy: string;
+  createdById?: string;
+  timestamp: number;
+  createdAt: string;
+  updatedAt?: string;
 }
 
 export interface ChartColorCustomPalette {
@@ -543,6 +705,18 @@ export interface StockAlertNotification {
   type: 'WARNING' | 'CRITICAL_ZERO';
 }
 
+export interface StockOpnameBatchDetail {
+  batchId: string;
+  batchNumber: string;
+  receivedDate?: string;
+  expiryDate?: string;
+  costPrice: number;
+  systemQty: number;
+  physicalQty: number;
+  difference: number; // physicalQty - systemQty
+  differenceValue: number; // difference * costPrice
+}
+
 export interface StockOpnameItem {
   productId: string;
   productName: string;
@@ -555,6 +729,7 @@ export interface StockOpnameItem {
   differenceValue: number; // difference * costPrice
   reason: string;
   notes?: string;
+  batchDetails?: StockOpnameBatchDetail[];
 }
 
 export interface StockOpnameRecord {
@@ -569,6 +744,8 @@ export interface StockOpnameRecord {
   totalDifferenceValue: number;
   generalReason: string;
   notes?: string;
+  auditedCategories?: string[];
+  auditMode?: 'SKU' | 'MULTI_BATCH';
   items: StockOpnameItem[];
 }
 
@@ -600,6 +777,32 @@ export interface EmployeeActivityLog {
   metadata?: Record<string, string | number | boolean>;
 }
 
+export type BalanceSheetSection =
+  | 'AKTIVA_LANCAR'
+  | 'AKTIVA_TETAP'
+  | 'KEWAJIBAN_LANCAR'
+  | 'KEWAJIBAN_JANGKA_PANJANG'
+  | 'EKUITAS';
+
+export interface BalanceSheetEntry {
+  id: string;
+  accountCode: string; // e.g. "1210", "3100"
+  accountName: string; // e.g. "Peralatan Kasir & Rak Display"
+  section: BalanceSheetSection;
+  amount: number; // Positive nominal in IDR (or acquisition cost for Fixed Assets)
+  isContra?: boolean; // True = reduces total of its section (e.g. Akumulasi Penyusutan / Prive)
+  asOfDate: string; // YYYY-MM-DD effective / acquisition date
+  depreciationMethod?: 'NONE' | 'STRAIGHT_LINE'; // Metode penyusutan garis lurus untuk Aktiva Tetap
+  usefulLifeMonths?: number; // Umur ekonomis aset dalam bulan (mis. 48 bulan = 4 tahun)
+  salvageValue?: number; // Nilai residu / nilai sisa di akhir umur ekonomis (IDR)
+  notes?: string;
+  createdBy: string;
+  createdById?: string;
+  timestamp: number;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 export interface BackupPayload {
   app: string;
   version: string;
@@ -619,6 +822,10 @@ export interface BackupPayload {
     stockOpnameCount?: number;
     onlineOrderCount?: number;
     activityLogCount?: number;
+    taxRecordCount?: number;
+    taxAuditLogCount?: number;
+    taxAdjustmentCount?: number;
+    balanceSheetEntryCount?: number;
   };
   data: {
     products: Product[];
@@ -635,5 +842,9 @@ export interface BackupPayload {
     stockOpnames?: StockOpnameRecord[];
     onlineOrders?: OnlineOrder[];
     activityLogs?: EmployeeActivityLog[];
+    taxRecords?: TaxRecord[];
+    taxAuditLogs?: TaxAuditLog[];
+    taxAdjustments?: TaxAdjustment[];
+    balanceSheetEntries?: BalanceSheetEntry[];
   };
 }

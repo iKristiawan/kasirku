@@ -22,7 +22,10 @@ import {
   Clock, 
   User, 
   Wallet,
-  AlertCircle
+  AlertCircle,
+  Scale,
+  Calculator,
+  Download
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -37,17 +40,44 @@ import {
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { CashflowRecord, CashflowType, Transaction, User as PosUser } from '../types/pos';
+import {
+  BalanceSheetEntry,
+  CashflowRecord,
+  CashflowType,
+  Customer,
+  Product,
+  RestockOrder,
+  StoreSettings,
+  TaxAdjustment,
+  TaxRecord,
+  Transaction,
+  User as PosUser,
+} from '../types/pos';
 import { formatRupiah, formatDateTime, formatDateOnly } from '../utils/formatters';
 import { sound } from '../utils/audio';
 import { WithdrawalMonthlyChart } from './WithdrawalMonthlyChart';
+import { BalanceSheetView } from './BalanceSheetView';
+import { FixedAssetDepreciationPanel } from './FixedAssetDepreciationPanel';
+import { MonthlyProfitComparisonChart } from './MonthlyProfitComparisonChart';
+import { exportMonthlyFinancialReportPdf, exportStockAndProfitLossPdf } from '../utils/balanceSheetUtils';
+import { addStandardPdfFooters, buildStoreContactLine, drawPdfStoreHeader } from '../utils/pdfLogoHelper';
+import { INITIAL_STORE_SETTINGS } from '../utils/mockData';
 
 interface FinanceViewProps {
   cashflows: CashflowRecord[];
   transactions?: Transaction[];
+  products?: Product[];
+  purchases?: RestockOrder[];
+  customers?: Customer[];
+  taxRecords?: TaxRecord[];
+  taxAdjustments?: TaxAdjustment[];
+  balanceSheetEntries?: BalanceSheetEntry[];
+  storeSettings?: StoreSettings;
   onAddCashflow: (record: Omit<CashflowRecord, 'id' | 'createdAt'>) => Promise<void> | void;
   onUpdateCashflow: (record: CashflowRecord) => Promise<void> | void;
   onDeleteCashflow: (id: string) => Promise<void> | void;
+  onSaveBalanceSheetEntry?: (entry: BalanceSheetEntry, isEdit?: boolean) => Promise<void> | void;
+  onDeleteBalanceSheetEntry?: (entry: BalanceSheetEntry) => Promise<void> | void;
   currentUser: PosUser;
   storeName?: string;
 }
@@ -78,12 +108,74 @@ const DEFAULT_INCOME_CATEGORIES = [
 export const FinanceView: React.FC<FinanceViewProps> = ({
   cashflows = [],
   transactions = [],
+  products = [],
+  purchases = [],
+  customers = [],
+  taxRecords = [],
+  taxAdjustments = [],
+  balanceSheetEntries = [],
+  storeSettings,
   onAddCashflow,
   onUpdateCashflow,
   onDeleteCashflow,
+  onSaveBalanceSheetEntry,
+  onDeleteBalanceSheetEntry,
   currentUser,
   storeName = 'KasirKu Tablet POS',
 }) => {
+  const [activeFinanceTab, setActiveFinanceTab] = useState<'CASHFLOW' | 'NERACA' | 'PENYUSUTAN'>('CASHFLOW');
+  const [reportPeriodMonth, setReportPeriodMonth] = useState<string>(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  });
+  const [pdfExportNotice, setPdfExportNotice] = useState<string | null>(null);
+
+  const effectiveStoreSettings = useMemo<StoreSettings>(
+    () => ({
+      ...INITIAL_STORE_SETTINGS,
+      ...(storeSettings || {}),
+      storeName: storeSettings?.storeName || storeName,
+    }),
+    [storeSettings, storeName]
+  );
+
+  const handleExportMonthlyFinancialPdf = async (targetMonth: string = reportPeriodMonth) => {
+    sound.playTap();
+    const filename = await exportMonthlyFinancialReportPdf({
+      periodMonth: targetMonth,
+      transactions,
+      products,
+      purchases,
+      cashflows,
+      customers,
+      taxRecords,
+      taxAdjustments,
+      manualEntries: balanceSheetEntries,
+      storeSettings: effectiveStoreSettings,
+      preparedBy: currentUser.name || 'Manajer',
+    });
+    sound.playSuccessChime();
+    setPdfExportNotice(`Laporan PDF Laba Rugi & Neraca (${filename}) berhasil diunduh.`);
+  };
+
+  const handleExportStockAndPnlOwnerPdf = async (targetMonth: string = reportPeriodMonth) => {
+    sound.playTap();
+    const { filename } = await exportStockAndProfitLossPdf({
+      periodMonth: targetMonth,
+      transactions,
+      products,
+      purchases,
+      cashflows,
+      taxRecords,
+      taxAdjustments,
+      manualEntries: balanceSheetEntries,
+      storeSettings: effectiveStoreSettings,
+      preparedBy: currentUser.name || 'Manajer',
+    });
+    sound.playSuccessChime();
+    setPdfExportNotice(`Laporan PDF Stok & Laba Rugi untuk Pemilik (${filename}) berhasil diunduh.`);
+  };
+
   // Modal states
   const [isFormModalOpen, setIsFormModalOpen] = useState(false);
   const [editingRecord, setEditingRecord] = useState<CashflowRecord | null>(null);
@@ -324,19 +416,24 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
     XLSX.writeFile(wb, `Laporan_Keuangan_KasirKu_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
-  // Export PDF / Print
-  const handlePrintPdf = () => {
+  // Export PDF / Print with Store Logo
+  const handlePrintPdf = async () => {
     sound.playTap();
-    const doc = new jsPDF({ orientation: 'portrait' });
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
     const todayStr = new Date().toLocaleDateString('id-ID', { dateStyle: 'full' });
 
-    doc.setFontSize(16);
-    doc.setTextColor(15, 23, 42);
-    doc.text(`LAPORAN KAS & KEUANGAN - ${storeName.toUpperCase()}`, 14, 15);
-
-    doc.setFontSize(9);
-    doc.setTextColor(100, 116, 139);
-    doc.text(`Tanggal Cetak: ${todayStr} | Total Catatan: ${filteredCashflows.length} Transaksi`, 14, 22);
+    const { bannerHeight } = await drawPdfStoreHeader({
+      doc,
+      title: 'LAPORAN KAS & ARUS KEUANGAN',
+      subtitle: effectiveStoreSettings.storeName.toUpperCase(),
+      contactLine: buildStoreContactLine(effectiveStoreSettings),
+      rightTopText: `Total Catatan: ${filteredCashflows.length}`,
+      rightBottomText: `Cetak: ${todayStr}`,
+      storeSettings: effectiveStoreSettings,
+      bannerColor: [15, 23, 42],
+      accentStripeColor: [13, 148, 136],
+      bannerHeight: 28,
+    });
 
     const tableRows = filteredCashflows.map((c, idx) => [
       (idx + 1).toString(),
@@ -349,7 +446,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
     ]);
 
     autoTable(doc, {
-      startY: 28,
+      startY: bannerHeight + 5,
       head: [['No', 'Tanggal', 'Jenis', 'Kategori', 'Keterangan', 'Metode', 'Nominal']],
       body: tableRows,
       theme: 'grid',
@@ -357,13 +454,144 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
       styles: { fontSize: 8, cellPadding: 2.5 },
     });
 
+    addStandardPdfFooters(
+      doc,
+      `${effectiveStoreSettings.storeName} — Laporan Kas & Arus Kas (${todayStr})`
+    );
+
     doc.save(`Laporan_Kas_Keuangan_${new Date().toISOString().slice(0, 10)}.pdf`);
   };
 
   return (
     <div className="flex-1 p-3 md:p-6 bg-slate-100 overflow-y-auto select-none font-sans">
       <div className="max-w-7xl mx-auto space-y-4 md:space-y-5">
-        
+        {/* Finance Module Sub-Navigation Tabs */}
+        <div className="bg-white px-4 py-3 rounded-2xl border border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-xl border border-slate-200 self-start">
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveFinanceTab('CASHFLOW');
+              }}
+              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeFinanceTab === 'CASHFLOW'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Wallet className="w-3.5 h-3.5 text-teal-600" />
+              <span>Buku Kas &amp; Arus Kas</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveFinanceTab('NERACA');
+              }}
+              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeFinanceTab === 'NERACA'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Scale className="w-3.5 h-3.5 text-sky-600" />
+              <span>Neraca (Aktiva &amp; Pasiva)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                sound.playTap();
+                setActiveFinanceTab('PENYUSUTAN');
+              }}
+              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                activeFinanceTab === 'PENYUSUTAN'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Calculator className="w-3.5 h-3.5 text-amber-600" />
+              <span>Penyusutan Aset Tetap</span>
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <label className="text-[11px] font-semibold text-slate-600 whitespace-nowrap" htmlFor="finance-pdf-period">
+              Periode Arsip:
+            </label>
+            <input
+              id="finance-pdf-period"
+              type="month"
+              value={reportPeriodMonth}
+              onChange={(e) => {
+                if (e.target.value) setReportPeriodMonth(e.target.value);
+              }}
+              className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-mono font-bold text-slate-800 focus:outline-none focus:border-sky-500"
+            />
+            <button
+              type="button"
+              onClick={() => handleExportStockAndPnlOwnerPdf(reportPeriodMonth)}
+              className="px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+              title="Unduh PDF rapi berisi Ringkasan Laba Rugi & Valuasi Stok Gudang lengkap dengan logo toko untuk pemilik bisnis"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Ekspor PDF Stok &amp; Laba Rugi</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExportMonthlyFinancialPdf(reportPeriodMonth)}
+              className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+              title="Unduh arsip bulanan Laporan Laba Rugi & Neraca dalam 1 dokumen PDF"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Ekspor PDF Laba Rugi &amp; Neraca</span>
+            </button>
+          </div>
+        </div>
+
+        {pdfExportNotice && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-medium">
+              <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{pdfExportNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPdfExportNotice(null)}
+              className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+              title="Tutup notifikasi"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {activeFinanceTab === 'NERACA' ? (
+          <BalanceSheetView
+            embedded
+            transactions={transactions}
+            products={products}
+            purchases={purchases}
+            cashflows={cashflows}
+            customers={customers}
+            taxRecords={taxRecords}
+            taxAdjustments={taxAdjustments}
+            balanceSheetEntries={balanceSheetEntries}
+            storeSettings={effectiveStoreSettings}
+            currentUser={currentUser}
+            onSaveEntry={onSaveBalanceSheetEntry || (() => undefined)}
+            onDeleteEntry={onDeleteBalanceSheetEntry || (() => undefined)}
+            onNavigateToFinance={() => setActiveFinanceTab('CASHFLOW')}
+          />
+        ) : activeFinanceTab === 'PENYUSUTAN' ? (
+          <FixedAssetDepreciationPanel
+            balanceSheetEntries={balanceSheetEntries}
+            currentUser={currentUser}
+            onSaveBalanceSheetEntry={onSaveBalanceSheetEntry || (() => undefined)}
+            onDeleteBalanceSheetEntry={onDeleteBalanceSheetEntry || (() => undefined)}
+            onOpenBalanceSheet={() => setActiveFinanceTab('NERACA')}
+          />
+        ) : (
+          <>
         {/* Top Header Banner */}
         <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3.5">
@@ -493,6 +721,20 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Interactive Monthly Bar Chart: Laba Kotor vs Laba Bersih & Efisiensi Operasional */}
+        <MonthlyProfitComparisonChart
+          selectedPeriodMonth={reportPeriodMonth}
+          onSelectPeriodMonth={setReportPeriodMonth}
+          onExportMonthlyPdf={handleExportMonthlyFinancialPdf}
+          transactions={transactions}
+          cashflows={cashflows}
+          purchases={purchases}
+          taxRecords={taxRecords}
+          taxAdjustments={taxAdjustments}
+          manualEntries={balanceSheetEntries}
+          storeSettings={effectiveStoreSettings}
+        />
 
         {/* 7-Day Cashflow Chart */}
         <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
@@ -762,7 +1004,8 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
             </table>
           </div>
         </div>
-
+          </>
+        )}
       </div>
 
       {/* =========================================================================

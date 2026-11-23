@@ -31,6 +31,7 @@ import {
 import { Product, Supplier, StoreSettings, ProductUnit } from '../types/pos';
 import { formatNumber, formatRupiah, formatDateTime, formatWhatsAppUrl } from '../utils/formatters';
 import { sound } from '../utils/audio';
+import { LazyProductImage } from './LazyProductImage';
 
 interface StockThresholdSettingsModalProps {
   isOpen: boolean;
@@ -627,16 +628,18 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
                     >
                       <div className="flex items-center gap-3">
                         <div className="w-10 h-10 rounded-xl bg-slate-100 overflow-hidden shrink-0 flex items-center justify-center font-bold text-slate-500 text-xs">
-                          {p.imageUrl ? (
-                            <img
-                              src={p.imageUrl}
-                              alt={p.name}
-                              referrerPolicy="no-referrer"
-                              className="w-full h-full object-cover"
-                            />
-                          ) : (
-                            p.name.charAt(0)
-                          )}
+                          <LazyProductImage
+                            src={p.imageUrl}
+                            alt={p.name}
+                            className="w-full h-full object-cover"
+                            containerClassName="w-full h-full relative"
+                            unloadFarOffscreen={true}
+                            fallback={
+                              <div className="w-full h-full flex items-center justify-center font-bold text-slate-500 text-xs">
+                                {p.name.charAt(0)}
+                              </div>
+                            }
+                          />
                         </div>
                         <div>
                           <div className="text-xs md:text-sm font-bold text-slate-900">{p.name}</div>
@@ -884,16 +887,18 @@ export const StockThresholdSettingsModal: React.FC<StockThresholdSettingsModalPr
                           className="mt-1 rounded text-emerald-600 focus:ring-emerald-500 w-4 h-4 cursor-pointer"
                         />
                         <div className="w-10 h-10 rounded-xl bg-slate-100 overflow-hidden shrink-0 flex items-center justify-center font-bold text-slate-500 text-xs">
-                          {p.imageUrl ? (
-                            <img
-                              src={p.imageUrl}
-                              alt={p.name}
-                              referrerPolicy="no-referrer"
-                              className="w-full h-full object-cover"
-                            />
-                          ) : (
-                            p.name.charAt(0)
-                          )}
+                          <LazyProductImage
+                            src={p.imageUrl}
+                            alt={p.name}
+                            className="w-full h-full object-cover"
+                            containerClassName="w-full h-full relative"
+                            unloadFarOffscreen={true}
+                            fallback={
+                              <div className="w-full h-full flex items-center justify-center font-bold text-slate-500 text-xs">
+                                {p.name.charAt(0)}
+                              </div>
+                            }
+                          />
                         </div>
                         <div>
                           <div className="text-xs md:text-sm font-bold text-slate-900">{p.name}</div>

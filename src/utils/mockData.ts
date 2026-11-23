@@ -168,6 +168,22 @@ export const INITIAL_STORE_SETTINGS: StoreSettings = {
     gold: 5,   // 5%
     platinum: 10, // 10%
   },
+  taxConfig: {
+    taxpayerStatus: 'UMKM_OP',
+    npwp: '',
+    taxpayerName: 'TOKO BERKAH JAYA',
+    enablePphFinalUmkm: true,
+    pphFinalRatePercent: 0.5,
+    applyUmkmOpThreshold500Jt: true,
+    enablePpn: false,
+    ppnRatePercent: 11,
+    ppnMode: 'INCLUSIVE',
+    deductInputVatFromPurchases: true,
+    enablePb1: false,
+    pb1RatePercent: 10,
+    excludeCashWithdrawalPrincipal: true,
+    monthlyDueDay: 15,
+  },
   bcaAccountNumber: '8830192819',
   bcaAccountName: 'PT TOKO BERKAH JAYA',
   bcaMerchantId: 'MID-BCA-994821',

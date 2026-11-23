@@ -119,12 +119,15 @@
       "path": "settings/{settingId}",
       "description": "Store information, thermal printer branding, loyalty configuration",
       "fields": {
-        "storeName": { "type": "string", "description": "Store title" },
-        "storeAddress": { "type": "string", "description": "Store address" },
-        "storePhone": { "type": "string", "description": "Store hotline" },
-        "storeFooterReceipt": { "type": "string", "description": "Personalized 2-line receipt footer greeting or return policy" },
-        "storeLogo": { "type": "string", "description": "Logo data URL" },
+        "id": { "type": "string", "description": "Singleton document ID (store_config)" },
+        "storeName": { "type": "string", "description": "Store title", "maxLength": 160 },
+        "storeAddress": { "type": "string", "description": "Store address", "maxLength": 500 },
+        "storePhone": { "type": "string", "description": "Store hotline", "maxLength": 80 },
+        "storeHeaderReceipt": { "type": "string", "description": "Custom header message printed on thermal receipt", "maxLength": 500 },
+        "storeFooterReceipt": { "type": "string", "description": "Personalized 2-line receipt footer greeting or return policy", "maxLength": 1000 },
+        "storeLogo": { "type": "string", "description": "Logo data URL", "maxLength": 600000 },
         "showLogoOnReceipt": { "type": "boolean", "description": "Toggle receipt logo" },
+        "manualOfflineMode": { "type": "boolean", "description": "Manual offline toggle to pause Firebase cloud synchronization" },
         "dailySalesGoal": { "type": "number", "description": "Daily sales target in IDR" },
         "weeklySalesGoal": { "type": "number", "description": "Weekly sales target in IDR" },
         "monthlySalesGoal": { "type": "number", "description": "Monthly sales target in IDR" },
@@ -134,7 +137,7 @@
         "useCustomWhatsAppTemplate": { "type": "boolean", "description": "Use custom WhatsApp message template for receipts" },
         "customWhatsAppTemplate": { "type": "string", "description": "Customizable WhatsApp receipt message template with placeholders" },
         "autoAdminLowStockWhatsApp": { "type": "boolean", "description": "Automatically send WhatsApp alert to admin when multiple products hit minimum stock in a single day" },
-        "adminWhatsAppNumber": { "type": "string", "description": "Admin WhatsApp phone number for daily low-stock alert notifications" },
+        "adminWhatsAppNumber": { "type": "string", "description": "Admin WhatsApp phone number for daily low-stock alert notifications", "maxLength": 80 },
         "adminLowStockTriggerCount": { "type": "number", "description": "Minimum number of distinct products hitting low stock in a single day before triggering admin WhatsApp alert" },
         "useCustomLowStockWhatsAppTemplate": { "type": "boolean", "description": "Toggle custom WhatsApp template for low-stock alerts" },
         "customLowStockWhatsAppTemplate": { "type": "string", "description": "Customizable WhatsApp low-stock alert template with product and stock placeholders" },
@@ -153,9 +156,14 @@
         "pointsPerSpend": { "type": "number", "description": "Number of Y points earned per spendPerPoint threshold" },
         "pointValueRupiah": { "type": "number", "description": "Rupiah value per 1 point" },
         "autoApplyMaxPoints": { "type": "boolean", "description": "Automatically apply maximum redeemable points discount on checkout when member has points" },
+        "enableMembershipDiscount": { "type": "boolean", "description": "Toggle automatic membership tier percentage discount at checkout" },
+        "membershipDiscounts": { "type": "object", "description": "Silver, Gold, and Platinum percentage discount configuration" },
         "bcaAccountNumber": { "type": "string", "description": "BCA account number" },
         "bcaAccountName": { "type": "string", "description": "BCA account name" },
         "bcaMerchantId": { "type": "string", "description": "BCA merchant ID" },
+        "qrisImageUrl": { "type": "string", "description": "Static store QRIS image data URL", "maxLength": 600000 },
+        "qrisImageName": { "type": "string", "description": "Static store QRIS filename" },
+        "qrisNmid": { "type": "string", "description": "Static store QRIS NMID identifier" },
         "customPaymentMethods": { "type": "array", "description": "Customizable list of active store payment methods including uploaded static QRIS JPGs" },
         "onlineStoreEnabled": { "type": "boolean", "description": "Toggle customer-facing online storefront availability" },
         "onlineStoreTagline": { "type": "string", "description": "Storefront hero tagline displayed to online shoppers" },
@@ -163,7 +171,10 @@
         "onlineStoreDeliveryFee": { "type": "number", "description": "Flat courier delivery fee for online orders in IDR" },
         "onlineStoreMinFreeDelivery": { "type": "number", "description": "Minimum order subtotal for free local courier delivery in IDR" },
         "onlineStorePickupEnabled": { "type": "boolean", "description": "Allow store pickup fulfillment for online orders" },
-        "onlineStoreDeliveryEnabled": { "type": "boolean", "description": "Allow local courier delivery fulfillment for online orders" }
+        "onlineStoreDeliveryEnabled": { "type": "boolean", "description": "Allow local courier delivery fulfillment for online orders" },
+        "taxConfig": { "type": "object", "description": "Store tax profile, PPh Final UMKM / PPh Badan Pasal 31E / PPN / PB1 rates, and calculation preferences" },
+        "storeUnits": { "type": "array", "description": "Multi-unit / multi-branch store directory" },
+        "stockTransferRequests": { "type": "array", "description": "Cross-branch inventory transfer records" }
       }
     },
     "users": {
@@ -220,7 +231,9 @@
         "totalDifferenceValue": { "type": "number", "description": "Net financial difference in IDR" },
         "generalReason": { "type": "string", "description": "General audit objective or period" },
         "notes": { "type": "string", "description": "Optional session notes" },
-        "items": { "type": "array", "description": "List of audited products with physical vs system count" }
+        "auditedCategories": { "type": "array", "description": "Selected product categories audited simultaneously in a multi-batch session" },
+        "auditMode": { "type": "string", "description": "SKU | MULTI_BATCH audit granularity mode" },
+        "items": { "type": "array", "description": "List of audited products with physical vs system count and optional per-batch counts" }
       }
     },
     "cashflows": {
@@ -318,6 +331,94 @@
         "metadata": { "type": "object", "description": "Related transaction invoiceNumber, transactionId, storeName, customerName, finalAmount, triggeredBy" },
         "createdAt": { "type": "number", "description": "Unix timestamp in ms when email dispatch was triggered" },
         "delivery": { "type": "object", "description": "Server-managed Firebase Trigger Email extension delivery status (state, error, endTime)" }
+      }
+    },
+    "tax_records": {
+      "path": "tax_records/{taxRecordId}",
+      "description": "Monthly tax filings, billing codes (ID Billing), NTPN payment proofs, and tax liability records",
+      "fields": {
+        "id": { "type": "string", "description": "Unique tax record ID" },
+        "periodMonth": { "type": "string", "description": "Tax period month YYYY-MM" },
+        "taxType": { "type": "string", "description": "PPH_FINAL_UMKM | PPH_BADAN | PPN | PB1 | PPH_21 | LAINNYA" },
+        "taxTypeLabel": { "type": "string", "description": "Human-readable tax category label" },
+        "taxBaseAmount": { "type": "number", "description": "Tax base (DPP / Peredaran Bruto) in IDR" },
+        "taxRatePercent": { "type": "number", "description": "Applied tax rate percentage" },
+        "taxAmountDue": { "type": "number", "description": "Calculated tax obligation in IDR" },
+        "paidAmount": { "type": "number", "description": "Settled payment nominal in IDR" },
+        "status": { "type": "string", "description": "BELUM_SETOR | SUDAH_SETOR" },
+        "billingCode": { "type": "string", "description": "Optional DJP billing code" },
+        "ntpnCode": { "type": "string", "description": "Optional NTPN payment proof number" },
+        "paidDate": { "type": "string", "description": "Payment date YYYY-MM-DD" },
+        "paymentMethod": { "type": "string", "description": "Payment channel used" },
+        "notes": { "type": "string", "description": "Optional tax filing notes" },
+        "linkedCashflowId": { "type": "string", "description": "Optional linked cashflow expense ID" },
+        "recordedBy": { "type": "string", "description": "Staff name who recorded the tax entry" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "createdAt": { "type": "string", "description": "ISO creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Optional ISO update timestamp" }
+      }
+    },
+    "tax_audit_logs": {
+      "path": "tax_audit_logs/{logId}",
+      "description": "Immutable internal audit trail recording every tax configuration modification, manual rate override, tax record mutation, and tax adjustment",
+      "fields": {
+        "id": { "type": "string", "description": "Unique tax audit log ID" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "createdAt": { "type": "string", "description": "ISO creation timestamp" },
+        "category": { "type": "string", "description": "CONFIG_CHANGE | RATE_OVERRIDE | ADJUSTMENT | RECORD_MUTATION" },
+        "actionLabel": { "type": "string", "description": "Short Indonesian title of the audited tax action" },
+        "actorId": { "type": "string", "description": "User ID of staff/manager who executed the change" },
+        "actorName": { "type": "string", "description": "Staff/Manager full name" },
+        "actorRole": { "type": "string", "description": "ADMIN | STORE_MANAGER | KARYAWAN" },
+        "summary": { "type": "string", "description": "Detailed summary of tax configuration or rate change" },
+        "changes": { "type": "array", "description": "List of field-level before/after diffs" },
+        "reason": { "type": "string", "description": "Optional audit reason or internal memo number" },
+        "periodMonth": { "type": "string", "description": "Optional affected tax period YYYY-MM" }
+      }
+    },
+    "tax_adjustments": {
+      "path": "tax_adjustments/{adjustmentId}",
+      "description": "Tax adjustment journal entries for invoice cancellations or input corrections that automatically recalculate monthly tax reports",
+      "fields": {
+        "id": { "type": "string", "description": "Unique tax adjustment ID" },
+        "adjustmentNumber": { "type": "string", "description": "Generated adjustment reference e.g. ADJ-PAJAK-202611-001" },
+        "periodMonth": { "type": "string", "description": "Affected tax period month YYYY-MM" },
+        "adjustmentDate": { "type": "string", "description": "Adjustment entry date YYYY-MM-DD" },
+        "reasonType": { "type": "string", "description": "PEMBATALAN_FAKTUR | KESALAHAN_INPUT | RETUR_NOTA_RETUR | KOREKSI_TARIF_DPP | LAINNYA" },
+        "affectedTaxType": { "type": "string", "description": "DPP_OMZET | PPH_FINAL_UMKM | PPN_KELUARAN | PPN_MASUKAN | PB1" },
+        "direction": { "type": "string", "description": "DECREASE | INCREASE" },
+        "referenceInvoiceNumber": { "type": "string", "description": "Optional invoice, PO, or e-Faktur reference number" },
+        "dppDelta": { "type": "number", "description": "Signed IDR adjustment to taxable turnover / DPP" },
+        "taxDelta": { "type": "number", "description": "Signed IDR adjustment to tax obligation or input VAT credit" },
+        "status": { "type": "string", "description": "ACTIVE | VOIDED" },
+        "notes": { "type": "string", "description": "Detailed audit justification and description" },
+        "createdBy": { "type": "string", "description": "Staff name who recorded the adjustment" },
+        "createdById": { "type": "string", "description": "Staff user ID" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "createdAt": { "type": "string", "description": "ISO creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Optional ISO update timestamp" }
+      }
+    },
+    "balance_sheet_entries": {
+      "path": "balance_sheet_entries/{entryId}",
+      "description": "Custom manual balance sheet accounts (fixed assets, accumulated depreciation, bank loans, paid-in capital, retained earnings, owner drawings)",
+      "fields": {
+        "id": { "type": "string", "description": "Unique balance sheet account entry ID" },
+        "accountCode": { "type": "string", "description": "Chart of accounts code e.g. 1210, 3100" },
+        "accountName": { "type": "string", "description": "Human-readable account title" },
+        "section": { "type": "string", "description": "AKTIVA_LANCAR | AKTIVA_TETAP | KEWAJIBAN_LANCAR | KEWAJIBAN_JANGKA_PANJANG | EKUITAS" },
+        "amount": { "type": "number", "description": "Positive nominal amount in IDR" },
+        "isContra": { "type": "boolean", "description": "True if contra-account subtracting from section total" },
+        "asOfDate": { "type": "string", "description": "Effective or fixed asset acquisition date YYYY-MM-DD" },
+        "depreciationMethod": { "type": "string", "description": "NONE | STRAIGHT_LINE for straight-line fixed asset depreciation" },
+        "usefulLifeMonths": { "type": "number", "description": "Fixed asset useful life in months for straight-line depreciation" },
+        "salvageValue": { "type": "number", "description": "Fixed asset residual/salvage value at end of useful life in IDR" },
+        "notes": { "type": "string", "description": "Optional account notes or description" },
+        "createdBy": { "type": "string", "description": "Staff name who created or edited the entry" },
+        "createdById": { "type": "string", "description": "Staff user ID" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "createdAt": { "type": "string", "description": "ISO creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Optional ISO update timestamp" }
       }
     }
   }
